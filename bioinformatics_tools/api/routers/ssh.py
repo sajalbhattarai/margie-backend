@@ -1523,6 +1523,8 @@ def _job_from_history_row(row: dict) -> dict:
         "selected_tools": row.get("selected_tools"),
         "relaunched_from": row.get("relaunched_from"),
         "start_time": row.get("created_at"),
+        # A finished row is last written when it finishes, so that is its end.
+        "end_time": row.get("updated_at") if row.get("status") in _TERMINAL_STATUSES else None,
         "sub_jobs": [],
         "slurm_jobs": row.get("slurm_jobs") or [],
         "containers": row.get("containers") or [],

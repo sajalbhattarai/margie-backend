@@ -36,9 +36,10 @@ class GenomeSend(BaseModel):
 class UserRegister(BaseModel):
     username: str
     password: str
-    cluster_host: str
-    cluster_username: str
-    private_key: str   # plaintext SSH private key — encrypted before storage, never returned
+    # Required unless the API runs in local mode (see api/local_mode.py).
+    cluster_host: str | None = None
+    cluster_username: str | None = None
+    private_key: str | None = None   # plaintext SSH private key — encrypted before storage, never returned
 
 
 class UserLogin(BaseModel):

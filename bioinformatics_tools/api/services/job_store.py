@@ -224,6 +224,7 @@ class JobStore:
             return
         job["status"] = status
         job["phase"] = phase
+        job["end_time"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         LOGGER.info("Finalized job %s: status=%s phase=%s", job_id, status, phase)
 
         if job_id in self._persistence:

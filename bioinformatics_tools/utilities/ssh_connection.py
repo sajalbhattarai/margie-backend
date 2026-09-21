@@ -276,9 +276,18 @@ def sync_remote_dane_wf(conn: SSHConnection, *, ref: str = _MARGIE_SB_REF, timeo
     margie.sh's archive-download fallback), a dirty tree, or any SSH hiccup is
     logged and skipped so a sync-check problem never blocks an actual job.
     Returns a short status string for logging/telemetry: 'unprovisioned',
-    'not-a-git-checkout', 'up-to-date', 'dirty-skipped', 'updated', or
-    'error: <detail>'.
+    'not-a-git-checkout', 'up-to-date', 'dirty-skipped', 'updated',
+    'disabled', or 'error: <detail>'.
+
+    BSP_SKIP_DANE_WF_SYNC=1 on the API turns it off. That is for a developer
+    whose API and "cluster" are one machine: there ~/bioinformatics-tools is
+    their own working checkout (api/main.py links it), and once its tree is
+    clean this would check out `ref` and reset it to origin, discarding the
+    branch they are on (scripts/dev-local/start.sh sets it).
     """
+    if os.environ.get('BSP_SKIP_DANE_WF_SYNC'):
+        LOGGER.info('dane_wf version-sync check disabled by BSP_SKIP_DANE_WF_SYNC')
+        return 'disabled'
     command = f'''cd "$HOME/bioinformatics-tools" 2>/dev/null || {{ echo NO_CHECKOUT; exit 0; }}
 [ -d .git ] || {{ echo NOT_GIT; exit 0; }}
 git fetch origin {shlex.quote(ref)} --quiet 2>&1

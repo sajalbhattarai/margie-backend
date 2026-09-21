@@ -454,12 +454,19 @@ def submit_ssh_job(
     except Exception as exc:
         LOGGER.warning('Could not open SFTP for completion checks: %s', exc)
 
+    # The run's files are named `$HOME/...` for the shell that writes them. SFTP
+    # has no shell to expand that, so asked for it literally it looks for a
+    # folder called "$HOME" and never finds the sentinel -- the run finishes,
+    # and this loop goes on waiting. SFTP resolves a relative path from the
+    # home directory, which is exactly what `$HOME/` meant.
+    rcf_sftp = rcf[len('$HOME/'):] if rcf.startswith('$HOME/') else rcf
+
     def _finished():
         """Exit code if the run has finished, else None."""
         if sftp is None:
             return None
         try:
-            with sftp.open(rcf, 'r') as fh:
+            with sftp.open(rcf_sftp, 'r') as fh:
                 txt = fh.read().decode('utf-8', 'replace').strip()
             return txt or None
         except IOError:

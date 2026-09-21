@@ -20,6 +20,7 @@ from bioinformatics_tools.api.auth import (
     verify_password,
 )
 from bioinformatics_tools.api.database import get_db
+from bioinformatics_tools.api.local_mode import is_local_mode, local_account
 from bioinformatics_tools.api.models import (
     TokenResponse,
     UpdateClusterCredentials,
@@ -66,7 +67,19 @@ def register(body: UserRegister):
 
     Validates the private key, encrypts it, then stores the user. Returns the
     new user_id and username. Does not issue a token — requires a separate login.
+
+    In local mode there is no cluster: the account is tied to this computer's
+    user and home directory, and no SSH key is stored.
     """
+    if is_local_mode():
+        return _store_user(body, **local_account(), private_key_encrypted='')
+
+    if not (body.cluster_host and body.cluster_username and body.private_key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Cluster host, cluster username, and SSH private key are required.'
+        )
+
     _validate_private_key(body.private_key)
 
     # SSH in before writing anything to DB — proves the credentials work and
@@ -105,9 +118,19 @@ def register(body: UserRegister):
             detail=f'Connected, but could not set up the workflow environment on the cluster: {exc}'
         )
 
+    return _store_user(
+        body,
+        cluster_host=body.cluster_host,
+        cluster_username=body.cluster_username,
+        home_dir=home_dir,
+        private_key_encrypted=encrypt_private_key(body.private_key),
+    )
+
+
+def _store_user(body: UserRegister, *, cluster_host: str, cluster_username: str,
+                home_dir: str, private_key_encrypted: str) -> dict:
     created_at = datetime.now(timezone.utc).isoformat()
     password_hash = hash_password(body.password)
-    private_key_encrypted = encrypt_private_key(body.private_key)
 
     try:
         with get_db() as db:
@@ -116,8 +139,8 @@ def register(body: UserRegister):
                        (username, password_hash, cluster_host, cluster_username,
                         home_dir, private_key_encrypted, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                (body.username, password_hash, body.cluster_host,
-                 body.cluster_username, home_dir, private_key_encrypted, created_at)
+                (body.username, password_hash, cluster_host,
+                 cluster_username, home_dir, private_key_encrypted, created_at)
             )
             user_id = cursor.lastrowid
     except Exception as exc:

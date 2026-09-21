@@ -27,7 +27,8 @@ def list_remote_dir(
 ) -> list[dict]:
     """List files and directories in a remote path via SFTP.
 
-    Returns a list of dicts: {name, type, size}.
+    Returns a list of dicts: {name, type, size, mtime}; mtime is seconds
+    since the epoch, or None when the server does not report it.
     """
     ssh = connection.connect()
     sftp = ssh.open_sftp()
@@ -38,6 +39,7 @@ def list_remote_dir(
             'name': attr.filename,
             'type': entry_type,
             'size': attr.st_size,
+            'mtime': attr.st_mtime,
         })
     sftp.close()
     pass  # pooled client: closing it would defeat SSHConnection's pool

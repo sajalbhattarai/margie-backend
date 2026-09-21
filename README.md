@@ -156,6 +156,7 @@ This backend can be used from the command line or from the separate frontend rep
 
 - **Just use it** — the hosted app at **[bsp.anvilcloud.rcac.purdue.edu](https://bsp.anvilcloud.rcac.purdue.edu/)**. Nothing to install; sign in and submit.
 - **Run your own** — clone `biolab-fe` and run its one-time `setup.sh`. That frontend launcher starts this backend on your HPC over SSH, opens a tunnel, and launches the app in your browser.
+- **Run it on your own computer (local mode)** — clone this repo into any folder, then run `biolab-fe`'s `setup.sh --local` and click **Use MARGIE locally on this computer** on the login page, pointing it at that folder. The app installs this backend's packages with `uv` and starts it on your computer (listening on `127.0.0.1` only). Local accounts need only a username and password. Running analyses locally is still in progress.
 
 Both routes drive this backend's `dane-api`, and both use the same licensing acceptance described above.
 

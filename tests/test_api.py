@@ -11,6 +11,7 @@ Tiers:
   5. Auth endpoints (register / login / me)
 """
 import io
+import os
 import uuid
 from unittest.mock import MagicMock, patch
 
@@ -1227,6 +1228,38 @@ class TestAuth:
     def test_me_with_invalid_token(self, client):
         resp = client.get("/v1/auth/me", headers={"Authorization": "Bearer not-a-real-token"})
         assert resp.status_code == 401
+
+    def test_register_without_cluster_fields_outside_local_mode(self, client, monkeypatch):
+        monkeypatch.delenv("BSP_LOCAL_MODE", raising=False)
+        resp = client.post("/v1/auth/register", json={"username": "u", "password": "p"})
+        assert resp.status_code == 400
+        assert "required" in resp.json()["detail"]
+
+    # --- local mode (no cluster) ---
+
+    @patch("bioinformatics_tools.api.routers.auth.ensure_remote_dane_wf")
+    @patch("bioinformatics_tools.api.routers.auth.make_user_connection")
+    def test_local_mode_register_login_me(self, mock_make_conn, mock_ensure, client, monkeypatch):
+        monkeypatch.setenv("BSP_LOCAL_MODE", "1")
+        resp = client.post("/v1/auth/register", json={"username": "local", "password": "pw"})
+        assert resp.status_code == 201
+        mock_make_conn.assert_not_called()   # no SSH anywhere
+        mock_ensure.assert_not_called()
+
+        token = client.post(
+            "/v1/auth/login", json={"username": "local", "password": "pw"}
+        ).json()["access_token"]
+        body = client.get("/v1/auth/me", headers={"Authorization": f"Bearer {token}"}).json()
+        assert body["cluster_host"] == "localhost"
+        assert body["home_dir"] == os.path.expanduser("~")
+
+    def test_local_mode_ignores_cluster_fields(self, client, monkeypatch):
+        monkeypatch.setenv("BSP_LOCAL_MODE", "1")
+        resp = client.post(
+            "/v1/auth/register",
+            json={**self.BASE_REG, "private_key": "not-a-key"},
+        )
+        assert resp.status_code == 201
 
     # --- protected endpoints require auth ---
 
