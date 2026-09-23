@@ -158,6 +158,43 @@ def genome_stem(name: str) -> str:
     return Path(name).stem
 
 
+def genome_calls(genomes: dict[str, str], config) -> dict[str, dict[str, str]]:
+    """Each genome's domain, genetic code and gene caller, before anything runs.
+
+    `margie_sb.genome_info` in the account's config.yaml (written by the web
+    app's Genomes page) maps a genome file name -- or its stem -- to
+    {domain, genetic_code}. The gene caller follows the local pipeline's rule
+    (run-prepare-genomes.sh): RASTtk needs both the domain and the genetic
+    code, so a genome with either unknown is called by Prodigal -- unless
+    GTDB-Tk runs, which works both out for every genome first.
+
+    Decided from config alone, so the Snakefile can split the genomes between
+    run_rasttk and run_prodigal when it is parsed, and workflow.py can tell
+    which genomes are Prodigal's (whose results must never meet the RASTtk
+    ones in output_cache: the feature ids differ).
+    """
+    run_gtdbtk = rc_bool('run_gtdbtk', True, config=config)
+    meta = rc('margie_sb.genome_info', None, config=config) or rc('genome_info', None, config=config) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    by_key = {}
+    for key, row in meta.items():
+        if isinstance(row, dict):
+            by_key.setdefault(str(key), row)
+            by_key.setdefault(genome_stem(str(key)), row)
+    out = {}
+    for genome, fasta in genomes.items():
+        row = by_key.get(Path(fasta).name) or by_key.get(genome) or {}
+        raw = str(row.get('domain') or '').strip().lower()
+        domain = 'Bacteria' if raw.startswith('b') else 'Archaea' if raw.startswith('a') else ''
+        code = str(row.get('genetic_code') or '').strip()
+        code = code if code.isdigit() else ''
+        caller = 'rasttk' if run_gtdbtk or (domain and code) else 'prodigal'
+        out[genome] = {'domain': domain, 'genetic_code': code, 'gene_caller': caller,
+                       'source': 'metadata' if domain or code else ('gtdbtk' if run_gtdbtk else 'none')}
+    return out
+
+
 def discover_genomes(input_path: str, recursive: bool = False) -> dict[str, str]:
     """Resolve an input path to a {stem: filepath} map. A single file
     resolves to one entry; a directory is scanned for recognized genome

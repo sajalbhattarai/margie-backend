@@ -24,10 +24,10 @@ import paramiko
 
 LOGGER = logging.getLogger(__name__)
 
-# Same fork margie.sh clones for a local dev launch -- kept in sync with
-# BACKEND_REPO_URL there so the bootstrap below and a laptop's `./margie.sh`
-# provision an identical checkout.
-_DANE_WF_REPO_URL = 'https://github.com/sajalbhattarai/bioinformatics-tools.git'
+# The same repository margie-frontend's hpc-connect.sh clones for the API
+# (BACKEND_REPO_URL, ~/margie-backend), so a first-time account's workflow
+# checkout and the API's are one codebase.
+_DANE_WF_REPO_URL = 'https://github.com/sajalbhattarai/margie-backend.git'
 # Branch margie_sb's remote checkouts should track once wintermutant has this
 # team's work -- for now this branch IS that work, still ahead of master.
 # margie itself is wintermutant's and is deliberately never auto-synced (see

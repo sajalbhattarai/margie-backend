@@ -186,9 +186,11 @@ MARGIE_SB_PHASED_TOOLS = [
     {'key': 'signalp4', 'label': 'SignalP4', 'phase': 8, 'sif': 'signalP4.sif', 'purpose': 'Signal peptide prediction (HPC module; kept until SignalP6 is confirmed)'},
     {'key': 'consolidation', 'label': 'Consolidation', 'phase': 9, 'sif': 'consolidation.sif', 'purpose': 'Consolidate upstream outputs', 'uses_container': False},
     {'key': 'labeling', 'label': 'Labeling', 'phase': 10, 'sif': 'labeling.sif', 'purpose': 'Label assignment', 'uses_container': False},
-    {'key': 'fingerprint', 'label': 'Fingerprint', 'phase': 11, 'sif': 'fingerprint.sif', 'purpose': 'Feature fingerprinting'},
+    # Host-side Python like consolidation/labeling (margie_sb.smk's run_fingerprint and
+    # update_fingerprint_database have no container:), so no .sif is checked or listed.
+    {'key': 'fingerprint', 'label': 'Fingerprint', 'phase': 11, 'sif': 'fingerprint.sif', 'purpose': 'Feature fingerprinting', 'uses_container': False},
     {'key': 'scoring_heuristic', 'label': 'Scoring', 'phase': 12, 'sif': 'scoring-heuristic.sif', 'purpose': 'Confidence scoring (statistical model)', 'uses_container': False},
-    {'key': 'fingerprint_database', 'label': 'Fingerprint Database', 'phase': 13, 'sif': 'fingerprint-database.sif', 'purpose': 'Fingerprint DB stage'},
+    {'key': 'fingerprint_database', 'label': 'Fingerprint Database', 'phase': 13, 'sif': 'fingerprint-database.sif', 'purpose': 'Fingerprint DB stage', 'uses_container': False},
     {'key': 'ani', 'label': 'ANI', 'phase': 14, 'sif': 'ani.sif', 'purpose': 'Average nucleotide identity'},
     {'key': 'aai', 'label': 'AAI', 'phase': 14, 'sif': 'aai.sif', 'purpose': 'Average amino acid identity'},
     {'key': 'closest', 'label': 'Closest', 'phase': 14, 'sif': 'closest.sif', 'purpose': 'Closest genome matching'},

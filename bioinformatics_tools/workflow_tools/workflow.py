@@ -25,7 +25,7 @@ from bioinformatics_tools.workflow_tools.output_cache import (
 from bioinformatics_tools.workflow_tools.load_to_db import is_already_processed, PIPELINE_VERSION, compute_fasta_hash
 from bioinformatics_tools.workflow_tools.programs import ProgramBase
 from bioinformatics_tools.workflow_tools.workflow_helpers import (
-    discover_genomes, get_workflow_prefix_for, WORKFLOW_PATH_DEFAULTS)
+    discover_genomes, get_workflow_prefix_for, WORKFLOW_PATH_DEFAULTS, genome_calls)
 from bioinformatics_tools.workflow_tools.workflow_registry import (
     MARGIE_SB_PHASED_TOOLS,
     WORKFLOWS,
@@ -748,7 +748,7 @@ class WorkflowBase(ProgramBase):
     def _run_pipeline_batch_sequential(self, key_name: str, smk_config: dict, genome_files: dict[str, str],
                                         cache_map_fn, mode='slurm', compute_config: dict = None,
                                         extra_resources: dict = None, sif_files_override: list[tuple] = None,
-                                        rerun_triggers: str = None):
+                                        rerun_triggers: str = None, prodigal_genomes: set[str] = frozenset()):
         '''Sequential-per-organism sibling of _run_pipeline_batch(), used by
         do_margie_sb() for margie_sb's phase-ordering requirement: RASTtk/
         GTDB-Tk (phase1-3) are bottlenecked on BV-BRC's remote service, so
@@ -806,6 +806,9 @@ class WorkflowBase(ProgramBase):
                     return 1
 
         db_path = smk_config.get('main_database')
+        # Off: nothing reads GTDB-Tk (margie_sb.smk's GENOME_INFO comes from
+        # margie_sb.genome_info), so its batch is neither restored nor run.
+        run_gtdbtk_enabled = smk_config.get('run_gtdbtk', True) not in (False, 'false', '0', 'no')
 
         restored: dict[str, dict[str, bool]] = {}
         rasttk_restored: dict[str, bool] = {}
@@ -828,12 +831,14 @@ class WorkflowBase(ProgramBase):
             # across the whole genome set, so _restore_gtdbtk_batch handles
             # that batch shape directly; rasttk is a normal per-genome rule
             # once gtdbtk's split outputs are in place.
-            gtdbtk_batch_hit = self._restore_gtdbtk_batch(db_path, genome_files, smk_config)
+            gtdbtk_batch_hit = run_gtdbtk_enabled and self._restore_gtdbtk_batch(db_path, genome_files, smk_config)
             if gtdbtk_batch_hit:
                 # Only worth attempting once gtdbtk's batch is a full hit --
                 # otherwise gtdbtk reruns for real and overwrites these with
                 # a fresher mtime anyway, forcing rasttk to rerun too.
                 for stem, genome_file in genome_files.items():
+                    if stem in prodigal_genomes:
+                        continue  # Prodigal's genes, not RASTtk's: never from the rasttk cache
                     hit = restore(db_path, genome_file, 'rasttk', self._rasttk_paths(stem, smk_config))
                     rasttk_restored[stem] = hit
                     if hit:
@@ -848,8 +853,6 @@ class WorkflowBase(ProgramBase):
         # remaining genomes need. Every wave is max_jobs_override=1 and the two
         # RASTtk waves are sequenced, so BV-BRC still only ever sees one
         # submission at a time (see this method's own docstring).
-        run_gtdbtk_enabled = smk_config.get('run_gtdbtk', True) not in (False, 'false', '0', 'no')
-
         def _stage1_targets(genome: str) -> list[str]:
             '''Same files rule rasttk_all asks for, for ONE genome -- the
             RASTtk DB token, plus the GTDB-Tk one when GTDB-Tk is selected.'''
@@ -862,8 +865,10 @@ class WorkflowBase(ProgramBase):
         # A genome is "ready" when its per-genome GTDB-Tk outputs are already on
         # disk, which after the restore above means output_cache had them. Those
         # genomes' run_rasttk needs nothing the batch produces.
+        # With GTDB-Tk off every genome is ready: nothing it produces is read.
         gtdbtk_ready = [g for g in genome_files
-                        if all(Path(p).exists() for p in self._gtdbtk_split_paths(g, smk_config))]
+                        if not run_gtdbtk_enabled
+                        or all(Path(p).exists() for p in self._gtdbtk_split_paths(g, smk_config))]
         gtdbtk_pending = [g for g in genome_files if g not in set(gtdbtk_ready)]
         LOGGER.info('Stage 1 waves: %d genome(s) have GTDB-Tk outputs already, %d still need the batch',
                     len(gtdbtk_ready), len(gtdbtk_pending))
@@ -918,7 +923,7 @@ class WorkflowBase(ProgramBase):
             # RASTtk: GTDB-Tk is the expensive highmem phase, and a downstream
             # RASTtk failure must not leave its already-loaded work uncached
             # (which previously forced a full GTDB-Tk rerun on the next run).
-            if db_path and not gtdbtk_batch_hit:
+            if db_path and run_gtdbtk_enabled and not gtdbtk_batch_hit:
                 for genome in genome_files:
                     if genome in gtdbtk_stored:
                         continue
@@ -931,10 +936,10 @@ class WorkflowBase(ProgramBase):
                     pending.discard(genome)
                     queue.append(genome)
                     if db_path:
-                        if not gtdbtk_batch_hit and genome not in gtdbtk_stored:
+                        if run_gtdbtk_enabled and not gtdbtk_batch_hit and genome not in gtdbtk_stored:
                             store(db_path, genome_files[genome], 'gtdbtk', self._gtdbtk_split_paths(genome, smk_config))
                             gtdbtk_stored.add(genome)
-                        if not rasttk_restored.get(genome, False):
+                        if genome not in prodigal_genomes and not rasttk_restored.get(genome, False):
                             store(db_path, genome_files[genome], 'rasttk', self._rasttk_paths(genome, smk_config))
 
             if not queue:
@@ -1024,7 +1029,10 @@ class WorkflowBase(ProgramBase):
                 # run even when every cached step was restored. Never take the
                 # already-processed fast-path while scoring is selected.
                 scoring_always_recomputes = smk_config.get('run_scoring', True) not in (False, 'false', '0', 'no')
-                if (is_already_processed(db_path, fasta_hash, PIPELINE_VERSION)
+                # A Prodigal genome restores nothing (see _genome_cache_map), so
+                # "nothing missing" says nothing about it: always compute.
+                if (genome not in prodigal_genomes
+                        and is_already_processed(db_path, fasta_hash, PIPELINE_VERSION)
                         and not missing_selected and not scoring_always_recomputes):
                     LOGGER.info('Genome %s already at pipeline version %s — skipping Stage 2 compute (all selected outputs restored from cache)',
                                 genome, PIPELINE_VERSION)
@@ -1514,10 +1522,18 @@ class WorkflowBase(ProgramBase):
             for tool in MARGIE_SB_PHASED_TOOLS:
                 run_flag = _tool_to_run_flag.get(tool['key'], f"run_{tool['key']}")
                 config_overrides[run_flag] = tool['key'] in selected_tool_keys
-            # gtdbtk/rasttk's container always runs even when deselected --
-            # run_gtdbtk=false only skips the DB load (rasttk can't be
-            # deselected at all) -- so their SIFs stay validated regardless.
-            sif_files_override = margie_sb_sif_files(selected_tool_keys | {'gtdbtk', 'rasttk'})
+            # rasttk can't be deselected (it is phase3's gate); gtdbtk's SIF is
+            # needed only when GTDB-Tk runs -- with it off, domain and genetic
+            # code come from margie_sb.genome_info and nothing reads GTDB-Tk.
+            # operon_fingerprint is not a registry tool of its own: its four
+            # shared operon-fingerprint databases grow with the gene
+            # fingerprint database (update_operon_fingerprint_database), so
+            # selecting fingerprint_database switches both on. Each script
+            # creates its database from scratch when none exists yet.
+            if config_overrides.get('run_fingerprint_database'):
+                config_overrides['run_operon_fingerprint'] = True
+            sif_files_override = margie_sb_sif_files(selected_tool_keys | {'rasttk'} | (
+                {'gtdbtk'} if config_overrides.get('run_gtdbtk', True) else set()))
 
         # --- Licensing gate ---------------------------------------------------
         # Require accepted terms (interactive first run, or web-app acceptance
@@ -1561,7 +1577,8 @@ class WorkflowBase(ProgramBase):
             for _tid in _disabled:
                 config_overrides[_tool_to_run_flag.get(_tid, f'run_{_tid}')] = False
             if selected_tools_raw:
-                _keep = (selected_tool_keys - _disabled) | {'gtdbtk', 'rasttk'}
+                _keep = (selected_tool_keys - _disabled) | {'rasttk'} | (
+                    {'gtdbtk'} if config_overrides.get('run_gtdbtk', True) else set())
             else:
                 _keep = _gateable_keys - _disabled
             sif_files_override = margie_sb_sif_files(_keep)
@@ -1569,6 +1586,19 @@ class WorkflowBase(ProgramBase):
                 'Licensing: disabled (not licensed for your usage type): %s',
                 ', '.join(sorted(_disabled)),
             )
+
+        # Genomes Prodigal calls instead of RASTtk: GTDB-Tk off and no domain
+        # or genetic code for them in margie_sb.genome_info (genome_calls; the
+        # Snakefile splits them the same way). Their container is checked like
+        # any other, and they never touch output_cache -- see _genome_cache_map.
+        _calls = genome_calls(genomes, {'run_gtdbtk': config_overrides.get('run_gtdbtk', True),
+                                        'margie_sb': self.conf.get('margie_sb', {})})
+        prodigal_genomes = {g for g, c in _calls.items() if c['gene_caller'] == 'prodigal'}
+        if prodigal_genomes:
+            LOGGER.info('Prodigal calls the genes of %d genome(s) with no domain or genetic code: %s',
+                        len(prodigal_genomes), ', '.join(sorted(prodigal_genomes)))
+            sif_files_override = [*(margie_sb_sif_files() if sif_files_override is None else sif_files_override),
+                                  ('prodigal.sif', 'latest')]
 
         def _genome_cache_map(genome: str) -> dict[str, list[str]]:
             '''Every phase4-8 tool's real output files for one genome, keyed by
@@ -1580,7 +1610,14 @@ class WorkflowBase(ProgramBase):
             batch-done marker that won't exist in a fresh output_dir, so
             Snakemake must replan the full batch regardless; rasttk's input is
             gtdbtk's per-genome split output, looping back into the same
-            problem.'''
+            problem.
+
+            Empty for a genome Prodigal calls: output_cache is keyed by the
+            FASTA and the tool, not the gene caller, and Prodigal's feature
+            ids are not RASTtk's -- a cached table from one must never be
+            restored beside the other's genes.'''
+            if genome in prodigal_genomes:
+                return {}
             prefix = get_workflow_prefix_for(genome, config_overrides)
             simple_tools = ['cog', 'pfam', 'merops', 'tcdb', 'uniprot', 'kegg', 'eggnog',
                             'dbcan', 'pgap', 'geneprop', 'operon', 'tmbed', 'signalp6',
@@ -1656,4 +1693,4 @@ class WorkflowBase(ProgramBase):
         self._run_pipeline_batch_sequential('margie_sb', config_overrides, genomes,
                                  cache_map_fn=_genome_cache_map, mode=mode, compute_config=compute_config,
                                  extra_resources=extra_resources, sif_files_override=sif_files_override,
-                                 rerun_triggers=rerun_triggers)
+                                 rerun_triggers=rerun_triggers, prodigal_genomes=prodigal_genomes)

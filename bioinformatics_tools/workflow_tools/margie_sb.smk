@@ -1,10 +1,11 @@
 
 import os
+import re
 import sys
 
 # Add current directory to path to import workflow_helpers
 sys.path.insert(0, os.path.dirname(workflow.snakefile))
-from workflow_helpers import rc, rc_bool, fixed_path, sif_path, db_path, db_token, discover_genomes, get_workflow_prefix_for, get_container_outputs_prefix_for
+from workflow_helpers import rc, rc_bool, fixed_path, sif_path, db_path, db_token, discover_genomes, genome_calls, get_workflow_prefix_for, get_container_outputs_prefix_for
 from load_to_db import PIPELINE_VERSION
 
 WORKFLOW_DIR = os.path.dirname(workflow.snakefile)
@@ -159,6 +160,35 @@ RASTTK_TOKEN = f"{GENOME_PREFIX}rasttk/rasttk_db.tkn"
 RASTTK_COMPUTE_TOKEN = f"{GENOME_PREFIX}rasttk/rasttk_compute.tkn"
 RASTTK_FAA = f"{GENOME_PREFIX}rasttk/rast.faa"
 RASTTK_GFF = f"{GENOME_PREFIX}rasttk/rast.gff"
+
+# Each genome's domain, genetic code and gene caller (genome_calls in
+# workflow_helpers.py). With GTDB-Tk on it classifies every genome and RASTtk
+# calls them all, as before. With it off, the domain and genetic code come
+# from margie_sb.genome_info in the config (the web app's Genomes page), and a
+# genome with either unknown is called by Prodigal instead -- RASTtk cannot
+# run without both. Prodigal writes RASTtk's own layout (rast.tsv/.faa/.gff,
+# same first 13 columns, same feature ids in the .faa and .gff), so every
+# rule after phase3 is the same for both.
+RUN_GTDBTK = rc_bool('run_gtdbtk', True, config=config)
+GENOME_CALLS = genome_calls(GENOMES, config)
+RASTTK_GENOMES = sorted(g for g, c in GENOME_CALLS.items() if c['gene_caller'] == 'rasttk')
+PRODIGAL_GENOMES = sorted(g for g, c in GENOME_CALLS.items() if c['gene_caller'] == 'prodigal')
+
+
+def _one_of(names):
+    """A {genome} wildcard constraint matching exactly these genomes (none: nothing)."""
+    return '|'.join(re.escape(n) for n in names) if names else '(?!)'
+
+
+# What every rule after phase2 reads for a genome's domain (GTDBTK_domain)
+# and RASTtk for its genetic code (translation_table) -- the same column names
+# as GTDB-Tk's own files, so their awk lines read either. Written from GTDB-Tk
+# when it runs, from the config's genome_info when it does not; the config
+# wins where it names a genome, as it does on this computer.
+GENOME_INFO = f"{GENOME_PREFIX}genome_info/genome_info.tsv"
+
+# Prodigal's own container outputs; the gene calls land in RASTTK_* above.
+PRODIGAL_CONTAINER_OUTPUTS = f"{CONTAINER_OUTPUTS_PREFIX}prodigal"
 
 # Phase4: functional annotation (12 tools). Each takes RASTTK_FAA + GTDBTK's
 # domain as input and writes <tool>_results.tsv. All 12 entrypoints share
@@ -885,7 +915,7 @@ rule run_consolidation:
     SLURM submission."""
     input:
         phase4_8=lambda wildcards: _phase4_8_targets_for_genome(wildcards.genome),
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         detected_columns=CONSOLIDATION_DETECTED_COLUMNS,
         merged=CONSOLIDATION_MERGED,
@@ -2269,16 +2299,66 @@ rule load_gtdbtk_to_db:
         """
 
 
+# A few lines of Python writing one small file: not worth a SLURM job.
+localrules: resolve_genome_info
+
+
+rule resolve_genome_info:
+    """One genome's domain, genetic code and gene caller, in the file every
+    rule after phase2 reads them from (GENOME_INFO, see its comment above).
+
+    With GTDB-Tk on, its per-genome results come in and supply both; a genome
+    named in margie_sb.genome_info keeps what is written there instead (the
+    person running it knows the organism). With GTDB-Tk off, nothing of
+    GTDB-Tk's is an input at all -- which is the point: its 400+ GB highmem
+    job no longer has to run for RASTtk or any phase4 tool to start. A domain
+    nobody knows is written as Unknown, which every phase4 entrypoint accepts,
+    and the genetic code is left empty (only RASTtk reads it, and a genome
+    without one is Prodigal's)."""
+    input:
+        unpack(lambda wildcards: {'gtdbtk_results': GTDBTK_RESULTS.format(genome=wildcards.genome),
+                                  'translation_table': GTDBTK_TRANSLATION_TABLE.format(genome=wildcards.genome)}
+               if RUN_GTDBTK else {})
+    output:
+        info=GENOME_INFO
+    run:
+        import csv
+        from pathlib import Path
+
+        call = GENOME_CALLS[wildcards.genome]
+        domain, code, source = call['domain'], call['genetic_code'], call['source']
+
+        def first_value(path, column):
+            with open(path, newline='') as fh:
+                for row in csv.DictReader(fh, delimiter='\t'):
+                    value = (row.get(column) or '').strip()
+                    if value:
+                        return value
+            return ''
+
+        if RUN_GTDBTK:
+            # The config only overrides what it actually names.
+            domain = domain or first_value(input.gtdbtk_results, 'GTDBTK_domain')
+            code = code or first_value(input.translation_table, 'translation_table')
+            if not call['domain'] and not call['genetic_code']:
+                source = 'gtdbtk'
+
+        target = Path(output.info)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open('w', newline='') as fh:
+            writer = csv.writer(fh, delimiter='\t', lineterminator='\n')
+            writer.writerow(['genome', 'GTDBTK_domain', 'translation_table', 'gene_caller', 'source'])
+            writer.writerow([wildcards.genome, domain or 'Unknown', code, call['gene_caller'], source])
+
+
 rule run_rasttk:
-    """RASTtk/BV-BRC structural annotation (margie_sb phase3). Depends on
-    run_gtdbtk's real outputs, not just its token -- RASTtk needs the
-    genome's actual NCBI genetic code (translation_table.tsv) and domain
-    (Bacteria/Archaea, from gtdbtk_results.tsv's GTDBTK_domain column) to
-    annotate correctly, so this is a hard biological dependency, not an
-    optional ordering hint. This means run_gtdbtk executes even if a user
-    sets run_gtdbtk=false while leaving run_rasttk=true -- gtdbtk's own
-    load_gtdbtk_to_db (DB load) is still skippable independently, since
-    nothing downstream needs that token, only the raw result files.
+    """RASTtk/BV-BRC structural annotation (margie_sb phase3). Needs the
+    genome's actual NCBI genetic code (translation_table) and domain
+    (Bacteria/Archaea, GTDBTK_domain) to annotate correctly -- a hard
+    biological dependency. Both come from GENOME_INFO: from GTDB-Tk when it
+    runs, from margie_sb.genome_info otherwise. A genome with either unknown
+    and GTDB-Tk off is not RASTtk's at all (wildcard_constraints below); it
+    goes to run_prodigal.
 
     --scientific is pinned to {wildcards.genome} (entrypoint.sh only
     sanitizes spaces -- underscores in genome stems pass through
@@ -2312,13 +2392,17 @@ rule run_rasttk:
     doesn't set the override) rather than the sole guarantee."""
     input:
         fasta=lambda wildcards: GENOMES[wildcards.genome],
-        gtdbtk_results=GTDBTK_RESULTS,
-        translation_table=GTDBTK_TRANSLATION_TABLE
+        gtdbtk_results=GENOME_INFO,
+        translation_table=GENOME_INFO
     output:
         results=RASTTK_RESULTS,
         faa=RASTTK_FAA,
         gff=RASTTK_GFF,
         tkn=RASTTK_COMPUTE_TOKEN
+    # Only the genomes RASTtk calls; run_prodigal below makes the same files
+    # for the rest, so exactly one of the two rules can make each genome's.
+    wildcard_constraints:
+        genome=_one_of(RASTTK_GENOMES)
     threads: rc('rasttk.threads', 8, config=config)
     resources:
         mem_mb=rc('rasttk.mem_mb', 8000, config=config),
@@ -2374,6 +2458,55 @@ rule run_rasttk:
         """
 
 
+rule run_prodigal:
+    """Prodigal gene calls (margie_sb phase3) for the genomes RASTtk cannot
+    take: GTDB-Tk is off and the config gives no domain or no genetic code
+    for them (PRODIGAL_GENOMES). The same default the local pipeline uses.
+
+    Makes exactly the files run_rasttk makes -- rast.tsv, rast.faa, rast.gff,
+    in rasttk/ -- because prodigal.sif's entrypoint writes RASTtk's layout
+    (format_gene_calls.py): the first 13 columns of rast.tsv are the same,
+    and the .faa and .gff share one set of feature ids, which is all
+    consolidation, operon, make-gff and every phase4 tool rely on. What
+    Prodigal does not produce is RASTtk's functional descriptions and EC
+    numbers; labeling and scoring already handle those being empty.
+
+    Local, not through BV-BRC: no mutex, no queue. -g is the genome's code
+    when the config has one, 11 otherwise (Prodigal's own default; the
+    entrypoint switches to meta mode under 20 kb, where -g does not apply)."""
+    input:
+        fasta=lambda wildcards: GENOMES[wildcards.genome],
+        info=GENOME_INFO
+    output:
+        results=RASTTK_RESULTS,
+        faa=RASTTK_FAA,
+        gff=RASTTK_GFF,
+        tkn=RASTTK_COMPUTE_TOKEN
+    wildcard_constraints:
+        genome=_one_of(PRODIGAL_GENOMES)
+    threads: rc('prodigal.threads', 1, config=config)
+    resources:
+        mem_mb=rc('prodigal.mem_mb', 4000, config=config),
+        runtime=runtime_min('prodigal.runtime', 60, config=config)
+    params:
+        output_dir=lambda wildcards: PRODIGAL_CONTAINER_OUTPUTS.format(genome=wildcards.genome)
+    container: sif_path('prodigal.sif', config=config, workflow_id='margie_sb')
+    shell:
+        """
+        echo "=== MARGIE_SB PHASE 3: PRODIGAL ({wildcards.genome}) ==="
+        DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.info})
+        GCODE=$(awk -F'\t' 'NR==1{{for(i=1;i<=NF;i++){{gsub(/\r/,"",$i); if($i=="translation_table") c=i}}}} NR>1{{gsub(/\r/,"",$c); if(c && $c!=""){{print $c; exit}}}}' {input.info})
+        /usr/local/bin/run -i {input.fasta} -o {params.output_dir} -g "${{GCODE:-11}}" --domain "${{DOMAIN:-Unknown}}" --organism-name {wildcards.genome} --force
+        mkdir -p $(dirname {output.results})
+        cp {params.output_dir}/gene_calls/* $(dirname {output.results})/
+        cp {params.output_dir}/gene_calls/genome.faa {output.faa}
+        cp {params.output_dir}/gene_calls/genome.gff {output.gff}
+        cp {params.output_dir}/processed/prodigal_gene_calls.tsv {output.results}
+        echo prodigal > $(dirname {output.results})/gene_caller.txt
+        echo "prodigal complete for {wildcards.genome}" > {output.tkn}
+        """
+
+
 rule load_rasttk_to_db:
     """Load RASTtk annotation results into SQLite database"""
     input:
@@ -2396,7 +2529,7 @@ rule run_cog:
     path fully predictable, so unlike phase1-3 no find is needed."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['cog'],
         tkn=PHASE4_COMPUTE_TOKENS['cog']
@@ -2449,7 +2582,7 @@ rule run_pfam:
     Same shape as run_cog."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['pfam'],
         tkn=PHASE4_COMPUTE_TOKENS['pfam']
@@ -2495,7 +2628,7 @@ rule run_tigrfam:
     tigrfam's own normalised processed/tigrfam_results.tsv."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['tigrfam'],
         domtbl=TIGRFAM_DOMTBL,
@@ -2540,7 +2673,7 @@ rule run_merops:
     Same shape as run_cog."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['merops'],
         tkn=PHASE4_COMPUTE_TOKENS['merops']
@@ -2584,7 +2717,7 @@ rule run_tcdb:
     Same shape as run_cog, plus a percent-identity cutoff (--id)."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['tcdb'],
         tkn=PHASE4_COMPUTE_TOKENS['tcdb']
@@ -2629,7 +2762,7 @@ rule run_uniprot:
     blastp). Same shape as run_tcdb."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['uniprot'],
         tkn=PHASE4_COMPUTE_TOKENS['uniprot']
@@ -2674,7 +2807,7 @@ rule run_kegg:
     as run_cog (no evalue flag -- KofamScan uses its own per-KO thresholds)."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['kegg'],
         tkn=PHASE4_COMPUTE_TOKENS['kegg']
@@ -2717,7 +2850,7 @@ rule run_eggnog:
     as run_cog."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['eggnog'],
         tkn=PHASE4_COMPUTE_TOKENS['eggnog']
@@ -2760,7 +2893,7 @@ rule run_dbcan:
     HMM consensus). Same shape as run_cog."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['dbcan'],
         tkn=PHASE4_COMPUTE_TOKENS['dbcan']
@@ -2804,7 +2937,7 @@ rule run_pgap:
     NCBI's hmm_PGAP.LIB). Same shape as run_cog."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['pgap'],
         tkn=PHASE4_COMPUTE_TOKENS['pgap']
@@ -2858,7 +2991,7 @@ rule run_interpro:
     config if it runs short."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['interpro'],
         perdb=list(INTERPRO_PERDB_RESULTS.values()),
@@ -2968,7 +3101,7 @@ rule run_geneprop:
     tools (pure post-processing against EBI's genome-properties rules)."""
     input:
         faa=RASTTK_FAA,
-        gtdbtk_results=GTDBTK_RESULTS,
+        gtdbtk_results=GENOME_INFO,
         tigrfam_domtbl=TIGRFAM_DOMTBL
     output:
         results=PHASE4_RESULTS['geneprop'],
@@ -3019,7 +3152,7 @@ rule run_operon:
     input:
         faa=RASTTK_FAA,
         gff=RASTTK_GFF,
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=OPERON_RESULTS,
         tkn=OPERON_COMPUTE_TOKEN
@@ -3245,7 +3378,7 @@ rule run_envelope:
         pgap=PHASE4_RESULTS['pgap'],
         pfam=PHASE4_RESULTS['pfam'],
         uniprot=PHASE4_RESULTS['uniprot'],
-        gtdbtk_results=GTDBTK_RESULTS
+        gtdbtk_results=GENOME_INFO
     output:
         results=ENVELOPE_RESULTS,
         summary=ENVELOPE_SUMMARY,
