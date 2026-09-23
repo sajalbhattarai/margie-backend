@@ -1441,6 +1441,34 @@ def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_curre
 
     _check_genome_path_exists(genome_path, genome_data.workflow, conn)
 
+    # A subset of a folder: stage those genomes into a folder of their own and
+    # run that instead. A workflow annotates everything it is pointed at, so
+    # narrowing the run means narrowing the folder -- there is no per-genome
+    # flag anywhere in the chain to set.
+    #
+    # An empty list is a mistake worth reporting rather than quietly running
+    # the whole folder, which is the opposite of what was asked.
+    if genome_data.genomes is not None:
+        if not genome_data.genomes:
+            raise HTTPException(status_code=400, detail="No genomes were selected.")
+        if ssh_sftp.check_remote_path_kind(genome_path, conn) != 'dir':
+            raise HTTPException(
+                status_code=400,
+                detail="Choosing genomes needs a folder to choose from; this run points at a single file.",
+            )
+        try:
+            genome_path = ssh_sftp.stage_selected_genomes(
+                genome_path, genome_data.genomes, conn, label=current_user["username"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        LOGGER.info(
+            "Running %d selected genome(s) from a staged folder: %s",
+            len(genome_data.genomes), genome_path,
+        )
+
     # Validates phase/tool selection, if given -- catch typos here rather than
     # have them silently no-op as an unrecognized run_<tool> config key.
     # `is not None` (not a truthiness check) matters here: an explicit empty

@@ -9,8 +9,10 @@ All functions are API-layer only. Pass a per-user SSHConnection built
 with make_user_connection() for every call.
 """
 import logging
+import re
 import shlex
 import stat
+import time
 
 import yaml
 
@@ -253,6 +255,65 @@ def copy_remote_directory(
             raise RuntimeError(f'rsync failed (exit {exit_code}) copying {src_path} to {dest_path}: {err}')
     finally:
         pass  # pooled client: closing it would defeat SSHConnection's pool
+
+
+def stage_selected_genomes(
+    source_dir: str,
+    names: list[str],
+    connection: SSHConnection,
+    label: str = '',
+) -> str:
+    """Build a folder on the cluster holding only the chosen genomes, and
+    return its absolute path.
+
+    A workflow is pointed at a folder and annotates everything in it; there is
+    no "run only these" flag anywhere in the chain. So to run a subset, the
+    subset is given a folder of its own.
+
+    The entries are symlinks, not copies: a genome is tens of megabytes, the
+    run only ever reads them, and hundreds of them would otherwise be
+    duplicated on scratch for no reason. Creating them is a single
+    exec_command, so the API process never touches the bytes.
+
+    The folder lives under the user's home, which is always writable and
+    always present -- unlike scratch, whose path differs between clusters.
+    Old selections are left where they are: they are a handful of symlinks
+    each, and they record what a finished job was actually given.
+
+    Raises ValueError for a name that is not a plain file name, and
+    RuntimeError if the remote command fails.
+    """
+    if not names:
+        raise ValueError('No genomes were selected.')
+    for name in names:
+        # These come from a browser, so they are checked rather than trusted:
+        # anything with a slash in it could reach outside source_dir.
+        if not name or '/' in name or name in ('.', '..'):
+            raise ValueError(f'Not a genome file name: {name!r}')
+
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    suffix = f"-{re.sub(r'[^A-Za-z0-9]+', '-', label).strip('-')}" if label else ''
+    rel = f'.margie/selections/{stamp}{suffix}'
+
+    src = shlex.quote(source_dir.rstrip('/'))
+    links = ' && '.join(
+        f'ln -sfn {src}/{shlex.quote(n)} "$d"/{shlex.quote(n)}' for n in names
+    )
+    # printf at the end so the absolute path comes back without a trailing
+    # newline to strip off guesswork later.
+    cmd = f'd="$HOME"/{shlex.quote(rel)} && mkdir -p "$d" && {links} && printf %s "$d"'
+
+    ssh = connection.connect()
+    LOGGER.info('Staging %d selected genome(s) from %s', len(names), source_dir)
+    _, stdout, stderr = ssh.exec_command(cmd)
+    out = stdout.read().decode('utf-8', errors='replace').strip()
+    exit_code = stdout.channel.recv_exit_status()
+    if exit_code != 0 or not out:
+        err = stderr.read().decode('utf-8', errors='replace')
+        raise RuntimeError(
+            f'Could not stage the selected genomes on the cluster (exit {exit_code}): {err or "no path returned"}'
+        )
+    return out
 
 
 def _build_path_rewrite_script(directory: str, old_path: str, new_path: str) -> str:

@@ -28,6 +28,11 @@ class GenomeSend(BaseModel):
     output_dir: str | None = None  # base path; timestamp appended server-side; falls back to output_path config
     workflow: str = 'margie_sb'
     selected_tools: list[str] | None = None  # tool keys to run (see MARGIE_SB_PHASED_TOOLS); omit/None runs everything
+    # File names (not paths) within genome_path to run, when it is a folder and
+    # only some of it is wanted. Omit/None runs the whole folder, which is what
+    # a workflow does on its own; a subset is staged into a folder of symlinks
+    # first (see ssh_sftp.stage_selected_genomes).
+    genomes: list[str] | None = None
     run_full_operon_map: bool = False  # opt-in: full per-genome operon atlas (heavy), downstream of the report figures
 
 
