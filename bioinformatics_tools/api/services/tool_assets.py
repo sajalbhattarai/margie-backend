@@ -13,8 +13,10 @@ A missing one comes from the first of these that has it:
               and the shared copy is there (and readable from this account);
   2. pull  -- margie_sb.container_registry (e.g. docker://ghcr.io/<owner>),
               containers only, tag margie_sb.container_tag (default latest);
-  3. build -- margie-build's recipes (build.sh), run on the cluster: phases
-              1-8's containers, and the 15 reference databases. Its five
+  3. build -- margie-build's recipes (build.sh), run on the cluster, from
+              margie_sb.build_repo when set, else the lab's copy on depot
+              (BUILD_FOLDER), else GitHub: phases 1-8's containers, and the
+              15 reference databases. Its five
               licence-gated tools build only with the licence accepted, in
               words, for that run.
 Nothing already there is replaced or deleted, and nothing is written under
@@ -53,6 +55,8 @@ OPTIONAL = {'gtdbtk', 'llm'}
 GENE_CALLER = {'key': 'prodigal', 'label': 'Prodigal', 'sif': 'prodigal.sif'}
 
 # What margie-build (build.sh) can make.
+# The lab's copy on depot first (lab accounts can read it); GitHub otherwise.
+BUILD_FOLDER = f'{user_stores.DEPOT}/margie-build'
 BUILD_REPO = 'https://github.com/sajalbhattarai/margie-build.git'
 BUILDABLE_IMAGES = {'quast', 'gtdbtk', 'prodigal', 'rasttk', 'cog', 'dbcan', 'eggnog', 'geneprop', 'interpro', 'kegg',
                     'merops', 'pfam', 'pgap', 'tcdb', 'tigrfam', 'uniprot', 'operon', 'phobius', 'tmbed', 'envelope',
@@ -346,7 +350,11 @@ def start(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[s
     for link in p['links']:
         steps.append(['link', link['src'], link['dst']])
     if p['builds']:
-        steps.append(['repo', str(_cfg_get(cfg, f'{WORKFLOW}.build_repo') or BUILD_REPO).strip()])
+        chosen = str(_cfg_get(cfg, f'{WORKFLOW}.build_repo') or '').strip()
+        if not chosen:
+            code, _ = _run(conn, f'test -r {shlex.quote(BUILD_FOLDER)}/build.sh')
+            chosen = BUILD_FOLDER if code == 0 else BUILD_REPO
+        steps.append(['repo', chosen])
     for i in p['items']:
         what = 'container' if i['kind'] == 'image' else 'database'
         if i['action'] == 'copy':

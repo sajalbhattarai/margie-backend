@@ -411,7 +411,7 @@ def _settle_pid(conn, op: dict) -> dict:
 #   mkdir<TAB>path
 #   link<TAB>src<TAB>dst                        symlink dst -> src, unless dst exists
 #   pull<TAB>label<TAB>url<TAB>dst              apptainer pull url -> dst (via dst.partial)
-#   repo<TAB>url                                where margie-build comes from, for build
+#   repo<TAB>url-or-folder                      where margie-build comes from, for build
 #   build<TAB>label<TAB>mode<TAB>tool<TAB>sifdir<TAB>dbdir<TAB>statement
 #                                               margie-build's build.sh --<mode> <tool>;
 #                                               a statement accepts a gated tool's licence
@@ -486,7 +486,15 @@ while IFS=$'\t' read -r kind a b c d e f; do
       say running "$label" 0 ""
       echo "== $label" >> "$log"
       repo="$dir/margie-build"
-      if [ ! -d "$repo/.git" ]; then
+      if [ -d "${repo_url:-}" ]; then
+        # A folder on the cluster (the lab's copy on depot): copied fresh once per
+        # setup, without its git history or whoever's own .build-config.sh is in it.
+        if [ -z "${repo_copied:-}" ]; then
+          mkdir -p "$repo" && rsync -a --delete --exclude .git --exclude .build-config.sh "$repo_url/" "$repo/" >> "$log" 2>&1 \
+            || fail "$label" "could not copy margie-build from $repo_url"
+          repo_copied=1
+        fi
+      elif [ ! -d "$repo/.git" ]; then
         GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 "${repo_url:-}" "$repo" >> "$log" 2>&1 \
           || fail "$label" "could not download margie-build from ${repo_url:-nowhere} (is it public?)"
       fi
