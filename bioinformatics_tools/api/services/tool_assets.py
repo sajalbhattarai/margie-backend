@@ -13,10 +13,12 @@ A missing one comes from the first of these that has it:
               and the shared copy is there (and readable from this account);
   2. pull  -- margie_sb.container_registry (e.g. docker://ghcr.io/<owner>),
               containers only, tag margie_sb.container_tag (default latest);
-  3. build -- margie-build's recipes (build.sh), run on the cluster, from
-              margie_sb.build_repo when set, else the lab's copy on depot
-              (BUILD_FOLDER), else GitHub: phases 1-8's containers, and the
-              15 reference databases. Its five
+  3. build -- margie-build's recipes (build.sh), run on the cluster from
+              wherever they already are (build_recipes: margie_sb.build_repo,
+              else the lab's copy on depot, else the user's own clone). Only
+              where there is none does the user clone one, from Install
+              (clone_recipes). Phases 1-8's containers, and the 15 reference
+              databases. Its five
               licence-gated tools build only with the licence accepted, in
               words, for that run.
 Nothing already there is replaced or deleted, and nothing is written under
@@ -55,8 +57,11 @@ OPTIONAL = {'gtdbtk', 'llm'}
 GENE_CALLER = {'key': 'prodigal', 'label': 'Prodigal', 'sif': 'prodigal.sif'}
 
 # What margie-build (build.sh) can make.
-# The lab's copy on depot first (lab accounts can read it); GitHub otherwise.
+# Where margie-build is looked for on the cluster, after margie_sb.build_repo:
+# the lab's copy on depot (lab accounts can read it), then the user's own clone.
 BUILD_FOLDER = f'{user_stores.DEPOT}/margie-build'
+CLONE_NAME = 'margie-build'
+# What a clone is made from when neither is there.
 BUILD_REPO = 'https://github.com/sajalbhattarai/margie-build.git'
 BUILDABLE_IMAGES = {'quast', 'gtdbtk', 'prodigal', 'rasttk', 'cog', 'dbcan', 'eggnog', 'geneprop', 'interpro', 'kegg',
                     'merops', 'pfam', 'pgap', 'tcdb', 'tigrfam', 'uniprot', 'operon', 'phobius', 'tmbed', 'envelope',
@@ -131,6 +136,37 @@ has() {
 }
 writable() { d=$(near "$1"); [ -w "$d" ] && [ -x "$d" ] && echo w || echo r; }
 '''
+
+
+def build_recipes(conn, cfg: dict, home: str) -> dict:
+    """Where margie-build is on the cluster, if anywhere: {path, source, ...}."""
+    chosen = str(_cfg_get(cfg, f'{WORKFLOW}.build_repo') or '').strip()
+    clone_to = f"{home.rstrip('/')}/{CLONE_NAME}"
+    places = ([('settings', _expand(chosen, home))] if chosen and '://' not in chosen else []) + [
+        ('lab', BUILD_FOLDER), ('yours', clone_to)]
+    q = shlex.quote
+    code, out = _run(conn, '; '.join(f'test -r {q(p)}/build.sh && echo {i}' for i, (_, p) in enumerate(places)))
+    found = [int(x) for x in out.split() if x.isdigit()]
+    source, path = places[found[0]] if found else (None, None)
+    return {'path': path, 'source': source, 'clone_to': clone_to, 'url': BUILD_REPO}
+
+
+def clone_recipes(conn, cfg: dict, home: str, url: str | None = None) -> dict:
+    """Clone margie-build into the user's home (or update that clone), and
+    point margie_sb.build_repo at it. The caller saves the config."""
+    url = (url or BUILD_REPO).strip()
+    dest = f"{home.rstrip('/')}/{CLONE_NAME}"
+    q = shlex.quote
+    code, out = _run(conn, f'if [ -d {q(dest)}/.git ]; then GIT_TERMINAL_PROMPT=0 git -C {q(dest)} pull -q --ff-only; '
+                           f'elif [ -e {q(dest)} ]; then echo "{dest} is there and is not a git clone" >&2; exit 3; '
+                           f'else GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 {q(url)} {q(dest)}; fi', timeout=600)
+    if code != 0:
+        tail = ' '.join(out.strip().splitlines()[-3:])
+        raise StoreError(f'Could not clone {url} into {dest}: {tail or "git failed"}. '
+                         'A private repository cannot be cloned from the cluster without a login; '
+                         'give a URL the cluster can reach.', 409)
+    user_stores._cfg_set(cfg, f'{WORKFLOW}.build_repo', dest)
+    return build_recipes(conn, cfg, home)
 
 
 def status(conn, cfg: dict, home: str) -> dict:
@@ -247,6 +283,7 @@ def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[st
     accept = accept or set()
     st = status(conn, cfg, home)
     root = user_stores.scratch_root(conn, cfg)
+    recipes = build_recipes(conn, cfg, home)
     rows = st['rows']
     todo = [r for r in rows if r['status'] != 'ok']
     items: list[dict] = []
@@ -262,6 +299,9 @@ def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[st
             return False
         if not r['source']:
             skip(r, 'nothing to copy it from: not in the lab folder, no container registry set, and margie-build has no recipe for it')
+            return False
+        if r['source'] == 'build' and not recipes['path']:
+            skip(r, 'only margie-build can make it, and margie-build is not on the cluster yet (set it up above)')
             return False
         if r['source'] == 'build' and not include_builds:
             skip(r, 'only margie-build can make it, and building was left out')
@@ -318,6 +358,7 @@ def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[st
         'builds': sum(1 for i in items if i['action'] == 'build'),
         'gated': sorted({r['tool'] for r in todo if r['source'] == 'build' and r['gated']}),
         'statement': LICENCE_STATEMENT,
+        'recipes': recipes,
     }
 
 
@@ -350,11 +391,7 @@ def start(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[s
     for link in p['links']:
         steps.append(['link', link['src'], link['dst']])
     if p['builds']:
-        chosen = str(_cfg_get(cfg, f'{WORKFLOW}.build_repo') or '').strip()
-        if not chosen:
-            code, _ = _run(conn, f'test -r {shlex.quote(BUILD_FOLDER)}/build.sh')
-            chosen = BUILD_FOLDER if code == 0 else BUILD_REPO
-        steps.append(['repo', chosen])
+        steps.append(['repo', p['recipes']['path']])
     for i in p['items']:
         what = 'container' if i['kind'] == 'image' else 'database'
         if i['action'] == 'copy':

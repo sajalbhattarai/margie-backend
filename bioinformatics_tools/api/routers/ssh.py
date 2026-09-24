@@ -1458,6 +1458,25 @@ def setup_assets(body: dict | None = None, current_user: dict = Depends(get_curr
                         bool(body.get("builds", True)), accepted, bool(body.get("optional", False)))
 
 
+@router.get("/assets/build-recipes")
+def get_build_recipes(current_user: dict = Depends(get_current_user)):
+    """Where margie-build is on the cluster (the lab's copy, the user's clone), if anywhere."""
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    return _stores_call(tool_assets.build_recipes, conn, user_config, current_user["home_dir"])
+
+
+@router.post("/assets/build-recipes")
+def clone_build_recipes(body: dict | None = None, current_user: dict = Depends(get_current_user)):
+    """Clone margie-build into the user's home (only needed where the cluster has
+    no copy), and point margie_sb.build_repo at it. body: {url}."""
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    found = _stores_call(tool_assets.clone_recipes, conn, user_config, current_user["home_dir"], (body or {}).get("url"))
+    ssh_sftp.write_remote_yaml(_config_path(current_user["home_dir"]), user_config, connection=conn)
+    return found
+
+
 def _check_margie_sb_assets(genome_data: GenomeSend, genome_path: str, user_config: dict, conn, current_user: dict) -> None:
     """Refuse a run that needs a container or database that is not there --
     it would otherwise fail at that tool, hours in. A folder this account
