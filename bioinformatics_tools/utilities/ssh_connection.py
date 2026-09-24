@@ -51,9 +51,13 @@ _MARGIE_SB_REF = os.getenv('BSP_MARGIE_SB_REF', 'for-website-deployment')
 # request rather than raising.
 _POOL: dict = {}
 _POOL_LOCK = threading.Lock()
-# Long enough to cover a browsing session, short enough that a stale client is
-# not kept around indefinitely.
-_POOL_TTL = 600.0
+# A pooled client is kept for as long as it works. It used to be replaced
+# every 10 minutes, and the replaced one was never closed: a paramiko
+# transport is a running thread, which keeps it alive whoever else lets go,
+# so a server up for hours held dozens of connections to the cluster (36
+# after 5.5 hours, 2026-09-24) and answered ever more slowly. Keepalives let
+# a connection the network dropped be noticed and replaced instead.
+_KEEPALIVE_SECONDS = 30
 
 
 def _pool_key(host, username, pkey, key_filename):
@@ -125,6 +129,9 @@ class SSHConnection:
             connect_kwargs['key_filename'] = self.key_filename
         # If neither is set, paramiko falls back to the system SSH agent (CLI default)
         ssh.connect(self.host, **connect_kwargs)
+        transport = ssh.get_transport()
+        if transport is not None:
+            transport.set_keepalive(_KEEPALIVE_SECONDS)
         LOGGER.debug('Connected to %s as %s', self.host, self.username)
         return ssh
 
@@ -169,36 +176,34 @@ class SSHConnection:
                         alive = transport.is_active() and transport.is_authenticated()
                     except Exception:
                         alive = False
-                if alive and now - created < _POOL_TTL:
+                if alive:
                     LOGGER.debug('Reusing pooled SSH connection to %s', self.host)
                     return client
-                # Dead or expired: bin it and fall through to reconnect, so a
-                # dropped connection heals silently instead of erroring.
-                #
-                # Evicting must NOT close a client that is still alive. This
-                # line used to close unconditionally, and the TTL branch is
-                # reached on a perfectly healthy connection -- one that a
-                # workflow run had been handed and was still streaming from.
-                # Closing it set paramiko's _transport = None underneath that
-                # run, whose next exec_command then died with "'NoneType'
-                # object has no attribute 'open_session'". job_runner recorded
-                # that as the ANALYSIS failing, ~4 minutes into a run that was
-                # in fact still submitting SLURM jobs on the cluster, and the
-                # job page showed a failed job with no SLURM jobs and a
-                # one-line log. Dropping the reference is enough: a holder
-                # keeps its client alive, and paramiko closes it on GC once
-                # nobody holds it. Only an already-dead transport is closed
-                # here, where there is nothing left to tear down.
+                # Dead: bin it and fall through to reconnect, so a dropped
+                # connection heals silently instead of erroring. Only a dead
+                # client is ever evicted, so closing it takes nothing from
+                # anyone (a live one must never be closed under a request or
+                # a run that is still using it).
                 _POOL.pop(key, None)
-                if not alive:
-                    try:
-                        client.close()
-                    except Exception:
-                        pass
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
         ssh = self._handshake()
         with _POOL_LOCK:
-            _POOL[key] = (ssh, time.time())
+            # Requests that found the pool empty together each made a client;
+            # the first one in is kept and the others close theirs.
+            hit = _POOL.get(key)
+            if hit:
+                other = hit[0].get_transport()
+                if other is not None and other.is_active():
+                    try:
+                        ssh.close()
+                    except Exception:
+                        pass
+                    return hit[0]
+            _POOL[key] = (ssh, now)
         return ssh
 
 
