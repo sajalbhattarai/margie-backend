@@ -119,6 +119,10 @@ _DB_ID_HYPOTHETICAL_RE = re.compile(
 )
 # Group 4 — eggNOG "Belongs to the UPF#### family" (Uncharacterized Protein Family).
 _UPF_ONLY_RE = re.compile(r'^\s*belongs to the upf\d+', re.IGNORECASE)
+# eggNOG describes orthologous groups of no known function with a PSORT
+# localisation guess ("Psort location Cytoplasmic, score 8.87"): where the
+# protein may sit, not what it does -- never a product name.
+_PSORT_ONLY_RE = re.compile(r'^\s*psort location\b', re.IGNORECASE)
 # Group 5 — a description that is nothing but a DUF tag ("Pfam:DUF955", "DUF955 family").
 _BARE_DUF_RE = re.compile(r'^\s*(?:pfam:)?\(?duf\d+\)?(?:\s+(?:family|domain))?\s*$', re.IGNORECASE)
 # Group 6 — "protein containing domains DUF###" (RAST multi-DUF stubs).
@@ -158,7 +162,7 @@ def is_uninformative(val: str) -> bool:
             return True
     # Groups 8, 4, 5, 6
     if (_UNKNOWN_FUNC_RE.match(v) or _DB_ID_HYPOTHETICAL_RE.match(v)
-            or _UPF_ONLY_RE.match(v) or _BARE_DUF_RE.match(v)
+            or _UPF_ONLY_RE.match(v) or _PSORT_ONLY_RE.match(v) or _BARE_DUF_RE.match(v)
             or _HYPOTHETICAL_ANYWHERE_RE.search(v)
             or _PROTEIN_CONSERVED_IN_BACTERIA_RE.search(v)
             or _INTEGRAL_MEMBRANE_PROTEIN_RE.match(v)
