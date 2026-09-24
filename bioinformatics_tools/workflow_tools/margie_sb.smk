@@ -167,6 +167,28 @@ RASTTK_COMPUTE_TOKEN = f"{GENOME_PREFIX}rasttk/rasttk_compute.tkn"
 RASTTK_FAA = f"{GENOME_PREFIX}rasttk/rast.faa"
 RASTTK_GFF = f"{GENOME_PREFIX}rasttk/rast.gff"
 
+# Per-protein cache (protein_cache.py). Before a genome's Stage 2, workflow.py
+# writes, for each tool in protein_cache.TOOLS, <tool>/protein-cache/novel.faa
+# -- the proteins that tool has not annotated before -- and the cached ones'
+# rows. The tool's rule then reads novel.faa (pc_faa), skips the tool when it
+# is empty, and merges its own rows with the cached ones (PC_MERGE, a POSIX sh
+# script in the output folder, where every container can read it). Without a
+# novel.faa (cache off, or a whole-genome output_cache hit) the rule reads
+# rast.faa and the merge is a plain copy, as before.
+import protein_cache as _protein_cache
+PC_MERGE = _protein_cache.install_merge_script(_OUTPUT_ROOT or os.path.join(WORKFLOW_DIR, '.protein-cache-local'))
+
+
+def pc_dir(tool):
+    return lambda wildcards: f"{GENOME_PREFIX}{tool}/{_protein_cache.PC_DIR}".format(genome=wildcards.genome)
+
+
+def pc_faa(tool):
+    def _faa(wildcards):
+        novel = f"{GENOME_PREFIX}{tool}/{_protein_cache.PC_DIR}/novel.faa".format(genome=wildcards.genome)
+        return novel if os.path.exists(novel) else RASTTK_FAA.format(genome=wildcards.genome)
+    return _faa
+
 # Each genome's domain, genetic code and gene caller (genome_calls in
 # workflow_helpers.py). With GTDB-Tk on it classifies every genome and RASTtk
 # calls them all, as before. With it off, the domain and genetic code come
@@ -2535,7 +2557,7 @@ rule run_cog:
     {wildcards.genome} makes cog's own <organism>/processed/cog_results.tsv
     path fully predictable, so unlike phase1-3 no find is needed."""
     input:
-        faa=RASTTK_FAA,
+        faa=pc_faa('cog'),
         gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['cog'],
@@ -2555,6 +2577,8 @@ rule run_cog:
         runtime=runtime_min('cog.runtime', 60, config=config),
         margie_sb_phase4_slot=1
     params:
+        pc=pc_dir('cog'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('cog.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}cog".format(genome=wildcards.genome), config=config),
         db=db_path('cog', config=config, workflow_id='margie_sb'),
         evalue=rc('cog.evalue', '1e-2', config=config)
@@ -2563,8 +2587,13 @@ rule run_cog:
         """
         echo "=== MARGIE_SB PHASE 4: COG ({wildcards.genome}) ==="
         DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.gtdbtk_results})
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} -e {params.evalue} --organism-name {wildcards.genome} --domain "$DOMAIN"
-        cp {params.output_dir}/{wildcards.genome}/processed/cog_results.tsv {output.results}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} -e {params.evalue} --organism-name {wildcards.genome} --domain "$DOMAIN"
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/cog_results.tsv" {output.results} {params.pc} cog_results.tsv tsv
         echo "cog complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -2588,7 +2617,7 @@ rule run_pfam:
     """Pfam domain annotation (margie_sb phase4, HMMER hmmscan --cut_ga).
     Same shape as run_cog."""
     input:
-        faa=RASTTK_FAA,
+        faa=pc_faa('pfam'),
         gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['pfam'],
@@ -2600,6 +2629,8 @@ rule run_pfam:
         runtime=runtime_min('pfam.runtime', 60, config=config),
         margie_sb_phase4_slot=1
     params:
+        pc=pc_dir('pfam'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('pfam.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}pfam".format(genome=wildcards.genome), config=config),
         db=db_path('pfam', config=config, workflow_id='margie_sb')
     container: sif_path('pfam.sif', config=config, workflow_id='margie_sb')
@@ -2607,8 +2638,13 @@ rule run_pfam:
         """
         echo "=== MARGIE_SB PHASE 4: PFAM ({wildcards.genome}) ==="
         DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.gtdbtk_results})
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
-        cp {params.output_dir}/{wildcards.genome}/processed/pfam_results.tsv {output.results}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/pfam_results.tsv" {output.results} {params.pc} pfam_results.tsv tsv
         echo "pfam complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -2634,7 +2670,7 @@ rule run_tigrfam:
     domtblout as TIGRFAM_DOMTBL -- geneprop needs that raw file, not
     tigrfam's own normalised processed/tigrfam_results.tsv."""
     input:
-        faa=RASTTK_FAA,
+        faa=pc_faa('tigrfam'),
         gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['tigrfam'],
@@ -2646,6 +2682,8 @@ rule run_tigrfam:
         runtime=runtime_min('tigrfam.runtime', 60, config=config),
         margie_sb_phase4_slot=1
     params:
+        pc=pc_dir('tigrfam'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('tigrfam.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}tigrfam".format(genome=wildcards.genome), config=config),
         db=db_path('tigrfam', config=config, workflow_id='margie_sb')
     container: sif_path('tigrfam.sif', config=config, workflow_id='margie_sb')
@@ -2653,9 +2691,14 @@ rule run_tigrfam:
         """
         echo "=== MARGIE_SB PHASE 4: TIGRFAM ({wildcards.genome}) ==="
         DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.gtdbtk_results})
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
-        cp {params.output_dir}/{wildcards.genome}/processed/tigrfam_results.tsv {output.results}
-        cp {params.output_dir}/{wildcards.genome}/raw/tigrfam_domtbl.out {output.domtbl}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/tigrfam_results.tsv" {output.results} {params.pc} tigrfam_results.tsv tsv
+        sh {params.merge} "$SRC/raw/tigrfam_domtbl.out" {output.domtbl} {params.pc} tigrfam_domtbl.out domtbl
         echo "tigrfam complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -2679,7 +2722,7 @@ rule run_merops:
     """MEROPS peptidase identification (margie_sb phase4, DIAMOND blastp).
     Same shape as run_cog."""
     input:
-        faa=RASTTK_FAA,
+        faa=pc_faa('merops'),
         gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['merops'],
@@ -2690,6 +2733,8 @@ rule run_merops:
         runtime=runtime_min('merops.runtime', 30, config=config),
         margie_sb_phase4_slot=1
     params:
+        pc=pc_dir('merops'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('merops.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}merops".format(genome=wildcards.genome), config=config),
         db=db_path('merops', config=config, workflow_id='margie_sb'),
         evalue=rc('merops.evalue', '1e-5', config=config)
@@ -2698,8 +2743,13 @@ rule run_merops:
         """
         echo "=== MARGIE_SB PHASE 4: MEROPS ({wildcards.genome}) ==="
         DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.gtdbtk_results})
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} -e {params.evalue} --organism-name {wildcards.genome} --domain "$DOMAIN"
-        cp {params.output_dir}/{wildcards.genome}/processed/merops_results.tsv {output.results}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} -e {params.evalue} --organism-name {wildcards.genome} --domain "$DOMAIN"
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/merops_results.tsv" {output.results} {params.pc} merops_results.tsv tsv
         echo "merops complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -2723,7 +2773,7 @@ rule run_tcdb:
     """TCDB transporter classification (margie_sb phase4, DIAMOND blastp).
     Same shape as run_cog, plus a percent-identity cutoff (--id)."""
     input:
-        faa=RASTTK_FAA,
+        faa=pc_faa('tcdb'),
         gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['tcdb'],
@@ -2734,6 +2784,8 @@ rule run_tcdb:
         runtime=runtime_min('tcdb.runtime', 30, config=config),
         margie_sb_phase4_slot=1
     params:
+        pc=pc_dir('tcdb'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('tcdb.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}tcdb".format(genome=wildcards.genome), config=config),
         db=db_path('tcdb', config=config, workflow_id='margie_sb'),
         evalue=rc('tcdb.evalue', '1e-5', config=config),
@@ -2743,8 +2795,13 @@ rule run_tcdb:
         """
         echo "=== MARGIE_SB PHASE 4: TCDB ({wildcards.genome}) ==="
         DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.gtdbtk_results})
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} -e {params.evalue} --id {params.pct_id} --organism-name {wildcards.genome} --domain "$DOMAIN"
-        cp {params.output_dir}/{wildcards.genome}/processed/tcdb_results.tsv {output.results}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} -e {params.evalue} --id {params.pct_id} --organism-name {wildcards.genome} --domain "$DOMAIN"
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/tcdb_results.tsv" {output.results} {params.pc} tcdb_results.tsv tsv
         echo "tcdb complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -2768,7 +2825,7 @@ rule run_uniprot:
     """UniProt/Swiss-Prot homology search (margie_sb phase4, DIAMOND
     blastp). Same shape as run_tcdb."""
     input:
-        faa=RASTTK_FAA,
+        faa=pc_faa('uniprot'),
         gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['uniprot'],
@@ -2779,6 +2836,8 @@ rule run_uniprot:
         runtime=runtime_min('uniprot.runtime', 30, config=config),
         margie_sb_phase4_slot=1
     params:
+        pc=pc_dir('uniprot'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('uniprot.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}uniprot".format(genome=wildcards.genome), config=config),
         db=db_path('uniprot', config=config, workflow_id='margie_sb'),
         evalue=rc('uniprot.evalue', '1e-5', config=config),
@@ -2788,8 +2847,13 @@ rule run_uniprot:
         """
         echo "=== MARGIE_SB PHASE 4: UNIPROT ({wildcards.genome}) ==="
         DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.gtdbtk_results})
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} -e {params.evalue} --id {params.pct_id} --organism-name {wildcards.genome} --domain "$DOMAIN"
-        cp {params.output_dir}/{wildcards.genome}/processed/uniprot_results.tsv {output.results}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} -e {params.evalue} --id {params.pct_id} --organism-name {wildcards.genome} --domain "$DOMAIN"
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/uniprot_results.tsv" {output.results} {params.pc} uniprot_results.tsv tsv
         echo "uniprot complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -2813,7 +2877,7 @@ rule run_kegg:
     """KEGG Orthology annotation (margie_sb phase4, KofamScan). Same shape
     as run_cog (no evalue flag -- KofamScan uses its own per-KO thresholds)."""
     input:
-        faa=RASTTK_FAA,
+        faa=pc_faa('kegg'),
         gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['kegg'],
@@ -2824,6 +2888,8 @@ rule run_kegg:
         runtime=runtime_min('kegg.runtime', 90, config=config),
         margie_sb_phase4_slot=1
     params:
+        pc=pc_dir('kegg'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('kegg.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}kegg".format(genome=wildcards.genome), config=config),
         db=db_path('kegg', config=config, workflow_id='margie_sb')
     container: sif_path('kegg.sif', config=config, workflow_id='margie_sb')
@@ -2831,8 +2897,13 @@ rule run_kegg:
         """
         echo "=== MARGIE_SB PHASE 4: KEGG ({wildcards.genome}) ==="
         DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.gtdbtk_results})
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
-        cp {params.output_dir}/{wildcards.genome}/processed/kegg_results.tsv {output.results}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/kegg_results.tsv" {output.results} {params.pc} kegg_results.tsv tsv
         echo "kegg complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -2856,7 +2927,7 @@ rule run_eggnog:
     """eggNOG-mapper orthology annotation (margie_sb phase4). Same shape
     as run_cog."""
     input:
-        faa=RASTTK_FAA,
+        faa=pc_faa('eggnog'),
         gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['eggnog'],
@@ -2867,6 +2938,8 @@ rule run_eggnog:
         runtime=runtime_min('eggnog.runtime', 90, config=config),
         margie_sb_phase4_slot=1
     params:
+        pc=pc_dir('eggnog'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('eggnog.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}eggnog".format(genome=wildcards.genome), config=config),
         db=db_path('eggnog', config=config, workflow_id='margie_sb')
     container: sif_path('eggnog.sif', config=config, workflow_id='margie_sb')
@@ -2874,8 +2947,13 @@ rule run_eggnog:
         """
         echo "=== MARGIE_SB PHASE 4: EGGNOG ({wildcards.genome}) ==="
         DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.gtdbtk_results})
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
-        cp {params.output_dir}/{wildcards.genome}/processed/eggnog_results.tsv {output.results}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/eggnog_results.tsv" {output.results} {params.pc} eggnog_results.tsv tsv
         echo "eggnog complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -2899,7 +2977,7 @@ rule run_dbcan:
     """dbCAN CAZyme annotation (margie_sb phase4, DIAMOND + HMMER + sub-family
     HMM consensus). Same shape as run_cog."""
     input:
-        faa=RASTTK_FAA,
+        faa=pc_faa('dbcan'),
         gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['dbcan'],
@@ -2911,6 +2989,8 @@ rule run_dbcan:
         runtime=runtime_min('dbcan.runtime', 60, config=config),
         margie_sb_phase4_slot=1
     params:
+        pc=pc_dir('dbcan'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('dbcan.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}dbcan".format(genome=wildcards.genome), config=config),
         db=db_path('dbcan', config=config, workflow_id='margie_sb')
     container: sif_path('dbcan.sif', config=config, workflow_id='margie_sb')
@@ -2918,8 +2998,13 @@ rule run_dbcan:
         """
         echo "=== MARGIE_SB PHASE 4: DBCAN ({wildcards.genome}) ==="
         DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.gtdbtk_results})
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
-        cp {params.output_dir}/{wildcards.genome}/processed/dbcan_results.tsv {output.results}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/dbcan_results.tsv" {output.results} {params.pc} dbcan_results.tsv tsv
         echo "dbcan complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -2943,7 +3028,7 @@ rule run_pgap:
     """PGAP HMM annotation (margie_sb phase4, HMMER hmmscan --cut_tc against
     NCBI's hmm_PGAP.LIB). Same shape as run_cog."""
     input:
-        faa=RASTTK_FAA,
+        faa=pc_faa('pgap'),
         gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['pgap'],
@@ -2954,6 +3039,8 @@ rule run_pgap:
         runtime=runtime_min('pgap.runtime', 60, config=config),
         margie_sb_phase4_slot=1
     params:
+        pc=pc_dir('pgap'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('pgap.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}pgap".format(genome=wildcards.genome), config=config),
         db=db_path('pgap', config=config, workflow_id='margie_sb')
     container: sif_path('pgap.sif', config=config, workflow_id='margie_sb')
@@ -2961,8 +3048,13 @@ rule run_pgap:
         """
         echo "=== MARGIE_SB PHASE 4: PGAP ({wildcards.genome}) ==="
         DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.gtdbtk_results})
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
-        cp {params.output_dir}/{wildcards.genome}/processed/pgap_results.tsv {output.results}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} --organism-name {wildcards.genome} --domain "$DOMAIN"
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/pgap_results.tsv" {output.results} {params.pc} pgap_results.tsv tsv
         echo "pgap complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -2997,7 +3089,7 @@ rule run_interpro:
     run's actual usage, not a measured figure; adjust interpro.mem_mb in
     config if it runs short."""
     input:
-        faa=RASTTK_FAA,
+        faa=pc_faa('interpro'),
         gtdbtk_results=GENOME_INFO
     output:
         results=PHASE4_RESULTS['interpro'],
@@ -3028,6 +3120,8 @@ rule run_interpro:
         # run_interpro's own footprint.
         margie_sb_phase4_slot=1
     params:
+        pc=pc_dir('interpro'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('interpro.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}interpro".format(genome=wildcards.genome), config=config),
         db=db_path('interpro', config=config, workflow_id='margie_sb'),
         apps=rc('interpro.applications', INTERPRO_DEFAULT_APPS, config=config),
@@ -3038,16 +3132,16 @@ rule run_interpro:
         echo "=== MARGIE_SB PHASE 4: INTERPRO ({wildcards.genome}) ==="
         DOMAIN=$(awk -F'\\t' 'NR==1{{for(i=1;i<=NF;i++) if($i=="GTDBTK_domain") c=i}} NR==2{{print $c}}' {input.gtdbtk_results})
         OUT_DIR=$(dirname {output.results})
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} -a {params.apps} --organism-name {wildcards.genome} --domain "$DOMAIN" 2>&1 | tee "$OUT_DIR/interpro_container.log"
-        cp {params.output_dir}/{wildcards.genome}/processed/interpro_results.tsv {output.results}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -d {params.db} -t {threads} -a {params.apps} --organism-name {wildcards.genome} --domain "$DOMAIN" 2>&1 | tee "$OUT_DIR/interpro_container.log"
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/interpro_results.tsv" {output.results} {params.pc} interpro_results.tsv tsv
         for db in {params.db_basenames}; do
-            SRC="{params.output_dir}/{wildcards.genome}/processed/interpro_${{db}}_results.tsv"
-            if [[ -f "$SRC" ]]; then
-                cp "$SRC" "$OUT_DIR/interpro_${{db}}_results.tsv"
-            else
-                echo "[interpro] WARNING: $db produced no output file at all, writing empty stub" >&2
-                touch "$OUT_DIR/interpro_${{db}}_results.tsv"
-            fi
+            # A database with no output at all leaves an empty stub, as before.
+            sh {params.merge} "$SRC/processed/interpro_${{db}}_results.tsv" "$OUT_DIR/interpro_${{db}}_results.tsv" {params.pc} "interpro_${{db}}_results.tsv" "tsv?"
         done
         echo "interpro complete for {wildcards.genome}" > {output.tkn}
         """
@@ -3202,7 +3296,7 @@ rule run_phobius:
     no database. Also exposes phobius_top1.tsv (per-protein summary)
     alongside the per-segment phobius_results.tsv."""
     input:
-        faa=RASTTK_FAA
+        faa=pc_faa('phobius')
     output:
         results=PHOBIUS_RESULTS,
         top1=PHOBIUS_TOP1,
@@ -3212,14 +3306,21 @@ rule run_phobius:
         mem_mb=rc('phobius.mem_mb', 2000, config=config),
         runtime=runtime_min('phobius.runtime', 30, config=config)
     params:
+        pc=pc_dir('phobius'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('phobius.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}phobius".format(genome=wildcards.genome), config=config)
     container: sif_path('phobius.sif', config=config, workflow_id='margie_sb')
     shell:
         """
         echo "=== MARGIE_SB PHASE 6: PHOBIUS ({wildcards.genome}) ==="
-        /usr/local/bin/run -i {input.faa} -o {params.output_dir} -t {threads} --organism-name {wildcards.genome}
-        cp {params.output_dir}/{wildcards.genome}/processed/phobius_results.tsv {output.results}
-        cp {params.output_dir}/{wildcards.genome}/processed/phobius_top1.tsv {output.top1}
+        if [ -s {input.faa} ]; then
+            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -t {threads} --organism-name {wildcards.genome}
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/phobius_results.tsv" {output.results} {params.pc} phobius_results.tsv tsv
+        sh {params.merge} "$SRC/processed/phobius_top1.tsv" {output.top1} {params.pc} phobius_top1.tsv tsv
         echo "phobius complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -3258,7 +3359,7 @@ rule run_tmbed:
     CPU-only for now (no --use-gpu); the entrypoint supports it if a
     larger genome ever makes CPU inference too slow."""
     input:
-        faa=RASTTK_FAA
+        faa=pc_faa('tmbed')
     output:
         results=TMBED_RESULTS,
         tkn=TMBED_COMPUTE_TOKEN
@@ -3267,18 +3368,25 @@ rule run_tmbed:
         mem_mb=rc('margie_sb.tmbed.mem_mb', rc('tmbed.mem_mb', 32000, config=config), config=config),
         runtime=runtime_min('margie_sb.tmbed.runtime', rc('tmbed.runtime', 240, config=config), config=config)
     params:
+        pc=pc_dir('tmbed'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('tmbed.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}tmbed".format(genome=wildcards.genome), config=config),
         model_dir=db_path('tmbed', config=config, workflow_id='margie_sb'),
         sif=sif_path('tmbed.sif', config=config, workflow_id='margie_sb')
     shell:
         """
         echo "=== MARGIE_SB PHASE 6: TMBED ({wildcards.genome}) ==="
-        apptainer exec \
-            -B {params.model_dir}/t5:/usr/local/lib/python3.11/site-packages/tmbed/models/t5 \
-            -B {params.model_dir}/cnn:/usr/local/lib/python3.11/site-packages/tmbed/models/cnn \
-            {params.sif} \
-            /usr/local/bin/run -i {input.faa} -o {params.output_dir} -t {threads} --organism-name {wildcards.genome}
-        cp {params.output_dir}/{wildcards.genome}/processed/tmbed_results.tsv {output.results}
+        if [ -s {input.faa} ]; then
+            apptainer exec \
+                -B {params.model_dir}/t5:/usr/local/lib/python3.11/site-packages/tmbed/models/t5 \
+                -B {params.model_dir}/cnn:/usr/local/lib/python3.11/site-packages/tmbed/models/cnn \
+                {params.sif} \
+                /usr/local/bin/run -i {input.faa} -o {params.output_dir} -t {threads} --organism-name {wildcards.genome}
+            SRC={params.output_dir}/{wildcards.genome}
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/processed/tmbed_results.tsv" {output.results} {params.pc} tmbed_results.tsv tsv
         echo "tmbed complete for {wildcards.genome}" > {output.tkn}
         """
 
@@ -3321,7 +3429,7 @@ rule run_signalp6:
     plateaus around 8 effective cores (user-time/real-time ratio was ~7.7x
     at 10 allocated), hence 8 here rather than 10."""
     input:
-        faa=RASTTK_FAA
+        faa=pc_faa('signalp6')
     output:
         results=SIGNALP6_RESULTS,
         tkn=SIGNALP6_COMPUTE_TOKEN
@@ -3330,6 +3438,8 @@ rule run_signalp6:
         mem_mb=rc('signalp6.mem_mb', 5000, config=config),
         runtime=runtime_min('signalp6.runtime', 15, config=config)
     params:
+        pc=pc_dir('signalp6'),
+        merge=PC_MERGE,
         output_dir=lambda wildcards: rc('signalp6.output_dir', f"{CONTAINER_OUTPUTS_PREFIX}signalp6".format(genome=wildcards.genome), config=config),
         process_script=SIGNALP6_PROCESS_SCRIPT
     envmodules:
@@ -3341,18 +3451,23 @@ rule run_signalp6:
         RAW_DIR={params.output_dir}/raw
         PROCESSED_DIR={params.output_dir}/processed
         mkdir -p "$RAW_DIR" "$PROCESSED_DIR"
-        SIGNALP6_CMD="signalp6 --fastafile {input.faa} --output_dir $RAW_DIR --organism other --mode fast --format none"
-        $SIGNALP6_CMD
-        {LOADER_PYTHON} {params.process_script} \
-            --input "$RAW_DIR/prediction_results.txt" \
-            --output "$PROCESSED_DIR/signalp6_results.tsv" \
-            --organism-name {wildcards.genome} \
-            --tool-used "SignalP 6.0" \
-            --command-used "$SIGNALP6_CMD" \
-            --database-used "SignalP6 bundled model | biocontainers/default + signalp6/6.0-fast" \
-            --input-path {input.faa} \
-            --output-path "$RAW_DIR"
-        cp "$PROCESSED_DIR/signalp6_results.tsv" {output.results}
+        if [ -s {input.faa} ]; then
+            SIGNALP6_CMD="signalp6 --fastafile {input.faa} --output_dir $RAW_DIR --organism other --mode fast --format none"
+            $SIGNALP6_CMD
+            {LOADER_PYTHON} {params.process_script} \
+                --input "$RAW_DIR/prediction_results.txt" \
+                --output "$PROCESSED_DIR/signalp6_results.tsv" \
+                --organism-name {wildcards.genome} \
+                --tool-used "SignalP 6.0" \
+                --command-used "$SIGNALP6_CMD" \
+                --database-used "SignalP6 bundled model | biocontainers/default + signalp6/6.0-fast" \
+                --input-path {input.faa} \
+                --output-path "$RAW_DIR"
+            SRC="$PROCESSED_DIR"
+        else
+            SRC=/nonexistent/protein-cache  # every protein's rows come from the cache
+        fi
+        sh {params.merge} "$SRC/signalp6_results.tsv" {output.results} {params.pc} signalp6_results.tsv tsv
         echo "signalp6 complete for {wildcards.genome}" > {output.tkn}
         """
 

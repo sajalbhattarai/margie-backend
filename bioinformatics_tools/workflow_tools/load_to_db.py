@@ -33,6 +33,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from bioinformatics_tools.workflow_tools.genome_identity import genome_hash, genome_hashes
+except ImportError:  # run as a script, or imported from margie_sb.smk
+    from genome_identity import genome_hash, genome_hashes
+
 # consolidated-merged-all-columns.tsv carries columns like na_seq/aa_seq and
 # concatenated multi-tool command_used strings well past Python's csv
 # module's 131072-byte default field limit -- without raising it, loading
@@ -113,11 +118,19 @@ def _compute_file_hash(file_path: str) -> str:
     return sha256.hexdigest()
 
 
-# Public alias used by workflow.py to compute the genome FASTA hash that
-# keys is_already_processed().  Returns the full 64-char SHA-256 — distinct
-# from output_cache.compute_file_hash which truncates to 16 chars for
-# the tool output cache.
-compute_fasta_hash = _compute_file_hash
+# A genome's identity in run_log: its sequence hash (genome_identity), so the
+# same genome in a differently formatted file is still "already processed".
+# Records written before it carry the file's byte hash (_compute_file_hash);
+# every lookup below takes both (fasta_hashes), and new records are written
+# under the first.
+compute_fasta_hash = genome_hash
+fasta_hashes = genome_hashes
+
+
+def _hash_list(fasta_hash) -> list[str]:
+    """One hash or several (fasta_hashes()) as a list, empty ones dropped."""
+    hashes = [fasta_hash] if isinstance(fasta_hash, str) else list(fasta_hash or [])
+    return [h for h in hashes if h]
 
 
 def _ensure_run_log(conn: sqlite3.Connection) -> None:
@@ -130,7 +143,7 @@ def _ensure_run_log(conn: sqlite3.Connection) -> None:
 
 
 def _already_loaded(db_path: str, input_hash: str, tool: str,
-                    fasta_hash: str | None = None) -> bool:
+                    fasta_hash=None) -> bool:
     """Return True if this tool's data is already current in the DB.
 
     When fasta_hash is provided, the check is (fasta_hash, PIPELINE_VERSION,
@@ -139,16 +152,18 @@ def _already_loaded(db_path: str, input_hash: str, tool: str,
     """
     if not Path(db_path).exists():
         return False
+    hashes = _hash_list(fasta_hash)
 
     def _check() -> bool:
         conn = _get_connection(db_path)
         try:
             _ensure_run_log(conn)
-            if fasta_hash:
+            if hashes:
                 row = conn.execute(
                     "SELECT id FROM run_log "
-                    "WHERE fasta_hash = ? AND pipeline_version = ? AND tool = ? AND status = 'success'",
-                    (fasta_hash, PIPELINE_VERSION, tool),
+                    f"WHERE fasta_hash IN ({','.join('?' * len(hashes))}) "
+                    "AND pipeline_version = ? AND tool = ? AND status = 'success'",
+                    (*hashes, PIPELINE_VERSION, tool),
                 ).fetchone()
             else:
                 row = conn.execute(
@@ -162,15 +177,19 @@ def _already_loaded(db_path: str, input_hash: str, tool: str,
     return _retry_operation(_check)
 
 
-def is_already_processed(db_path: str, fasta_hash: str,
+def is_already_processed(db_path: str, fasta_hash,
                          pipeline_version: str = PIPELINE_VERSION,
                          tool: str = "scoring_confidence_final") -> bool:
     """Return True when this genome FASTA was fully processed at pipeline_version.
 
     workflow.py calls this before launching Stage 2 so it can skip the
     entire Snakemake run for organisms already at the current version.
+    fasta_hash: one hash, or fasta_hashes() to match records under either.
     """
     if not Path(db_path).exists():
+        return False
+    hashes = _hash_list(fasta_hash)
+    if not hashes:
         return False
 
     def _check() -> bool:
@@ -179,8 +198,9 @@ def is_already_processed(db_path: str, fasta_hash: str,
             _ensure_run_log(conn)
             row = conn.execute(
                 "SELECT id FROM run_log "
-                "WHERE fasta_hash = ? AND pipeline_version = ? AND tool = ? AND status = 'success'",
-                (fasta_hash, pipeline_version, tool),
+                f"WHERE fasta_hash IN ({','.join('?' * len(hashes))}) "
+                "AND pipeline_version = ? AND tool = ? AND status = 'success'",
+                (*hashes, pipeline_version, tool),
             ).fetchone()
             return row is not None
         finally:
@@ -189,7 +209,7 @@ def is_already_processed(db_path: str, fasta_hash: str,
     return _retry_operation(_check)
 
 
-def _organism_names_for_fasta(db_path: str, fasta_hash: str) -> set[str]:
+def _organism_names_for_fasta(db_path: str, fasta_hash) -> set[str]:
     """Every organism_name this FASTA has ever been loaded under.
 
     A genome's identity is its sequence, not its label. When the same FASTA is
@@ -197,7 +217,8 @@ def _organism_names_for_fasta(db_path: str, fasta_hash: str) -> set[str]:
     the OLD name -- and those rows are keyed only by organism_name, so a delete
     scoped to the new name cannot see them.
     """
-    if not fasta_hash:
+    hashes = _hash_list(fasta_hash)
+    if not hashes:
         return set()
 
     def _query() -> set[str]:
@@ -206,8 +227,9 @@ def _organism_names_for_fasta(db_path: str, fasta_hash: str) -> set[str]:
             _ensure_run_log(conn)
             rows = conn.execute(
                 "SELECT DISTINCT organism_name FROM run_log "
-                "WHERE fasta_hash = ? AND organism_name IS NOT NULL AND organism_name != ''",
-                (fasta_hash,),
+                f"WHERE fasta_hash IN ({','.join('?' * len(hashes))}) "
+                "AND organism_name IS NOT NULL AND organism_name != ''",
+                tuple(hashes),
             ).fetchall()
             return {r[0] for r in rows}
         finally:
@@ -221,7 +243,7 @@ def _organism_names_for_fasta(db_path: str, fasta_hash: str) -> set[str]:
 
 def _delete_stale_organism_rows(db_path: str, table_name: str,
                                 organism_name: str,
-                                fasta_hash: str | None = None) -> int:
+                                fasta_hash=None) -> int:
     """Delete existing rows for THIS GENOME from table_name before reloading.
 
     Called only when _already_loaded() returned False, so this is always safe:
@@ -569,7 +591,9 @@ def main():
         sys.exit(1)
 
     label = args.source_tool if args.format == "gff" else args.table_name
-    fasta_hash = _compute_file_hash(args.fasta) if getattr(args, "fasta", None) else None
+    # Looked up under the sequence hash and the older byte hash; recorded under the first.
+    hashes = fasta_hashes(args.fasta) if getattr(args, "fasta", None) else []
+    fasta_hash = hashes[0] if hashes else None
     organism_name = getattr(args, "delete_organism", None)
 
     # Version-aware skip: if this FASTA was already loaded at PIPELINE_VERSION, skip.
@@ -577,7 +601,7 @@ def main():
     # operon reference grows over time, so the same genome must be re-scored and the
     # DB refreshed each run (see rule load_scoring_to_db in margie_sb.smk).
     input_hash = _compute_file_hash(args.input_file)
-    if not getattr(args, "force", False) and _already_loaded(args.db_path, input_hash, label, fasta_hash=fasta_hash):
+    if not getattr(args, "force", False) and _already_loaded(args.db_path, input_hash, label, fasta_hash=hashes):
         print(f"Skipped {label}: already at pipeline version {PIPELINE_VERSION}")
         if args.token:
             Path(args.token).parent.mkdir(parents=True, exist_ok=True)
@@ -589,7 +613,7 @@ def main():
     # if current-version rows were already present.
     if organism_name:
         deleted = _delete_stale_organism_rows(args.db_path, label, organism_name,
-                                              fasta_hash=fasta_hash)
+                                              fasta_hash=hashes)
         if deleted:
             print(f"Deleted {deleted} stale rows from {label} (pre-delete before reload)")
 

@@ -22,7 +22,8 @@ from bioinformatics_tools.workflow_tools.output_cache import (
     cached_tools, current_rast_genome_id, log_workflow_run, realign_rast_genome_id,
     restore, restore_all, store, store_all,
 )
-from bioinformatics_tools.workflow_tools.load_to_db import is_already_processed, PIPELINE_VERSION, compute_fasta_hash
+from bioinformatics_tools.workflow_tools.load_to_db import is_already_processed, PIPELINE_VERSION, fasta_hashes
+from bioinformatics_tools.workflow_tools import protein_cache
 from bioinformatics_tools.workflow_tools.programs import ProgramBase
 from bioinformatics_tools.workflow_tools.workflow_helpers import (
     discover_genomes, get_workflow_prefix_for, WORKFLOW_PATH_DEFAULTS, genome_calls)
@@ -908,6 +909,10 @@ class WorkflowBase(ProgramBase):
         stage2_target = 'phase4_12_one_genome_no_llm' if run_llm_enabled else 'phase4_12_one_genome'
         LOGGER.info('LLM enabled: %s  →  Stage 2 target: %s', run_llm_enabled, stage2_target)
 
+        # What the per-protein cache reads: the account's config and this run's settings.
+        pc_cfg = {**(self.conf or {}), **smk_config}
+        pc_on = bool(db_path) and key_name == 'margie_sb' and protein_cache.enabled(pc_cfg)
+
         total = len(genome_files)
         pending = set(genome_files.keys())
         queue: list[str] = []
@@ -1011,6 +1016,34 @@ class WorkflowBase(ProgramBase):
                     LOGGER.warning('No single RASTtk genome id readable from %s — skipping '
                                    'cache realignment for %s', rast_ref, genome)
 
+            # Per-protein cache (protein_cache.py): for each selected tool that
+            # output_cache did not restore whole, the proteins it has annotated
+            # before (in any genome) come from the cache and only the rest go to
+            # the tool. Restored tools read rast.faa as before; they are still
+            # stored below, so the cache learns every genome's proteins.
+            pc_prefix = get_workflow_prefix_for(genome, smk_config)
+            pc_faa_path = f"{pc_prefix}rasttk/rast.faa"
+            pc_tools: list[str] = []
+            pc_stored: set[str] = set()
+            if pc_on and Path(pc_faa_path).exists():
+                pc_tools = [t for t in protein_cache.TOOLS
+                            if smk_config.get(f'run_{t}', True) not in (False, 'false', '0', 'no')]
+                to_split = [t for t in pc_tools if not genome_restored.get(t, False)]
+                for t in pc_tools:
+                    if t not in to_split:
+                        protein_cache.clear(pc_prefix, t)
+                try:
+                    counts = protein_cache.split(db_path, pc_faa_path, pc_prefix, genome, to_split, pc_cfg)
+                    served = {t: c for t, c in counts.items() if c[0]}
+                    LOGGER.info('Protein cache for %s: %s', genome,
+                                ', '.join(f'{t} {c}/{c + n} cached' for t, (c, n) in counts.items()) or 'no tool to split')
+                    if served:
+                        LOGGER.info('Protein cache: %d tool(s) run on fewer proteins for %s', len(served), genome)
+                except Exception as exc:
+                    LOGGER.warning('Protein cache split failed for %s (tools run on every protein): %s', genome, exc)
+                    for t in to_split:
+                        protein_cache.clear(pc_prefix, t)
+
             # Skip Stage 2 COMPUTE only when this genome is already at the
             # current PIPELINE_VERSION AND every SELECTED step was actually
             # restored from cache above — then there is nothing left to compute.
@@ -1019,7 +1052,7 @@ class WorkflowBase(ProgramBase):
             # Snakemake computes just the missing selected steps; the cache-hit
             # files restored above are skipped by their fresh mtime.
             if db_path:
-                fasta_hash = compute_fasta_hash(genome_files[genome])
+                fasta_hash = fasta_hashes(genome_files[genome])
                 missing_selected = [
                     t for t, hit in genome_restored.items()
                     if not hit and smk_config.get(f'run_{t}', True) not in (False, 'false', '0', 'no')
@@ -1070,6 +1103,17 @@ class WorkflowBase(ProgramBase):
             def _store_ready_tools():
                 if not db_path:
                     return
+                # Each tool's proteins, once its results are loaded (its db token).
+                for t in pc_tools:
+                    if t in pc_stored or not Path(f"{pc_prefix}{t}/{t}_db.tkn").exists():
+                        continue
+                    pc_stored.add(t)
+                    try:
+                        added = protein_cache.store(db_path, pc_faa_path, pc_prefix, t, pc_cfg)
+                        if added:
+                            LOGGER.info('Protein cache: %d new protein(s) of %s kept for %s', added, genome, t)
+                    except Exception as exc:
+                        LOGGER.warning('Protein cache store failed for %s / %s: %s', genome, t, exc)
                 for tool, paths in genome_cache_map.items():
                     if tool in genome_stored or genome_restored.get(tool, False):
                         continue

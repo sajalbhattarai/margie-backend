@@ -8,6 +8,12 @@ has already been processed, even across fresh timestamped working directories.
 
 Copy the ``.db`` file to another server and it carries the cached outputs
 with it — no separate cache directory needed.
+
+A genome's key is its sequence hash (genome_identity.genome_hash), so the same
+genome saved with different line widths, case or line endings is still a hit.
+Entries written before that are keyed by the first 16 hex characters of the
+file's byte hash; they are still found (_input_hashes), and new ones are
+written under the sequence hash.
 """
 import hashlib
 import logging
@@ -17,6 +23,11 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    from bioinformatics_tools.workflow_tools.genome_identity import genome_hash, legacy_file_hash
+except ImportError:  # imported from margie_sb.smk, with this folder on sys.path
+    from genome_identity import genome_hash, legacy_file_hash
 
 LOGGER = logging.getLogger(__name__)
 
@@ -96,13 +107,17 @@ def _retry_operation(func, max_retries: int = 3, initial_delay: float = 0.5):
 
 
 def _compute_file_hash(file_path: str) -> str:
-    """Return first 16 hex chars of the SHA-256 of *file_path*."""
+    """Return first 16 hex chars of the SHA-256 of *file_path* (the key before genome_hash)."""
     sha256 = hashlib.sha256()
     with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             sha256.update(chunk)
     return sha256.hexdigest()[:16]
 
+
+def _input_hashes(input_file: str) -> tuple[str, str]:
+    """(key new entries are written under, older key still looked up)."""
+    return genome_hash(input_file), legacy_file_hash(input_file)[:16]
 
 
 def _ensure_table(conn: sqlite3.Connection) -> None:
@@ -152,16 +167,21 @@ def restore(db_path: str, input_file: str, tool_name: str,
     if not Path(db_path).exists():
         return False
 
-    input_hash = _compute_file_hash(input_file)
+    current, legacy = _input_hashes(input_file)
 
     conn = _get_connection(db_path)
     try:
         _ensure_table(conn)
-        rows = conn.execute(
-            "SELECT filename, content FROM output_cache "
-            "WHERE input_hash = ? AND tool = ?",
-            (input_hash, tool_name),
-        ).fetchall()
+        # The sequence-hash entry when there is one; an older byte-hash one otherwise.
+        rows = []
+        for input_hash in (current, legacy):
+            rows = conn.execute(
+                "SELECT filename, content FROM output_cache "
+                "WHERE input_hash = ? AND tool = ?",
+                (input_hash, tool_name),
+            ).fetchall()
+            if rows:
+                break
     finally:
         conn.close()
 
@@ -289,13 +309,13 @@ def cached_tools(db_path: str, input_file: str) -> set:
     try:
         if not Path(db_path).expanduser().exists():
             return set()
-        input_hash = _compute_file_hash(input_file)
+        current, legacy = _input_hashes(input_file)
         conn = _get_connection(str(Path(db_path).expanduser()))
         try:
             _ensure_table(conn)
             rows = conn.execute(
-                "SELECT DISTINCT tool FROM output_cache WHERE input_hash = ?",
-                (input_hash,),
+                "SELECT DISTINCT tool FROM output_cache WHERE input_hash IN (?, ?)",
+                (current, legacy),
             ).fetchall()
         finally:
             conn.close()
@@ -310,7 +330,7 @@ def store(db_path: str, input_file: str, tool_name: str,
 
     Missing files are skipped (handles partial workflow success).
     """
-    input_hash = _compute_file_hash(input_file)
+    input_hash = genome_hash(input_file)
     now = datetime.now(timezone.utc).isoformat()
 
     # Ensure parent directory exists before creating database
@@ -431,7 +451,7 @@ def log_workflow_run(db_path: str, run_id: str, input_file: str, workflow_name: 
             LOGGER.warning("Cannot write run_log: db not found at %s", db_path)
             return
 
-        input_hash = _compute_file_hash(input_file)
+        input_hash = genome_hash(input_file)
         now = datetime.now(timezone.utc).isoformat()
 
         def _log_run():
