@@ -28,7 +28,7 @@ from dataclasses import asdict
 
 from bioinformatics_tools.api.auth import decrypt_private_key, get_current_user
 from bioinformatics_tools.api.models import GenomeSend, SlurmSend
-from bioinformatics_tools.api.services import job_history_client, job_runner, user_stores
+from bioinformatics_tools.api.services import job_history_client, job_runner, tool_assets, user_stores
 from bioinformatics_tools.api.services.job_store import job_store
 from bioinformatics_tools.utilities import ssh_sftp, ssh_slurm
 from bioinformatics_tools.utilities.ssh_connection import make_user_connection, sync_remote_dane_wf
@@ -1385,14 +1385,6 @@ def get_stores_progress(current_user: dict = Depends(get_current_user)):
     return {"op": _stores_call(user_stores.progress, conn, user_config)}
 
 
-@router.get("/stores/progress")
-def get_stores_progress(current_user: dict = Depends(get_current_user)):
-    """Only the copy under way (percent, log tail): cheap enough to poll every second or two."""
-    conn = _build_connection(current_user)
-    user_config = _stores_user_config(current_user, conn)
-    return {"op": _stores_call(user_stores.progress, conn, user_config)}
-
-
 @router.get("/stores/{store_id}/backup-check")
 def check_store_backup(store_id: str, current_user: dict = Depends(get_current_user)):
     """What backing this database up would take, and whether depot has room --
@@ -1422,6 +1414,78 @@ def backup_store(store_id: str, current_user: dict = Depends(get_current_user)):
     if _active_run(current_user, conn, user_config):
         raise HTTPException(status_code=409, detail="A run is still going; back up once it has finished, so the copy is not taken half-written.")
     return _stores_call(user_stores.start_backup, conn, user_config, current_user["cluster_username"], store_id)
+
+
+# ---------------------------------------------------------------------------
+# The tools' containers and reference databases: what is there, and setting
+# up what is not (services/tool_assets.py). The setup is the same copy job
+# as the databases above, so it shares their progress (GET /stores/progress).
+# ---------------------------------------------------------------------------
+
+@router.get("/assets")
+def get_assets(current_user: dict = Depends(get_current_user)):
+    """Each container and reference database: where the run looks for it,
+    whether it is there, and where it could be set up from."""
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    _stores_settle(current_user, conn, user_config)
+    return _stores_call(tool_assets.status, conn, user_config, current_user["home_dir"])
+
+
+@router.get("/assets/plan")
+def get_assets_plan(builds: bool = True, optional: bool = False, accept: str = "",
+                    current_user: dict = Depends(get_current_user)):
+    """What setting up would do -- item by item, the size of the copies, the
+    room on scratch -- asked before the Yes / No. accept=* lists the
+    licence-gated builds too, marked, for the page to ask about."""
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    accepted = set(tool_assets.GATED) if accept == "*" else {t.strip() for t in accept.split(",") if t.strip()}
+    return _stores_call(tool_assets.plan, conn, user_config, current_user["home_dir"], builds, accepted, optional)
+
+
+@router.post("/assets/setup")
+def setup_assets(body: dict | None = None, current_user: dict = Depends(get_current_user)):
+    """Set up the missing containers and databases. body: {builds: bool,
+    optional: bool, accept: [tool, ...]} -- accept names the licence-gated
+    tools whose statement the user accepted for this build."""
+    body = body or {}
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    _stores_settle(current_user, conn, user_config)
+    accepted = {str(t) for t in (body.get("accept") or [])}
+    return _stores_call(tool_assets.start, conn, user_config, current_user["home_dir"],
+                        bool(body.get("builds", True)), accepted, bool(body.get("optional", False)))
+
+
+def _check_margie_sb_assets(genome_data: GenomeSend, genome_path: str, user_config: dict, conn, current_user: dict) -> None:
+    """Refuse a run that needs a container or database that is not there --
+    it would otherwise fail at that tool, hours in. A folder this account
+    cannot read, or a look that fails, never stops a run."""
+    from bioinformatics_tools.api import licensing
+    all_keys = {tool['key'] for tool in MARGIE_SB_PHASED_TOOLS}
+    if genome_data.selected_tools is not None:
+        tools = set(genome_data.selected_tools)
+    else:
+        ent = licensing.get_entitlement(current_user["username"])
+        tools = all_keys - licensing.disabled_tool_ids(ent.get("usage_type"), ent.get("licensed_tools"))
+    names = genome_data.genomes
+    if names is None:
+        try:
+            if ssh_sftp.check_remote_path_kind(genome_path, conn) == 'directory':
+                names = [e['name'] for e in ssh_sftp.list_remote_dir(genome_path, conn)
+                         if e.get('type') == 'file' and e['name'].lower().endswith(GENOME_EXTENSIONS)]
+            else:
+                names = [posixpath.basename(genome_path)]
+        except Exception:
+            names = None
+    try:
+        missing = tool_assets.missing_for_run(conn, user_config, current_user["home_dir"], tools, names)
+    except Exception as exc:
+        LOGGER.warning("Could not check the containers and databases before a run: %s", exc)
+        return
+    if missing:
+        raise HTTPException(status_code=409, detail=tool_assets.describe_missing(missing))
 
 
 @router.post("/run_workflow")
@@ -1515,7 +1579,7 @@ def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_curre
     if genome_data.genomes is not None:
         if not genome_data.genomes:
             raise HTTPException(status_code=400, detail="No genomes were selected.")
-        if ssh_sftp.check_remote_path_kind(genome_path, conn) != 'dir':
+        if ssh_sftp.check_remote_path_kind(genome_path, conn) != 'directory':
             raise HTTPException(
                 status_code=400,
                 detail="Choosing genomes needs a folder to choose from; this run points at a single file.",
@@ -1567,6 +1631,9 @@ def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_curre
                        "Update your usage type / licensed tools when accepting the terms "
                        "(Profile), or remove them from your selection.",
             )
+
+    if genome_data.workflow == 'margie_sb':
+        _check_margie_sb_assets(genome_data, genome_path, user_config, conn, current_user)
 
     base_dir = (genome_data.output_dir or user_config.get(genome_data.workflow, {}).get('output_path') or current_user['home_dir']).rstrip('/')
 

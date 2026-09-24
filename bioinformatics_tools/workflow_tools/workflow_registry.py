@@ -160,30 +160,34 @@ def workflow_path_params(wf_id: str, include_sif: bool = True, include_db_root: 
     return params
 
 
+# 'database': the tool reads a reference database from db.<key>, else
+# <margie_sb.db_root>/<key> (margie_sb.smk's db_path calls).
 MARGIE_SB_PHASED_TOOLS = [
     {'key': 'quast', 'label': 'QUAST', 'phase': 1, 'sif': 'quast.sif', 'purpose': 'Assembly quality metrics'},
-    {'key': 'gtdbtk', 'label': 'GTDB-Tk', 'phase': 2, 'sif': 'gtdbtk.sif', 'purpose': 'Taxonomic assignment'},
-    {'key': 'rasttk', 'label': 'RASTtk', 'phase': 3, 'sif': 'rasttk.sif', 'purpose': 'Core annotation stage gate'},
-    {'key': 'cog', 'label': 'COG', 'phase': 4, 'sif': 'cog.sif', 'purpose': 'Functional category annotation'},
-    {'key': 'kegg', 'label': 'KEGG', 'phase': 4, 'sif': 'kegg.sif', 'purpose': 'Pathway annotation'},
-    {'key': 'eggnog', 'label': 'eggNOG', 'phase': 4, 'sif': 'eggnog.sif', 'purpose': 'Orthology annotation'},
-    {'key': 'uniprot', 'label': 'UniProt', 'phase': 4, 'sif': 'uniprot.sif', 'purpose': 'Protein annotation'},
-    {'key': 'pfam', 'label': 'Pfam', 'phase': 4, 'sif': 'pfam.sif', 'purpose': 'Protein family annotation'},
-    {'key': 'tigrfam', 'label': 'TIGRFAM', 'phase': 4, 'sif': 'tigrfam.sif', 'purpose': 'Protein family annotation'},
-    {'key': 'merops', 'label': 'MEROPS', 'phase': 4, 'sif': 'merops.sif', 'purpose': 'Protease annotation'},
-    {'key': 'tcdb', 'label': 'TCDB', 'phase': 4, 'sif': 'tcdb.sif', 'purpose': 'Transporter annotation'},
-    {'key': 'dbcan', 'label': 'dbCAN', 'phase': 4, 'sif': 'dbcan.sif', 'purpose': 'CAZyme annotation'},
-    {'key': 'pgap', 'label': 'PGAP', 'phase': 4, 'sif': 'pgap.sif', 'purpose': 'Genome annotation support'},
-    {'key': 'geneprop', 'label': 'GeneProp', 'phase': 4, 'sif': 'geneprop.sif', 'purpose': 'Gene property annotation (after TIGRFAM)'},
-    {'key': 'interpro', 'label': 'InterPro', 'phase': 4, 'sif': 'interpro.sif', 'purpose': 'Domain/signature annotation'},
+    {'key': 'gtdbtk', 'label': 'GTDB-Tk', 'phase': 2, 'sif': 'gtdbtk.sif', 'purpose': 'Taxonomic assignment', 'database': True},
+    {'key': 'rasttk', 'label': 'RASTtk', 'phase': 3, 'sif': 'rasttk.sif', 'purpose': 'Core annotation stage gate', 'database': True},
+    {'key': 'cog', 'label': 'COG', 'phase': 4, 'sif': 'cog.sif', 'purpose': 'Functional category annotation', 'database': True},
+    {'key': 'kegg', 'label': 'KEGG', 'phase': 4, 'sif': 'kegg.sif', 'purpose': 'Pathway annotation', 'database': True},
+    {'key': 'eggnog', 'label': 'eggNOG', 'phase': 4, 'sif': 'eggnog.sif', 'purpose': 'Orthology annotation', 'database': True},
+    {'key': 'uniprot', 'label': 'UniProt', 'phase': 4, 'sif': 'uniprot.sif', 'purpose': 'Protein annotation', 'database': True},
+    {'key': 'pfam', 'label': 'Pfam', 'phase': 4, 'sif': 'pfam.sif', 'purpose': 'Protein family annotation', 'database': True},
+    {'key': 'tigrfam', 'label': 'TIGRFAM', 'phase': 4, 'sif': 'tigrfam.sif', 'purpose': 'Protein family annotation', 'database': True},
+    {'key': 'merops', 'label': 'MEROPS', 'phase': 4, 'sif': 'merops.sif', 'purpose': 'Protease annotation', 'database': True},
+    {'key': 'tcdb', 'label': 'TCDB', 'phase': 4, 'sif': 'tcdb.sif', 'purpose': 'Transporter annotation', 'database': True},
+    {'key': 'dbcan', 'label': 'dbCAN', 'phase': 4, 'sif': 'dbcan.sif', 'purpose': 'CAZyme annotation', 'database': True},
+    {'key': 'pgap', 'label': 'PGAP', 'phase': 4, 'sif': 'pgap.sif', 'purpose': 'Genome annotation support', 'database': True},
+    {'key': 'geneprop', 'label': 'GeneProp', 'phase': 4, 'sif': 'geneprop.sif', 'purpose': 'Gene property annotation (after TIGRFAM)', 'database': True},
+    {'key': 'interpro', 'label': 'InterPro', 'phase': 4, 'sif': 'interpro.sif', 'purpose': 'Domain/signature annotation', 'database': True},
     {'key': 'operon', 'label': 'Operon', 'phase': 5, 'sif': 'operon.sif', 'purpose': 'Operon prediction'},
     {'key': 'phobius', 'label': 'Phobius', 'phase': 6, 'sif': 'phobius.sif', 'purpose': 'Signal peptide and topology prediction'},
-    {'key': 'tmbed', 'label': 'TMbed', 'phase': 6, 'sif': 'tmbed.sif', 'purpose': 'Transmembrane topology prediction'},
-    {'key': 'signalp6', 'label': 'SignalP6', 'phase': 6, 'sif': 'signalp6.sif', 'purpose': 'Signal peptide prediction (HPC module, no envelope dependency)'},
+    {'key': 'tmbed', 'label': 'TMbed', 'phase': 6, 'sif': 'tmbed.sif', 'purpose': 'Transmembrane topology prediction', 'database': True},
+    # SignalP 4 and 6 run from RCAC's own modules (envmodules:, not container:
+    # in margie_sb.smk), so neither has a .sif to check or set up.
+    {'key': 'signalp6', 'label': 'SignalP6', 'phase': 6, 'sif': 'signalp6.sif', 'purpose': 'Signal peptide prediction (HPC module, no envelope dependency)', 'uses_container': False},
     {'key': 'envelope', 'label': 'Envelope', 'phase': 7, 'sif': 'envelope.sif', 'purpose': 'Gram envelope type inference'},
     {'key': 'psortb', 'label': 'PSORTb', 'phase': 8, 'sif': 'psortb.sif', 'purpose': 'Subcellular localization'},
     {'key': 'deepsig', 'label': 'DeepSig', 'phase': 8, 'sif': 'deepsig.sif', 'purpose': 'Signal peptide prediction'},
-    {'key': 'signalp4', 'label': 'SignalP4', 'phase': 8, 'sif': 'signalP4.sif', 'purpose': 'Signal peptide prediction (HPC module; kept until SignalP6 is confirmed)'},
+    {'key': 'signalp4', 'label': 'SignalP4', 'phase': 8, 'sif': 'signalP4.sif', 'purpose': 'Signal peptide prediction (HPC module; kept until SignalP6 is confirmed)', 'uses_container': False},
     {'key': 'consolidation', 'label': 'Consolidation', 'phase': 9, 'sif': 'consolidation.sif', 'purpose': 'Consolidate upstream outputs', 'uses_container': False},
     {'key': 'labeling', 'label': 'Labeling', 'phase': 10, 'sif': 'labeling.sif', 'purpose': 'Label assignment', 'uses_container': False},
     # Host-side Python like consolidation/labeling (margie_sb.smk's run_fingerprint and
@@ -194,8 +198,9 @@ MARGIE_SB_PHASED_TOOLS = [
     {'key': 'ani', 'label': 'ANI', 'phase': 14, 'sif': 'ani.sif', 'purpose': 'Average nucleotide identity'},
     {'key': 'aai', 'label': 'AAI', 'phase': 14, 'sif': 'aai.sif', 'purpose': 'Average amino acid identity'},
     {'key': 'closest', 'label': 'Closest', 'phase': 14, 'sif': 'closest.sif', 'purpose': 'Closest genome matching'},
-    {'key': 'mauve', 'label': 'Mauve', 'phase': 14, 'sif': 'mauve.sif', 'purpose': 'Whole-genome synteny/collinear blocks vs. closest organisms'},
-    {'key': 'synteny', 'label': 'Synteny', 'phase': 14, 'sif': 'synteny.sif', 'purpose': 'Synteny calculation'},
+    # No rule in margie_sb.smk runs these yet, so no .sif is checked or listed.
+    {'key': 'mauve', 'label': 'Mauve', 'phase': 14, 'sif': 'mauve.sif', 'purpose': 'Whole-genome synteny/collinear blocks vs. closest organisms', 'uses_container': False},
+    {'key': 'synteny', 'label': 'Synteny', 'phase': 14, 'sif': 'synteny.sif', 'purpose': 'Synteny calculation', 'uses_container': False},
     {'key': 'evidence', 'label': 'Evidence', 'phase': 15, 'sif': 'evidence.sif', 'purpose': 'Per-gene annotation evidence reports (build-gene-report.py)', 'uses_container': False},
     {'key': 'llm', 'label': 'LLM', 'phase': 15, 'sif': 'llm.sif', 'purpose': 'LLM confidence scoring layer (GPU, ROCm/MI210)'},
 ]
@@ -236,7 +241,8 @@ def _margie_sb_default_runtime(tool_key: str) -> int:
 def margie_sb_sif_files(selected_tool_keys: set[str] | None = None) -> list[tuple]:
     """SIF entries to validate for a margie_sb run -- always excludes tools
     with uses_container=False (consolidation/labeling/scoring_heuristic run
-    as plain Python scripts, never need a .sif at all). When
+    as plain Python scripts, SignalP from HPC modules, and mauve/synteny have
+    no rule yet: none needs a .sif). When
     selected_tool_keys is given, further restricts to just that subset, so
     a partial-phase run never gets blocked on a container it doesn't need.
     """

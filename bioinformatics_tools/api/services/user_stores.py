@@ -409,6 +409,13 @@ def _settle_pid(conn, op: dict) -> dict:
 #   files<TAB>label<TAB>srcdir<TAB>dst<TAB>bytes<TAB>name,name,...
 #   move<TAB>src<TAB>dst                        rename (same filesystem: instant)
 #   mkdir<TAB>path
+#   link<TAB>src<TAB>dst                        symlink dst -> src, unless dst exists
+#   pull<TAB>label<TAB>url<TAB>dst              apptainer pull url -> dst (via dst.partial)
+#   repo<TAB>url                                where margie-build comes from, for build
+#   build<TAB>label<TAB>mode<TAB>tool<TAB>sifdir<TAB>dbdir<TAB>statement
+#                                               margie-build's build.sh --<mode> <tool>;
+#                                               a statement accepts a gated tool's licence
+# (link, pull, repo and build set up the tools: api/services/tool_assets.py.)
 # ---------------------------------------------------------------------------
 COPY_SCRIPT = r'''#!/bin/bash
 set -u
@@ -421,7 +428,7 @@ fail() { say failed "$1" 0 "$2"; echo "FAILED: $2" >> "$log"; exit 1; }
 OP="$(head -n 1 "$dir/op.kind" 2>/dev/null)"
 : > "$log"
 say running "Starting" 0 ""
-while IFS=$'\t' read -r kind a b c d e; do
+while IFS=$'\t' read -r kind a b c d e f; do
   case "$kind" in
     copy)
       label="$a"; src="$b"; dst="$c"; bytes="$d"
@@ -456,6 +463,41 @@ while IFS=$'\t' read -r kind a b c d e; do
     mkdir)
       mkdir -p "$a" || fail "Folders" "could not make $a"
       ;;
+    link)
+      [ -e "$b" ] || [ -L "$b" ] || ln -s "$a" "$b" || fail "Links" "could not link $b"
+      ;;
+    pull)
+      label="$a"; url="$b"; dst="$c"
+      say running "$label" 0 ""
+      echo "== $label: $url -> $dst" >> "$log"
+      app=$(command -v apptainer || command -v singularity) || fail "$label" "apptainer is not installed here"
+      mkdir -p "$(dirname "$dst")" || fail "$label" "could not make $(dirname "$dst")"
+      # Its cache and scratch space beside this script, not in the small home folder.
+      export APPTAINER_CACHEDIR="$dir/apptainer-cache" APPTAINER_TMPDIR="$dir/apptainer-tmp"
+      mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
+      "$app" pull --force "$dst.partial" "$url" >> "$log" 2>&1 || fail "$label" "could not pull $url"
+      mv -T "$dst.partial" "$dst" || fail "$label" "could not put $dst in place"
+      ;;
+    repo)
+      repo_url="$a"
+      ;;
+    build)
+      label="$a"; mode="$b"; tool="$c"; sifdir="$d"; dbdir="$e"; statement="$f"
+      say running "$label" 0 ""
+      echo "== $label" >> "$log"
+      repo="$dir/margie-build"
+      if [ ! -d "$repo/.git" ]; then
+        GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 "${repo_url:-}" "$repo" >> "$log" 2>&1 \
+          || fail "$label" "could not download margie-build from ${repo_url:-nowhere} (is it public?)"
+      fi
+      accept=()
+      [ -n "$statement" ] && accept=(--accept-"$tool"-licence --licence-statement "$statement")
+      mkdir -p "$sifdir" "$dbdir" "$dir/apptainer-cache" "$dir/apptainer-tmp" || fail "$label" "could not make $sifdir or $dbdir"
+      ( cd "$repo" && APPTAINER_CACHEDIR="$dir/apptainer-cache" APPTAINER_TMPDIR="$dir/apptainer-tmp" \
+          THREADS="${SLURM_CPUS_PER_TASK:-4}" ./build.sh --"$mode" "$tool" --sif-dir "$sifdir" --db-dir "$dbdir" \
+          --audit-log "$dir/licence-acceptances.tsv" --no-color --quiet-notice ${accept[@]+"${accept[@]}"} ) >> "$log" 2>&1 \
+        || fail "$label" "margie-build could not build $tool (the log above says why)"
+      ;;
   esac
 done < "$plan"
 say done "Finished" 0 ""
@@ -474,7 +516,8 @@ def _copy_cpus(cfg: dict | None) -> int:
     return max(1, min(16, n))
 
 
-def _start(conn, root: str, kind: str, plan: list[list], after: dict, cfg: dict | None = None) -> None:
+def _start(conn, root: str, kind: str, plan: list[list], after: dict, cfg: dict | None = None,
+           walltime: str = '12:00:00', mem: str = '4G') -> None:
     """Write the plan and start the copy script: a SLURM job when the config
     names an account, detached on the login node otherwise."""
     state = f'{root}/{STATE_DIR}'
@@ -497,7 +540,7 @@ def _start(conn, root: str, kind: str, plan: list[list], after: dict, cfg: dict 
             f'{state}/op.status', f'state=queued\nop={kind}\nlabel=Waiting for a SLURM slot\n', connection=conn)
         cmd = (f'cd {q(state)} && sbatch --parsable --job-name=margie-databases --account={q(account)} '
                + (f'--partition={q(partition)} ' if partition else '')
-               + f'--time=12:00:00 --ntasks=1 --cpus-per-task={_copy_cpus(cfg)} --mem=4G --output={q(state)}/op.slurm.out '
+               + f'--time={q(walltime)} --ntasks=1 --cpus-per-task={_copy_cpus(cfg)} --mem={q(mem)} --output={q(state)}/op.slurm.out '
                + f'op.sh {q(state)}')
         code, out = _run(conn, cmd)
         job = out.strip().split(';')[0].split()[-1] if out.strip() else ''
@@ -723,6 +766,7 @@ def apply_finished(conn, cfg: dict, user: str) -> bool:
         return False
     state = f'{root}/{STATE_DIR}'
     after_text = _read_text(conn, f'{state}/op.after.json')
+    changed = False
     if after_text:
         try:
             after = json.loads(after_text)
@@ -732,8 +776,16 @@ def apply_finished(conn, cfg: dict, user: str) -> bool:
         for sid, version in (after.get('versions') or {}).items():
             manifest[sid] = {'version': int(version)}
         _write_manifest(conn, root, manifest)
+        # Settings the copy moved (the containers' and reference databases' folders).
+        for key, value in (after.get('config') or {}).items():
+            if _cfg_get(cfg, key) != value:
+                _cfg_set(cfg, key, value)
+                changed = True
         _run(conn, f'mv -f {shlex.quote(state)}/op.after.json {shlex.quote(state)}/op.applied.json')
-    return point_config(conn, cfg, user, root)
+    if op.get('op') == 'assets':
+        # Not the databases' copy: their settings stay as they are.
+        return changed
+    return point_config(conn, cfg, user, root) or changed
 
 
 def point_config(conn, cfg: dict, user: str, root: str | None = None) -> bool:
