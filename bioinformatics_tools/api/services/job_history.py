@@ -275,9 +275,13 @@ def list_jobs(db_path: str, workflow: str | None = None, limit: int = 100,
             # A list needs each run's record, not its whole log: only the end of
             # it (where a failure says why). Whole logs made a 50-row list 43 MB
             # -- over a minute through SSH -- for 71 runs; get_job still has them.
+            # Nor its SLURM jobs and containers (2.8 MB more for 50 rows): a
+            # list shows neither.
             columns = [r[1] for r in conn.execute("PRAGMA table_info(api_jobs)")]
             select = ", ".join(
-                f"substr(logs, -{LIST_LOG_TAIL}) AS logs" if c == "logs" else f'"{c}"' for c in columns)
+                f"substr(logs, -{LIST_LOG_TAIL}) AS logs" if c == "logs"
+                else f'NULL AS "{c}"' if c in ("slurm_jobs", "containers")
+                else f'"{c}"' for c in columns)
             rows = conn.execute(
                 f"SELECT {select} FROM api_jobs {where_clause}ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 [*params, limit, offset],
@@ -353,15 +357,10 @@ def count_jobs(db_path: str, workflow: str | None = None,
 # docstring and api/services/job_history_client.py.
 # ---------------------------------------------------------------------------
 
-def _main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: python -m bioinformatics_tools.api.services.job_history "
-              "<create|update|get|list|count>", file=sys.stderr)
-        return 2
-    action = sys.argv[1]
-    payload = json.loads(sys.stdin.read() or "{}")
+def dispatch(action: str, payload: dict):
+    """One action, as the CLI below and job_history_client's in-process path
+    both run it. Returns the result (None for create/update)."""
     db_path = payload.get("db_path")
-
     if action == "create":
         record_job_created(
             db_path, payload["job_id"], payload["workflow"],
@@ -369,47 +368,40 @@ def _main() -> int:
             payload.get("owner_username"), payload.get("owner_cluster_username"),
             payload.get("selected_tools"), payload.get("relaunched_from"),
         )
-    elif action == "update":
+        return None
+    if action == "update":
         record_job_updated(db_path, payload["job_id"], **payload.get("fields", {}))
-    elif action == "get":
-        result = get_job(
-            db_path,
-            payload["job_id"],
-            payload.get("owner_username"),
-            payload.get("owner_cluster_username"),
-        )
-        print(json.dumps(result))
-    elif action == "list":
-        result = list_jobs(
-            db_path,
-            payload.get("workflow"),
-            payload.get("limit", 100),
-            payload.get("offset", 0),
-            payload.get("owner_username"),
-            payload.get("owner_cluster_username"),
-        )
-        print(json.dumps(result))
-    elif action == "list_and_count":
-        result = list_jobs_and_count(
-            db_path,
-            payload.get("workflow"),
-            payload.get("limit", 100),
-            payload.get("offset", 0),
-            payload.get("owner_username"),
-            payload.get("owner_cluster_username"),
-        )
-        print(json.dumps(result))
-    elif action == "count":
-        result = count_jobs(
-            db_path,
-            payload.get("workflow"),
-            payload.get("owner_username"),
-            payload.get("owner_cluster_username"),
-        )
-        print(json.dumps(result))
-    else:
-        print(f"unknown action: {action}", file=sys.stderr)
+        return None
+    if action == "get":
+        return get_job(db_path, payload["job_id"],
+                       payload.get("owner_username"), payload.get("owner_cluster_username"))
+    if action == "list":
+        return list_jobs(db_path, payload.get("workflow"), payload.get("limit", 100), payload.get("offset", 0),
+                         payload.get("owner_username"), payload.get("owner_cluster_username"))
+    if action == "list_and_count":
+        return list_jobs_and_count(db_path, payload.get("workflow"), payload.get("limit", 100),
+                                   payload.get("offset", 0), payload.get("owner_username"),
+                                   payload.get("owner_cluster_username"))
+    if action == "count":
+        return count_jobs(db_path, payload.get("workflow"),
+                          payload.get("owner_username"), payload.get("owner_cluster_username"))
+    raise ValueError(f"unknown action: {action}")
+
+
+def _main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: python -m bioinformatics_tools.api.services.job_history "
+              "<create|update|get|list|list_and_count|count>", file=sys.stderr)
         return 2
+    action = sys.argv[1]
+    payload = json.loads(sys.stdin.read() or "{}")
+    try:
+        result = dispatch(action, payload)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if action not in ("create", "update"):
+        print(json.dumps(result))
     return 0
 
 

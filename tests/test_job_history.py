@@ -126,17 +126,22 @@ class TestFinalSnapshotPersistence:
         assert row["slurm_jobs"] == [{"job_id": "111", "rule": "quast", "status": "COMPLETED", "time": "00:01:00"}]
         assert row["containers"] == [{"name": "quast", "version": "5.0"}]
 
-    def test_list_jobs_also_decodes_snapshot_fields(self, tmp_path):
+    def test_list_jobs_leaves_out_snapshot_fields_get_job_keeps_them(self, tmp_path):
+        """A list carries neither a run's SLURM jobs nor its containers (nor
+        more than the end of its log): they made a 50-run list megabytes.
+        They decode to [] there, and get_job still has them."""
         db_path = str(tmp_path / "snapshot_list.db")
         job_history.record_job_created(
             db_path, "job-4", "margie_sb", "/genomes/e.fasta", "/out/2026-06-21-1200",
         )
-        job_history.record_job_updated(
-            db_path, "job-4", slurm_jobs=[{"job_id": "222", "rule": "rasttk", "status": "COMPLETED", "time": "01:00:00"}],
-        )
+        snapshot = [{"job_id": "222", "rule": "rasttk", "status": "COMPLETED", "time": "01:00:00"}]
+        job_history.record_job_updated(db_path, "job-4", slurm_jobs=snapshot, logs="x" * 20000 + "the end")
 
         rows = job_history.list_jobs(db_path)
-        assert rows[0]["slurm_jobs"] == [{"job_id": "222", "rule": "rasttk", "status": "COMPLETED", "time": "01:00:00"}]
+        assert rows[0]["slurm_jobs"] == []
+        assert rows[0]["logs"].endswith("the end") and len(rows[0]["logs"]) == job_history.LIST_LOG_TAIL
+        row = job_history.get_job(db_path, "job-4")
+        assert row["slurm_jobs"] == snapshot and len(row["logs"]) == 20007
 
     def test_no_snapshot_yet_decodes_to_empty_list(self, tmp_path):
         """A job that hasn't reached finalize() yet (still running, or

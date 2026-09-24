@@ -6,9 +6,13 @@ the API server cannot open it directly.
 Errors here are ignored — if saving history fails, the job itself keeps
 running.
 """
+import getpass
 import json
 import logging
+import os
+import socket
 
+from bioinformatics_tools.api.services import job_history
 from bioinformatics_tools.utilities.ssh_connection import SSHConnection
 
 LOGGER = logging.getLogger(__name__)
@@ -17,7 +21,28 @@ _REMOTE_MODULE = "bioinformatics_tools.api.services.job_history"
 _REMOTE_PYTHON = "~/bioinformatics-tools/.venv/bin/python"
 
 
+def _here(connection: SSHConnection, db_path: str | None) -> bool:
+    """Is this API running on the cluster, as the user, with the database in
+    reach? As the desktop app runs it: then the same file is opened directly,
+    with the same permissions, instead of starting a Python on the cluster
+    over SSH for each call (1.8 s before any work, 2026-09-24). A server
+    elsewhere (the web deployment) keeps going over SSH."""
+    if not db_path or not connection.username or connection.username != getpass.getuser():
+        return False
+    host = (connection.host or "").lower()
+    fqdn = socket.getfqdn().lower()
+    if not host or not (fqdn == host or fqdn.endswith("." + host)):
+        return False
+    return os.path.exists(os.path.expanduser(db_path))
+
+
 def _run(connection: SSHConnection, action: str, payload: dict):
+    if _here(connection, payload.get("db_path")):
+        try:
+            return job_history.dispatch(action, payload)
+        except Exception as exc:
+            LOGGER.warning("job_history %s failed in-process: %s", action, exc)
+            return None
     ssh = connection.connect()
     try:
         stdin, stdout, stderr = ssh.exec_command(f"{_REMOTE_PYTHON} -m {_REMOTE_MODULE} {action}")
