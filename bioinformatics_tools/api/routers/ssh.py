@@ -28,7 +28,7 @@ from dataclasses import asdict
 
 from bioinformatics_tools.api.auth import decrypt_private_key, get_current_user
 from bioinformatics_tools.api.models import GenomeSend, SlurmSend
-from bioinformatics_tools.api.services import job_history_client, job_runner
+from bioinformatics_tools.api.services import job_history_client, job_runner, user_stores
 from bioinformatics_tools.api.services.job_store import job_store
 from bioinformatics_tools.utilities import ssh_sftp, ssh_slurm
 from bioinformatics_tools.utilities.ssh_connection import make_user_connection, sync_remote_dane_wf
@@ -211,8 +211,12 @@ def _classify_path_scope(current_user: dict, conn, path: str, *, is_dir: bool) -
                 ),
             )
 
-    # Backward-compatible fallback for pre-marker paths.
-    return "user" if _is_user_scoped_db(path, current_user["username"]) else "shared"
+    # Backward-compatible fallback for pre-marker paths. The cluster username
+    # too: the scratch stores (services/user_stores.py) are named after it.
+    if _is_user_scoped_db(path, current_user["username"]):
+        return "user"
+    cluster_user = current_user.get("cluster_username") or ""
+    return "user" if cluster_user and _is_user_scoped_db(path, cluster_user) else "shared"
 
 
 def _versioned_user_db_path(template_db: str, username: str, version: int) -> str:
@@ -446,69 +450,6 @@ def _resolve_effective_main_db(current_user: dict, conn, user_config: dict, *, p
     return main_db
 
 
-def _resolve_effective_margie_sb_writable_paths(current_user: dict, conn, user_config: dict, *, persist: bool) -> dict:
-    """Promote writable margie_sb shared paths to per-user versioned paths.
-
-    Returns mapping of config key -> resolved path.
-    """
-    resolved: dict[str, str] = {}
-    changed_any = False
-
-    file_keys = (
-        (
-            'margie_sb.operon_database.occ_reference_pkl',
-            'operon_database.occ_reference_pkl',
-            '/depot/lindems/data/margie/operon-database/occ_reference.pkl',
-        ),
-        (
-            'margie_sb.fingerprint_database.path',
-            'fingerprint_database.path',
-            '/depot/lindems/data/margie/fingerprint-database/fingerprint-database.tsv',
-        ),
-    )
-    dir_keys = (
-        (
-            'margie_sb.genome_pool.path',
-            'genome_pool.path',
-            '/depot/lindems/data/margie/genome-pool',
-        ),
-        (
-            'margie_sb.scoring_results_historical.path',
-            'scoring_results_historical.path',
-            '/depot/lindems/data/margie/scoring-results-historical',
-        ),
-        (
-            'margie_sb.final_tables_depot.path',
-            'final_tables_depot.path',
-            '/depot/lindems/data/margie/final-tables',
-        ),
-        (
-            'margie_sb.sqlite_pipeline_snapshot.path',
-            'sqlite_pipeline_snapshot.path',
-            '/depot/lindems/data/margie/sqlite/pipeline-version',
-        ),
-    )
-
-    for key, legacy_key, default_value in file_keys:
-        raw = _first_nonempty(_cfg_get(user_config, key), _cfg_get(user_config, legacy_key), default_value)
-        target, changed = _promote_shared_file_to_user_file(current_user, conn, str(raw))
-        _cfg_set(user_config, key, target)
-        resolved[key] = target
-        changed_any = changed_any or changed
-
-    for key, legacy_key, default_value in dir_keys:
-        raw = _first_nonempty(_cfg_get(user_config, key), _cfg_get(user_config, legacy_key), default_value)
-        target, changed = _promote_shared_dir_to_user_dir(current_user, conn, str(raw))
-        _cfg_set(user_config, key, target)
-        resolved[key] = target
-        changed_any = changed_any or changed
-
-    if changed_any and persist:
-        ssh_sftp.write_remote_yaml(_config_path(current_user["home_dir"]), user_config, connection=conn)
-
-    return resolved
-
-
 def _run_remote_check(conn, command: str) -> tuple[int, str]:
     ssh = conn.connect()
     _, stdout, stderr = ssh.exec_command(command)
@@ -547,7 +488,6 @@ def _validate_margie_sb_shared_paths(user_config: dict, conn, home_dir: str) -> 
             _first_nonempty(
                 _cfg_get(user_config, 'margie_sb.operon_database.occ_reference_pkl'),
                 _cfg_get(user_config, 'operon_database.occ_reference_pkl'),
-                '/depot/lindems/data/margie/operon-database/occ_reference.pkl',
             ),
             'margie_sb.operon_database.occ_reference_pkl',
             True,
@@ -556,7 +496,6 @@ def _validate_margie_sb_shared_paths(user_config: dict, conn, home_dir: str) -> 
             _first_nonempty(
                 _cfg_get(user_config, 'margie_sb.fingerprint_database.path'),
                 _cfg_get(user_config, 'fingerprint_database.path'),
-                '/depot/lindems/data/margie/fingerprint-database/fingerprint-database.tsv',
             ),
             'margie_sb.fingerprint_database.path',
             True,
@@ -565,7 +504,6 @@ def _validate_margie_sb_shared_paths(user_config: dict, conn, home_dir: str) -> 
             _first_nonempty(
                 _cfg_get(user_config, 'margie_sb.genome_pool.path'),
                 _cfg_get(user_config, 'genome_pool.path'),
-                '/depot/lindems/data/margie/genome-pool',
             ),
             'margie_sb.genome_pool.path',
             False,
@@ -574,7 +512,6 @@ def _validate_margie_sb_shared_paths(user_config: dict, conn, home_dir: str) -> 
             _first_nonempty(
                 _cfg_get(user_config, 'margie_sb.scoring_results_historical.path'),
                 _cfg_get(user_config, 'scoring_results_historical.path'),
-                '/depot/lindems/data/margie/scoring-results-historical',
             ),
             'margie_sb.scoring_results_historical.path',
             False,
@@ -583,7 +520,6 @@ def _validate_margie_sb_shared_paths(user_config: dict, conn, home_dir: str) -> 
             _first_nonempty(
                 _cfg_get(user_config, 'margie_sb.final_tables_depot.path'),
                 _cfg_get(user_config, 'final_tables_depot.path'),
-                '/depot/lindems/data/margie/final-tables',
             ),
             'margie_sb.final_tables_depot.path',
             False,
@@ -592,7 +528,6 @@ def _validate_margie_sb_shared_paths(user_config: dict, conn, home_dir: str) -> 
             _first_nonempty(
                 _cfg_get(user_config, 'margie_sb.sqlite_pipeline_snapshot.path'),
                 _cfg_get(user_config, 'sqlite_pipeline_snapshot.path'),
-                '/depot/lindems/data/margie/sqlite/pipeline-version',
             ),
             'margie_sb.sqlite_pipeline_snapshot.path',
             False,
@@ -600,6 +535,10 @@ def _validate_margie_sb_shared_paths(user_config: dict, conn, home_dir: str) -> 
     ]
 
     for raw_path, key_name, treat_as_file in writable_paths:
+        # Unset means nothing to check: the scratch stores (user_stores) set
+        # every one before a run; there is no depot fallback to fill in.
+        if not raw_path:
+            continue
         expanded = _expand_remote_home(str(raw_path), home_dir)
         _assert_remote_writable(conn, expanded, label=f"Shared path '{key_name}'", treat_as_file=treat_as_file)
 
@@ -1363,6 +1302,128 @@ def _launch_job(
     return {"success": True, "job_id": job_id, "output_dir": output_dir, "message": "Job submitted successfully"}
 
 
+# ---------------------------------------------------------------------------
+# Each user's databases on scratch, and their backups on depot
+# (services/user_stores.py).
+# ---------------------------------------------------------------------------
+
+STORES_NOT_READY = "stores-not-ready"
+
+
+def _stores_user_config(current_user: dict, conn) -> dict:
+    try:
+        return ssh_sftp.read_remote_yaml(_config_path(current_user["home_dir"]), connection=conn)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Configuration file not found. Create your configuration first.")
+
+
+def _stores_call(fn, *args):
+    try:
+        return fn(*args)
+    except user_stores.StoreError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+
+
+def _stores_settle(current_user: dict, conn, user_config: dict) -> None:
+    """Record a copy that has finished, and save the config if it now points elsewhere."""
+    user = current_user["cluster_username"]
+    if _stores_call(user_stores.apply_finished, conn, user_config, user):
+        ssh_sftp.write_remote_yaml(_config_path(current_user["home_dir"]), user_config, connection=conn)
+
+
+def _margie_sb_stores_ready(current_user: dict, conn, user_config: dict) -> str:
+    """The job database a margie_sb run uses, once every store is on scratch.
+
+    409 with a detail starting "stores-not-ready" when they are not (the page
+    then offers the first-run setup), or while a copy is under way."""
+    user = current_user["cluster_username"]
+    _stores_settle(current_user, conn, user_config)
+    st = _stores_call(user_stores.status, conn, user_config, user)
+    op = st.get("op") or {}
+    if op.get("state") == "running":
+        raise HTTPException(status_code=409, detail=f"{STORES_NOT_READY}: your databases are being copied ({op.get('label', '')}); the run can start when that finishes.")
+    if not st["ready"]:
+        raise HTTPException(status_code=409, detail=f"{STORES_NOT_READY}: your databases are not on scratch yet. They are copied there once, before your first run.")
+    if user_stores.point_config(conn, user_config, user):
+        ssh_sftp.write_remote_yaml(_config_path(current_user["home_dir"]), user_config, connection=conn)
+    return user_config["main_database"]
+
+
+def _active_run(current_user: dict, conn, user_config: dict) -> bool:
+    """Whether any of this user's runs is still going (checked, not just recorded)."""
+    main_db = user_config.get("main_database")
+    if not main_db:
+        return False
+    try:
+        rows, _ = job_history_client.list_jobs_and_count(
+            conn, main_db, limit=20, offset=0,
+            owner_username=current_user["username"],
+            owner_cluster_username=current_user["cluster_username"],
+        )
+        _reconcile_running(conn, main_db, rows, current_user["cluster_username"])
+    except Exception as exc:
+        LOGGER.warning("Could not check for running jobs before a backup: %s", exc)
+        return False
+    return any(str(r.get("status", "")).lower() == "running" for r in rows)
+
+
+@router.get("/stores")
+def get_stores(current_user: dict = Depends(get_current_user)):
+    """Where each database is (scratch, version), its latest depot backup, and
+    the copy under way or last done -- with a percentage and a log tail."""
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    _stores_settle(current_user, conn, user_config)
+    return _stores_call(user_stores.status, conn, user_config, current_user["cluster_username"])
+
+
+@router.get("/stores/progress")
+def get_stores_progress(current_user: dict = Depends(get_current_user)):
+    """Only the copy under way (percent, log tail): cheap enough to poll every second or two."""
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    return {"op": _stores_call(user_stores.progress, conn, user_config)}
+
+
+@router.get("/stores/progress")
+def get_stores_progress(current_user: dict = Depends(get_current_user)):
+    """Only the copy under way (percent, log tail): cheap enough to poll every second or two."""
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    return {"op": _stores_call(user_stores.progress, conn, user_config)}
+
+
+@router.get("/stores/{store_id}/backup-check")
+def check_store_backup(store_id: str, current_user: dict = Depends(get_current_user)):
+    """What backing this database up would take, and whether depot has room --
+    shown in the Yes / No question before any copy starts."""
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    return _stores_call(user_stores.backup_check, conn, user_config, current_user["cluster_username"], store_id)
+
+
+@router.post("/stores/setup")
+def setup_stores(current_user: dict = Depends(get_current_user)):
+    """Copy the databases missing on scratch: from the user's newest depot
+    backup where there is one, from the base copies otherwise."""
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    _stores_settle(current_user, conn, user_config)
+    return _stores_call(user_stores.start_setup, conn, user_config, current_user["cluster_username"])
+
+
+@router.post("/stores/{store_id}/backup")
+def backup_store(store_id: str, current_user: dict = Depends(get_current_user)):
+    """Copy one database's working version to depot; the working copy moves on
+    to the next version. Not while a run is writing to it."""
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    _stores_settle(current_user, conn, user_config)
+    if _active_run(current_user, conn, user_config):
+        raise HTTPException(status_code=409, detail="A run is still going; back up once it has finished, so the copy is not taken half-written.")
+    return _stores_call(user_stores.start_backup, conn, user_config, current_user["cluster_username"], store_id)
+
+
 @router.post("/run_workflow")
 def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_current_user)):
     """Submit a genome analysis workflow by name."""
@@ -1422,12 +1483,15 @@ def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_curre
         )
 
     if genome_data.workflow == 'margie_sb':
-        _resolve_effective_margie_sb_writable_paths(current_user, conn, user_config, persist=True)
+        # The growing databases live on the user's scratch (user_stores): a
+        # run needs its copies there first -- the page sets them up, with a
+        # progress bar, when this says so -- and never starts during a copy.
+        main_db = _margie_sb_stores_ready(current_user, conn, user_config)
         _validate_margie_sb_shared_paths(user_config, conn, current_user["home_dir"])
-
-    # Shared template DB -> per-user DB promotion (persisted), so concurrent
-    # users stop writing to one SQLite file.
-    main_db = _resolve_effective_main_db(current_user, conn, user_config, persist=True)
+    else:
+        # Shared template DB -> per-user DB promotion (persisted), so concurrent
+        # users stop writing to one SQLite file.
+        main_db = _resolve_effective_main_db(current_user, conn, user_config, persist=True)
 
     # Resolves genome path / output dir, falling back to the user's global config
     # defaults (input_path / output_path) when the request didn't specify one.

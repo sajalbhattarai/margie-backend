@@ -5,7 +5,7 @@ import sys
 
 # Add current directory to path to import workflow_helpers
 sys.path.insert(0, os.path.dirname(workflow.snakefile))
-from workflow_helpers import rc, rc_bool, fixed_path, sif_path, db_path, db_token, discover_genomes, genome_calls, get_workflow_prefix_for, get_container_outputs_prefix_for
+from workflow_helpers import rc, rc_bool, fixed_path, sif_path, db_path, db_token, discover_genomes, genome_calls, default_store_root, get_workflow_prefix_for, get_container_outputs_prefix_for
 from load_to_db import PIPELINE_VERSION
 
 WORKFLOW_DIR = os.path.dirname(workflow.snakefile)
@@ -28,6 +28,12 @@ ENRICH_SCRIPT = os.path.join(WORKFLOW_DIR, "enrich_with_envelope.py")
 # rather than left as an unset user-supplied path.
 SIGNALP6_SCRIPT = os.path.join(WORKFLOW_DIR, "process_signalp6.py")
 SIGNALP4_SCRIPT = os.path.join(WORKFLOW_DIR, "process_signalp4.py")
+
+
+# Where a store goes when the config names none (see default_store_root):
+# the user's scratch, never the depot bases. The app always names them.
+STORE_ROOT = rc('margie_sb.stores_root', '', config=config) or default_store_root()
+BASES = '/depot/lindems/data/margie/databases/margie-generated-databases'
 
 
 def _resolve_cfg_path(preferred_key: str, legacy_key: str, default: str) -> str:
@@ -420,11 +426,11 @@ LABELING_TOKEN = f"{GENOME_PREFIX}labeling/labeling_db.tkn"
 # score-confidence-final.py blends all four C1-C4 outputs. All host-side
 # scripts, no container, same LOADER_PYTHON as consolidation/labeling.
 SCORING_SCRIPTS_DIR = os.path.join(WORKFLOW_DIR, "scoring")
-# Persistent cross-run OCC reference (operon database) lives on depot, not in repo.
+# Persistent cross-run OCC reference (operon database): the user's copy on scratch.
 C3_REFERENCE_PKL = _resolve_shared_file(
     'margie_sb.operon_database.occ_reference_pkl',
     'operon_database.occ_reference_pkl',
-    '/depot/lindems/data/margie/operon-database/occ_reference.pkl',
+    f'{STORE_ROOT}/operon-database/occ_reference.pkl',
     'occ_reference.pkl',
 )
 SCORING_HIERARCHY_TIER = f"{GENOME_PREFIX}scoring/scored-labeled-genes-annotation-tool-tier.tsv"
@@ -451,7 +457,7 @@ SCORING_TOKEN = f"{GENOME_PREFIX}scoring/scoring_db.tkn"
 SCORING_HISTORICAL_PATH = _resolve_shared_dir(
     'margie_sb.scoring_results_historical.path',
     'scoring_results_historical.path',
-    '/depot/lindems/data/margie/scoring-results-historical',
+    f'{STORE_ROOT}/scoring-archive',
 )
 # One folder per pipeline run, named by the run's output directory (already a
 # timestamp like 2026-07-03-1435); all of a run's genomes archive side by side.
@@ -460,11 +466,11 @@ SCORING_ARCHIVE_DIR = f"{SCORING_HISTORICAL_PATH}/{_RUN_TIMESTAMP}"
 SCORING_ARCHIVE_TOKEN = f"{GENOME_PREFIX}scoring/scoring_archived.tkn"
 
 # Reviewer-facing final scoring table export per organism:
-#   /depot/lindems/data/margie/final-tables/<organism>/FINAL_ANNOTATION_WITH_CONFIDENCE.tsv
+#   <margie-2026 on scratch>/final-tables/<organism>/FINAL_ANNOTATION_WITH_CONFIDENCE.tsv
 FINAL_TABLES_DEPOT_PATH = _resolve_shared_dir(
     'margie_sb.final_tables_depot.path',
     'final_tables_depot.path',
-    '/depot/lindems/data/margie/final-tables',
+    f'{STORE_ROOT}/final-tables',
 )
 FINAL_TABLES_DEPOT_TOKEN = f"{GENOME_PREFIX}scoring/final_tables_depot.tkn"
 
@@ -481,7 +487,8 @@ REPORT_FIGURES_SCRIPTS_DIR = os.path.join(SCORING_SCRIPTS_DIR, "analysis", "repo
 REPORT_FIGURES_OPERON_DB = _resolve_shared_file(
     'margie_sb.report_figures.operon_db',
     'report_figures.operon_db',
-    '/depot/lindems/data/margie/fingerprint-database/operon-fingerprint-database-label-ordered.tsv',
+    # Read only: the figures compare against it, so the base is a safe fallback.
+    f'{BASES}/fingerprint-database/operon-fingerprint-database-label-ordered.tsv',
     'operon-fingerprint-database-label-ordered.tsv',
 )
 REPORT_FIGURES_ORGANISM_DIR = f"{GENOME_PREFIX}scoring/figures"
@@ -539,7 +546,7 @@ _FULL_OPERON_MAP_DEFAULT = _home_config_flag("margie_sb", "run_full_operon_map")
 SQLITE_SNAPSHOT_ROOT = _resolve_shared_dir(
     'margie_sb.sqlite_pipeline_snapshot.path',
     'sqlite_pipeline_snapshot.path',
-    '/depot/lindems/data/margie/sqlite/pipeline-version',
+    f'{STORE_ROOT}/sqlite/snapshots',
 )
 SQLITE_SNAPSHOT_VERSION_DIR = f"{SQLITE_SNAPSHOT_ROOT}/{PIPELINE_VERSION}"
 SQLITE_SNAPSHOT_QUEUE_TOKEN = (
@@ -607,7 +614,7 @@ FINGERPRINT_TOKEN = f"{GENOME_PREFIX}fingerprint/fingerprint_db.tkn"
 FINGERPRINT_DATABASE_PATH = _resolve_shared_file(
     'margie_sb.fingerprint_database.path',
     'fingerprint_database.path',
-    '/depot/lindems/data/margie/fingerprint-database/fingerprint-database.tsv',
+    f'{STORE_ROOT}/fingerprint-database/fingerprint-database.tsv',
     'fingerprint-database.tsv',
 )
 FINGERPRINT_DATABASE_UPDATED_TOKEN = f"{GENOME_PREFIX}fingerprint/fingerprint_database_updated.tkn"
@@ -653,7 +660,7 @@ OPERON_FINGERPRINT_DATABASE_UPDATED_TOKEN = f"{GENOME_PREFIX}fingerprint/operon_
 GENOME_POOL_PATH = _resolve_shared_dir(
     'margie_sb.genome_pool.path',
     'genome_pool.path',
-    '/depot/lindems/data/margie/genome-pool',
+    f'{STORE_ROOT}/genome-pool',
 )
 GENOME_POOL_FNA_DIR = f"{GENOME_POOL_PATH}/fna"
 GENOME_POOL_FAA_DIR = f"{GENOME_POOL_PATH}/faa"

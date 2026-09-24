@@ -721,11 +721,11 @@ def load_operon_recurrence(depot_db: Path, restrict_to=None) -> dict[str, dict]:
 
 
 DEFAULT_OPERON_DB = Path(
-    "/depot/lindems/data/margie/fingerprint-database/"
+    "/depot/lindems/data/margie/databases/margie-generated-databases/fingerprint-database/"
     "operon-fingerprint-database-label-ordered.tsv"
 )
 DEFAULT_OCC_REFERENCE = Path(
-    "/depot/lindems/data/margie/operon-database/occ_reference.pkl"
+    "/depot/lindems/data/margie/databases/margie-generated-databases/operon-database/occ_reference.pkl"
 )
 
 

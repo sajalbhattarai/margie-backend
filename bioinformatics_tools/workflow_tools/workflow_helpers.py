@@ -23,7 +23,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH_DEFAULTS: dict[str, dict[str, str]] = {
     'margie_sb': {
         'sif_path': '/depot/lindems/data/margie/sif',
-        'db_root': '/depot/lindems/data/margie/db',
+        # The tools' reference databases (read only, shared by everyone).
+        'db_root': '/depot/lindems/data/margie/databases/reference-database-for-annotation/db',
         'input_path': '',
         'output_path': '',
     },
@@ -156,6 +157,18 @@ def genome_stem(name: str) -> str:
         if lowered.endswith(ext):
             return name[: -len(ext)]
     return Path(name).stem
+
+
+def default_store_root() -> str:
+    """Where a run writes its growing databases when the config names none:
+    the user's own scratch, /scratch/<cluster>/<user>/margie-2026 -- never the
+    base copies on depot, which every user starts from and nobody writes to.
+    The app always names them (api/services/user_stores.py); this is only the
+    fallback for a run started some other way."""
+    import os
+    import socket
+    cluster = (socket.getfqdn().split('.') + ['', ''])[1] or 'cluster'
+    return f"/scratch/{cluster}/{os.environ.get('USER', 'user')}/margie-2026"
 
 
 def genome_calls(genomes: dict[str, str], config) -> dict[str, dict[str, str]]:

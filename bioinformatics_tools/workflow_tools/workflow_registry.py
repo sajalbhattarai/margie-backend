@@ -522,46 +522,21 @@ WORKFLOWS: dict[str, WorkflowKey] = {
                 'description': 'Default runtime limit in minutes for MARGIE(SB) tools unless overridden per tool',
                 'type': 'int'
             },
+            # The growing databases (job database, operon reference, fingerprint
+            # databases, genome pool) and the run archives are each user's own,
+            # in this folder -- copied there from the bases on the first run and
+            # tracked by api/services/user_stores.py, which sets the per-store
+            # paths itself. Empty: /scratch/<cluster>/<cluster user>/margie-2026.
             {
-                'param': 'margie_sb.operon_database.occ_reference_pkl',
-                'default': MARGIE_USER_ROOT + '/operon-database/occ_reference.pkl',
-                'description': 'Shared cross-run OCC reference pickle path for C3 scoring updates',
+                'param': 'margie_sb.stores_root',
+                'default': '',
+                'description': 'Working folder for your databases and run archives (empty: margie-2026 in your scratch)',
                 'type': 'path'
             },
             {
-                'param': 'margie_sb.fingerprint_database.path',
-                'default': MARGIE_USER_ROOT + '/fingerprint-database/fingerprint-database.tsv',
-                'description': 'Shared cross-run gene fingerprint database TSV',
-                'type': 'path'
-            },
-            {
-                'param': 'margie_sb.genome_pool.path',
-                'default': MARGIE_USER_ROOT + '/genome-pool',
-                'description': 'Shared genome pool root (contains fna/ and faa/ subfolders)',
-                'type': 'path'
-            },
-            {
-                'param': 'margie_sb.scoring_results_historical.path',
-                'default': MARGIE_USER_ROOT + '/scoring-results-historical',
-                'description': 'Archive root for per-run historical FINAL scoring tables',
-                'type': 'path'
-            },
-            {
-                'param': 'margie_sb.final_tables_depot.path',
-                'default': MARGIE_USER_ROOT + '/final-tables',
-                'description': 'Reviewer-facing per-organism final table export root',
-                'type': 'path'
-            },
-            {
-                'param': 'margie_sb.report_figures.operon_db',
-                'default': MARGIE_USER_ROOT + '/fingerprint-database/operon-fingerprint-database-label-ordered.tsv',
-                'description': 'Operon fingerprint database used by downstream report figure scripts',
-                'type': 'path'
-            },
-            {
-                'param': 'margie_sb.sqlite_pipeline_snapshot.path',
-                'default': MARGIE_USER_ROOT + '/sqlite/pipeline-version',
-                'description': 'Destination root for versioned sqlite snapshot queueing',
+                'param': 'margie_sb.backup_root',
+                'default': f'{MARGIE_DEPOT_ROOT}/databases/margie-generated-databases',
+                'description': 'Where "Back up to depot" puts copies of your databases, beside the bases every user starts from',
                 'type': 'path'
             },
             {
