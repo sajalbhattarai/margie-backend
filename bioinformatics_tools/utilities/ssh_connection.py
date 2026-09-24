@@ -58,6 +58,20 @@ _POOL_LOCK = threading.Lock()
 # after 5.5 hours, 2026-09-24) and answered ever more slowly. Keepalives let
 # a connection the network dropped be noticed and replaced instead.
 _KEEPALIVE_SECONDS = 30
+# Connections per user, used in turn. One is not enough: sshd allows 10
+# sessions per connection (MaxSessions), and a page opening several folders
+# while runs are polled went past that ("ChannelException(2, 'Connect
+# failed')", 2026-09-24). A few, each kept for good, spread the sessions
+# without the leak coming back.
+_POOL_SIZE = 4
+
+
+def _alive(client) -> bool:
+    try:
+        transport = client.get_transport()
+        return transport is not None and transport.is_active() and transport.is_authenticated()
+    except Exception:
+        return False
 
 
 def _pool_key(host, username, pkey, key_filename):
@@ -75,11 +89,14 @@ def _pool_key(host, username, pkey, key_filename):
 def close_pooled_connections():
     """Drop every pooled client. For shutdown and tests."""
     with _POOL_LOCK:
-        for client, _ in _POOL.values():
-            try:
-                client.close()
-            except Exception:
-                pass
+        for entry in _POOL.values():
+            for client in entry['slots']:
+                if client is None:
+                    continue
+                try:
+                    client.close()
+                except Exception:
+                    pass
         _POOL.clear()
 
 _KEY_CLASSES = (
@@ -156,55 +173,36 @@ class SSHConnection:
             return self._handshake()
 
         key = _pool_key(self.host, self.username, self.pkey, self.key_filename)
-        now = time.time()
         with _POOL_LOCK:
-            hit = _POOL.get(key)
-            if hit:
-                client, created = hit
-                transport = client.get_transport()
-                # is_active() is necessary but not sufficient: a pooled client is
-                # shared across FastAPI's threadpool, so another request can close
-                # it between this check and the caller's exec_command -- which
-                # surfaces as "'NoneType' object has no attribute 'open_session'"
-                # because paramiko sets _transport = None on close. Nothing should
-                # close a pooled client (all such calls were removed), and this
-                # check is the second line of defence: anything not verifiably
-                # usable is discarded and replaced rather than handed out.
-                alive = False
-                if transport is not None:
-                    try:
-                        alive = transport.is_active() and transport.is_authenticated()
-                    except Exception:
-                        alive = False
-                if alive:
-                    LOGGER.debug('Reusing pooled SSH connection to %s', self.host)
-                    return client
-                # Dead: bin it and fall through to reconnect, so a dropped
-                # connection heals silently instead of erroring. Only a dead
-                # client is ever evicted, so closing it takes nothing from
-                # anyone (a live one must never be closed under a request or
-                # a run that is still using it).
-                _POOL.pop(key, None)
+            entry = _POOL.setdefault(key, {'slots': [None] * _POOL_SIZE, 'next': 0,
+                                           'making': [threading.Lock() for _ in range(_POOL_SIZE)]})
+            slot = entry['next']
+            entry['next'] = (slot + 1) % _POOL_SIZE
+            client = entry['slots'][slot]
+        # is_active() alone is not enough: anything not verifiably usable is
+        # replaced rather than handed out (a closed client has _transport None,
+        # which surfaces as "'NoneType' object has no attribute 'open_session'").
+        if client is not None and _alive(client):
+            LOGGER.debug('Reusing pooled SSH connection %d to %s', slot, self.host)
+            return client
+        # One handshake per slot at a time: requests arriving together wait
+        # for it rather than each making a connection only to close it.
+        with entry['making'][slot]:
+            with _POOL_LOCK:
+                current = entry['slots'][slot]
+            if current is not None and _alive(current):
+                return current
+            if current is not None:
+                # Dead: nothing is left to take from anyone by closing it. A
+                # live one is never closed -- a request or a run may use it.
                 try:
-                    client.close()
+                    current.close()
                 except Exception:
                     pass
-
-        ssh = self._handshake()
-        with _POOL_LOCK:
-            # Requests that found the pool empty together each made a client;
-            # the first one in is kept and the others close theirs.
-            hit = _POOL.get(key)
-            if hit:
-                other = hit[0].get_transport()
-                if other is not None and other.is_active():
-                    try:
-                        ssh.close()
-                    except Exception:
-                        pass
-                    return hit[0]
-            _POOL[key] = (ssh, now)
-        return ssh
+            ssh = self._handshake()
+            with _POOL_LOCK:
+                entry['slots'][slot] = ssh
+            return ssh
 
 
 def make_user_connection(
