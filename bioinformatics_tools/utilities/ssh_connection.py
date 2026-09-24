@@ -205,6 +205,20 @@ class SSHConnection:
             return ssh
 
 
+def runs_here(connection: 'SSHConnection') -> bool:
+    """Is this process on the cluster the connection goes to, as the same
+    user? (As the desktop app runs the API: on a login node, as the user.)
+    Then the user's files can be read directly, with the same permissions,
+    instead of over SSH. A server elsewhere (the web deployment) is not."""
+    import getpass
+    import socket
+    if not connection.username or connection.username != getpass.getuser():
+        return False
+    host = (connection.host or '').lower()
+    fqdn = socket.getfqdn().lower()
+    return bool(host) and (fqdn == host or fqdn.endswith('.' + host))
+
+
 def make_user_connection(
     cluster_host: str,
     cluster_username: str,

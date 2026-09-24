@@ -6,14 +6,12 @@ the API server cannot open it directly.
 Errors here are ignored — if saving history fails, the job itself keeps
 running.
 """
-import getpass
 import json
 import logging
 import os
-import socket
 
 from bioinformatics_tools.api.services import job_history
-from bioinformatics_tools.utilities.ssh_connection import SSHConnection
+from bioinformatics_tools.utilities.ssh_connection import SSHConnection, runs_here
 
 LOGGER = logging.getLogger(__name__)
 
@@ -27,13 +25,7 @@ def _here(connection: SSHConnection, db_path: str | None) -> bool:
     with the same permissions, instead of starting a Python on the cluster
     over SSH for each call (1.8 s before any work, 2026-09-24). A server
     elsewhere (the web deployment) keeps going over SSH."""
-    if not db_path or not connection.username or connection.username != getpass.getuser():
-        return False
-    host = (connection.host or "").lower()
-    fqdn = socket.getfqdn().lower()
-    if not host or not (fqdn == host or fqdn.endswith("." + host)):
-        return False
-    return os.path.exists(os.path.expanduser(db_path))
+    return bool(db_path) and runs_here(connection) and os.path.exists(os.path.expanduser(db_path))
 
 
 def _run(connection: SSHConnection, action: str, payload: dict):

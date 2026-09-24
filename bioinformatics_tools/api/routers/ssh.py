@@ -2680,6 +2680,52 @@ def browse(path: str, current_user: dict = Depends(get_current_user)):
     }
 
 
+_FINAL_SUMMARIES: dict = {}
+
+
+@router.get("/final_summary")
+def final_summary(path: str, current_user: dict = Depends(get_current_user)):
+    """A FINAL confidence table's report numbers (services/final_summary.py),
+    counted here instead of in the browser: the table is 10-30 MB, the
+    numbers a few hundred bytes. Read from disk when this API runs on the
+    cluster as the user, else streamed over SFTP. Kept until the file
+    changes (same size and time)."""
+    import os
+    from bioinformatics_tools.api.services import final_summary as fs
+    from bioinformatics_tools.utilities.ssh_connection import runs_here
+
+    conn = _build_connection(current_user)
+    path = _resolve_browse_path(path, current_user)
+    if not path.endswith(".tsv"):
+        raise HTTPException(status_code=400, detail="Not a FINAL table (.tsv)")
+    try:
+        if runs_here(conn) and os.path.exists(path):
+            st = os.stat(path)
+            key = (current_user["user_id"], path, st.st_size, st.st_mtime)
+            if key not in _FINAL_SUMMARIES:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    _FINAL_SUMMARIES[key] = fs.tally(fh)
+        else:
+            sftp = conn.connect().open_sftp()
+            try:
+                st = sftp.stat(path)
+                key = (current_user["user_id"], path, st.st_size, st.st_mtime)
+                if key not in _FINAL_SUMMARIES:
+                    with sftp.open(path, "r") as fh:
+                        fh.prefetch()
+                        _FINAL_SUMMARIES[key] = fs.tally(l.decode("utf-8", "replace") if isinstance(l, bytes) else l for l in fh)
+            finally:
+                sftp.close()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Path not found on cluster: '{path}'")
+    except Exception as exc:
+        raise HTTPException(status_code=_permission_status(exc), detail=f"Could not read {path}: {exc}")
+    # A few genomes' worth is plenty: drop the oldest past 64.
+    while len(_FINAL_SUMMARIES) > 64:
+        _FINAL_SUMMARIES.pop(next(iter(_FINAL_SUMMARIES)))
+    return _FINAL_SUMMARIES[key]
+
+
 # Cap for the in-browser file viewer: read at most this many bytes so a huge
 # output file can't blow up memory or the response. The UI flags truncation.
 _VIEW_MAX_BYTES = 1_000_000
