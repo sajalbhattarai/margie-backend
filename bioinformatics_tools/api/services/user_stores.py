@@ -486,8 +486,9 @@ while IFS=$'\t' read -r kind a b c d e f; do
       say running "$label" 0 ""
       echo "== $label" >> "$log"
       # margie-build's own folder on the cluster (the lab's, or the user's clone),
-      # used where it is: build.sh writes only to --sif-dir, --db-dir and the
-      # audit log. CONFIG_FILE is an empty file of our own: whoever's
+      # used where it is: build.sh writes only to --sif-dir, --db-dir, its
+      # --work-dir and the licence records. --local: this is already a SLURM
+      # job, and build.sh must not submit another. CONFIG_FILE is an empty file of our own: whoever's
       # .build-config.sh is in that folder must not decide where this user's
       # builds go (build.sh looks for one unless CONFIG_FILE names a file).
       repo="${repo_url:-}"
@@ -497,7 +498,7 @@ while IFS=$'\t' read -r kind a b c d e f; do
       [ -n "$statement" ] && accept=(--accept-"$tool"-licence --licence-statement "$statement")
       mkdir -p "$sifdir" "$dbdir" "$dir/apptainer-cache" "$dir/apptainer-tmp" || fail "$label" "could not make $sifdir or $dbdir"
       ( cd "$repo" && CONFIG_FILE="$dir/build-config.sh" APPTAINER_CACHEDIR="$dir/apptainer-cache" APPTAINER_TMPDIR="$dir/apptainer-tmp" \
-          THREADS="${SLURM_CPUS_PER_TASK:-4}" ./build.sh --"$mode" "$tool" --sif-dir "$sifdir" --db-dir "$dbdir" \
+          THREADS="${SLURM_CPUS_PER_TASK:-4}" ./build.sh --"$mode" "$tool" --local --work-dir "$dir/build-work" --sif-dir "$sifdir" --db-dir "$dbdir" \
           --audit-log "$dir/licence-acceptances.tsv" --no-color --quiet-notice ${accept[@]+"${accept[@]}"} ) >> "$log" 2>&1 \
         || fail "$label" "margie-build could not build $tool (the log above says why)"
       ;;

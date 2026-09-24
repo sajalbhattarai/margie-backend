@@ -273,14 +273,34 @@ def _sizes(conn, paths: list[str]) -> dict[str, int]:
     return sizes
 
 
+def _target(conn, path: str, home: str) -> str:
+    """A folder the user chose for the set-up copies: theirs to write to, and not the lab's."""
+    p = _expand(path, home)
+    if not p.startswith('/'):
+        raise StoreError(f'{path}: give the whole path, from /.', 400)
+    if _in_lab(p):
+        raise StoreError(f"{p} is in the lab's depot folder, which setup never writes to; choose another folder.", 409)
+    _, out = _run(conn, _PROBE + f'\nwritable {shlex.quote(p)}')
+    if (out.split() or ['r'])[-1] != 'w':
+        raise StoreError(f'Your account cannot write to {p} (or to the folder it would be made in).', 409)
+    return p
+
+
 def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[str] | None = None,
-         include_optional: bool = False) -> dict:
+         include_optional: bool = False, sif_to: str | None = None, db_to: str | None = None) -> dict:
     """What setting up would do, item by item, and what it cannot do and why.
     GTDB-Tk and the LLM layer (hundreds of GB between them) only when asked.
+
+    Where things go: sif_to and db_to when the user chose them (the containers
+    folder becomes sif_to; each database goes to <db_to>/<tool>); otherwise
+    where the config points when that can be written to, else under the
+    user's scratch root. The config is pointed at wherever they end up.
 
     The same answer the Yes / No question shows and the job then runs, so it
     is worked out again when Yes is pressed."""
     accept = accept or set()
+    sif_choice = _target(conn, sif_to, home) if sif_to and sif_to.strip() else None
+    db_choice = _target(conn, db_to, home) if db_to and db_to.strip() else None
     st = status(conn, cfg, home)
     root = user_stores.scratch_root(conn, cfg)
     recipes = build_recipes(conn, cfg, home)
@@ -315,8 +335,11 @@ def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[st
     images = [r for r in todo if r['kind'] == 'image' and usable(r)]
     sif_target = st['sif_dir']
     links: list[dict] = []
-    if images and not st['sif_dir_writable']:
+    if images and sif_choice:
+        sif_target = sif_choice
+    elif images and not st['sif_dir_writable']:
         sif_target = f'{root}/{SIF_SUB}'
+    if images and sif_target != st['sif_dir']:
         config[f'{WORKFLOW}.sif_path'] = sif_target
         fetching = {r['id'] for r in images}
         links = [r for r in rows if r['kind'] == 'image' and r['id'] not in fetching and r['status'] != 'missing']
@@ -324,14 +347,17 @@ def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[st
         items.append({**_item(r), 'dst': f"{sif_target}/{r['name']}"})
     ready_images = {r['tool'] for r in rows if r['kind'] == 'image' and r['status'] == 'ok'} | {r['tool'] for r in images}
 
-    # Databases: each where the config points, or under scratch with db.<tool>.
+    # Databases: each in the chosen folder, or where the config points, or
+    # under scratch -- with db.<tool> pointed there when that is not its place.
+    db_home = db_choice or f'{root}/{DB_SUB}'
     for r in todo:
         if r['kind'] != 'database' or not usable(r):
             continue
         dst = r['path']
         movable = r['writable'] and (r['source'] != 'build' or posixpath.basename(dst) == r['tool'])
-        if not movable:
-            dst = f"{root}/{DB_SUB}/{r['tool']}"
+        if db_choice or not movable:
+            dst = f"{db_home}/{r['tool']}"
+        if dst != r['path']:
             config[f"db.{r['tool']}"] = dst
         if r['source'] == 'build' and r['tool'] not in ready_images:
             # build.sh indexes a database inside its tool's container.
@@ -348,6 +374,8 @@ def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[st
     return {
         'root': root,
         'sif_dir': sif_target,
+        # Where the databases set up here go (the page offers to change it).
+        'db_dir': db_choice or (db_home if any(k.startswith('db.') for k in config) else st['db_root']),
         'items': items,
         'links': [{'src': r['path'], 'dst': f"{sif_target}/{r['name']}"} for r in links],
         'skipped': skipped,
@@ -368,12 +396,12 @@ def _item(r: dict) -> dict:
 
 
 def start(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[str] | None = None,
-          include_optional: bool = False) -> dict:
+          include_optional: bool = False, sif_to: str | None = None, db_to: str | None = None) -> dict:
     """Set up what the plan can: one SLURM job, the copy job's progress bar."""
     op = user_stores.progress(conn, cfg)
     if op and op.get('state') in ('queued', 'running'):
         raise StoreError('A copy is already under way.', 409)
-    p = plan(conn, cfg, home, include_builds, accept, include_optional)
+    p = plan(conn, cfg, home, include_builds, accept, include_optional, sif_to, db_to)
     if not p['items']:
         raise StoreError('Nothing here can be set up: ' + '; '.join(f"{s['label']}: {s['reason']}" for s in p['skipped'])
                          if p['skipped'] else 'Everything is already there.', 409)

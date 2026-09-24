@@ -1434,6 +1434,7 @@ def get_assets(current_user: dict = Depends(get_current_user)):
 
 @router.get("/assets/plan")
 def get_assets_plan(builds: bool = True, optional: bool = False, accept: str = "",
+                    sif_to: str = "", db_to: str = "",
                     current_user: dict = Depends(get_current_user)):
     """What setting up would do -- item by item, the size of the copies, the
     room on scratch -- asked before the Yes / No. accept=* lists the
@@ -1441,21 +1442,24 @@ def get_assets_plan(builds: bool = True, optional: bool = False, accept: str = "
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
     accepted = set(tool_assets.GATED) if accept == "*" else {t.strip() for t in accept.split(",") if t.strip()}
-    return _stores_call(tool_assets.plan, conn, user_config, current_user["home_dir"], builds, accepted, optional)
+    return _stores_call(tool_assets.plan, conn, user_config, current_user["home_dir"], builds, accepted, optional,
+                        sif_to or None, db_to or None)
 
 
 @router.post("/assets/setup")
 def setup_assets(body: dict | None = None, current_user: dict = Depends(get_current_user)):
     """Set up the missing containers and databases. body: {builds: bool,
-    optional: bool, accept: [tool, ...]} -- accept names the licence-gated
-    tools whose statement the user accepted for this build."""
+    optional: bool, accept: [tool, ...], sif_to, db_to} -- accept names the
+    licence-gated tools whose statement the user accepted for this build;
+    sif_to / db_to, the folders the user chose for them (else the defaults)."""
     body = body or {}
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
     _stores_settle(current_user, conn, user_config)
     accepted = {str(t) for t in (body.get("accept") or [])}
     return _stores_call(tool_assets.start, conn, user_config, current_user["home_dir"],
-                        bool(body.get("builds", True)), accepted, bool(body.get("optional", False)))
+                        bool(body.get("builds", True)), accepted, bool(body.get("optional", False)),
+                        str(body.get("sif_to") or "") or None, str(body.get("db_to") or "") or None)
 
 
 @router.get("/assets/build-recipes")

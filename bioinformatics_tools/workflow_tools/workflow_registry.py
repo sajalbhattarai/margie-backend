@@ -253,6 +253,25 @@ def margie_sb_sif_files(selected_tool_keys: set[str] | None = None) -> list[tupl
     ]
 
 
+def _margie_sb_location_params() -> list[dict]:
+    """Where each tool's database is, when not <db_root>/<tool> (margie_sb.smk's
+    db_path reads db.<tool> first), and where margie-build is on the cluster."""
+    params = [{
+        'param': f"db.{tool['key']}",
+        'default': '',
+        'description': f"{tool['label']} database folder; empty means <Databases folder>/{tool['key']}",
+        'type': 'path',
+    } for tool in MARGIE_SB_PHASED_TOOLS if tool.get('database')]
+    params.append({
+        'param': 'margie_sb.build_repo',
+        'default': '',
+        'description': "margie-build's folder on the cluster, which builds containers and databases; "
+                       "empty means the lab's copy on depot, else ~/margie-build",
+        'type': 'path',
+    })
+    return params
+
+
 def _margie_sb_tool_params() -> list[dict]:
     params: list[dict] = []
     for tool in MARGIE_SB_PHASED_TOOLS:
@@ -653,7 +672,7 @@ WORKFLOWS: dict[str, WorkflowKey] = {
                 'description': 'Default SLURM partition for phase15 tools',
                 'type': 'string'
             },
-        ] + _margie_sb_tool_params(),
+        ] + _margie_sb_tool_params() + _margie_sb_location_params(),
         database_deps=[
             'Input FASTA file',
             'Configurable db_root with per-tool db overrides',
