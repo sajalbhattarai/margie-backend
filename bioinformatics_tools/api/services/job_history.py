@@ -243,6 +243,10 @@ def get_job(db_path: str, job_id: str,
         return None
 
 
+# How much of each run's log a list carries (its end).
+LIST_LOG_TAIL = 8000
+
+
 def list_jobs(db_path: str, workflow: str | None = None, limit: int = 100,
               offset: int = 0, owner_username: str | None = None,
               owner_cluster_username: str | None = None) -> list[dict]:
@@ -268,8 +272,14 @@ def list_jobs(db_path: str, workflow: str | None = None, limit: int = 100,
                 params.extend(owner_params)
 
             where_clause = f"WHERE {' AND '.join(conditions)} " if conditions else ""
+            # A list needs each run's record, not its whole log: only the end of
+            # it (where a failure says why). Whole logs made a 50-row list 43 MB
+            # -- over a minute through SSH -- for 71 runs; get_job still has them.
+            columns = [r[1] for r in conn.execute("PRAGMA table_info(api_jobs)")]
+            select = ", ".join(
+                f"substr(logs, -{LIST_LOG_TAIL}) AS logs" if c == "logs" else f'"{c}"' for c in columns)
             rows = conn.execute(
-                f"SELECT * FROM api_jobs {where_clause}ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                f"SELECT {select} FROM api_jobs {where_clause}ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 [*params, limit, offset],
             ).fetchall()
             return [_decode_row(dict(r)) for r in rows]

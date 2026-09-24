@@ -1881,8 +1881,25 @@ def _try_reattach(job_id: str, row: dict, conn, main_db: str | None,
 @router.get("/job_status/{job_id}")
 def get_job_status(
     job_id: str,
+    log_offset: int | None = None,
+    log_tail: int | None = None,
     current_user: dict = Depends(get_current_user),
 ):
+    """A job's status and log (_job_status). A page following a run asks for
+    only the log it does not have: log_offset=N, from character N on, or
+    log_tail=N, the last N characters; logs_size is then the whole log's
+    length. Without them, the whole log, as before -- a long run's is tens of
+    MB, and a page polling that every few seconds kept the server busy."""
+    result = _job_status(job_id, current_user)
+    if log_offset is None and log_tail is None:
+        return result
+    full = result.get("logs") or ""
+    size = len(full)
+    start = max(0, size - log_tail) if log_tail else min(max(0, log_offset or 0), size)
+    return {**result, "logs": full[start:], "logs_offset": start, "logs_size": size}
+
+
+def _job_status(job_id: str, current_user: dict) -> dict:
     """Get status of a running job. Falls back to persistent history (e.g.
     after a dane-api restart wiped the in-memory job_store) before giving
     up. Returns 403 if the in-memory job belongs to a different user --
@@ -2642,18 +2659,11 @@ def browse(path: str, current_user: dict = Depends(get_current_user)):
     path = _resolve_browse_path(path, current_user)
 
     try:
-        kind = ssh_sftp.check_remote_path_kind(path, conn)
+        entries = ssh_sftp.list_remote_dir_checked(path, connection=conn)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Path not found on cluster: '{path}'")
-    except Exception as exc:
-        raise HTTPException(status_code=_permission_status(exc),
-                            detail=f"Could not access path: {exc}")
-
-    if kind != "directory":
+    except NotADirectoryError:
         raise HTTPException(status_code=400, detail=f"Not a directory: '{path}'")
-
-    try:
-        entries = ssh_sftp.list_remote_dir(path, connection=conn)
     except Exception as exc:
         status = _permission_status(exc)
         detail = f"Permission denied: '{path}'" if status == 403 else f"Failed to list directory: {exc}"

@@ -48,6 +48,34 @@ def list_remote_dir(
     return entries
 
 
+def list_remote_dir_checked(
+    remote_path: str,
+    connection: SSHConnection,
+) -> list[dict]:
+    """list_remote_dir, with the check that the path is a directory made in
+    the same SFTP session (one session per listing, not two: each one is a
+    round trip and a new sftp-server on the login node). Raises
+    FileNotFoundError when the path is not there and NotADirectoryError when
+    it is a file."""
+    ssh = connection.connect()
+    sftp = ssh.open_sftp()
+    try:
+        try:
+            attr = sftp.stat(remote_path)
+        except FileNotFoundError:
+            raise FileNotFoundError(f'Path not found on cluster: {remote_path}')
+        if not stat.S_ISDIR(attr.st_mode):
+            raise NotADirectoryError(remote_path)
+        return [{
+            'name': a.filename,
+            'type': 'directory' if stat.S_ISDIR(a.st_mode) else 'file',
+            'size': a.st_size,
+            'mtime': a.st_mtime,
+        } for a in sftp.listdir_attr(remote_path)]
+    finally:
+        sftp.close()
+
+
 def stream_remote_file(
     remote_path: str,
     connection: SSHConnection,
