@@ -464,13 +464,14 @@ function opColor(id){
   return OPERON_CYCLE[Math.abs(h)%OPERON_CYCLE.length];
 }
 const CX=390, CY=396, START=90;
-// A draft assembly comes in hundreds of contigs. A fixed 4-degree gap (and a
-// 4-degree floor) each wrapped the ring round several times over itself, with
-// a label per contig on top: past MANY contigs the gaps share at most 60
-// degrees, each contig gets its length's share of the rest, and only contigs
-// of at least LABEL_SHARE of the genome are named.
-const MANY=24, LABEL_SHARE=0.05;
-const DRAFT=D.contigs.length>MANY;
+// A genome in more than one piece shows no contig names, ticks or positions:
+// with a draft's hundreds of contigs they piled up on each other, and even a
+// few crowd the ring. The pieces sit end to end with a small gap between.
+// Past MANY contigs the gaps share at most 60 degrees and each contig gets its
+// length's share of the rest (a fixed 4-degree gap and floor each wrapped the
+// ring round itself).
+const MANY=24;
+const DRAFT=D.contigs.length>MANY, MULTI=D.contigs.length>1;
 const GAP=DRAFT?Math.min(4,60/D.contigs.length):4, MINSPAN=DRAFT?0:4;
 const R={bbO:352,bbI:343, fO:335,fI:306, rO:301,rI:272, tick:262};
 
@@ -489,10 +490,6 @@ D.contigs.forEach(c=>{
   lay.push({start:cur,span}); cur-=span;
 });
 const ang=(ci,pos)=>lay[ci].start - lay[ci].span*(pos/D.contigs[ci].len);
-// SPAdes names contigs NODE_12_length_83421_cov_31.2: "NODE_12" says which.
-const shortContig=n=>(n.match(/^(NODE_\d+)_length_/)||[,n])[1];
-const sizeText=len=>len>=1e5?(len/1e6).toFixed(2)+" Mb":(len/1e3).toFixed(1)+" kb";
-const contigLabel=c=>shortContig(c.name)+" · "+sizeText(c.len);
 const pol=(r,deg)=>{const a=deg*Math.PI/180;return [CX+r*Math.cos(a), CY - r*Math.sin(a)];};
 const P=(r,d)=>{const p=pol(r,d);return p[0].toFixed(1)+","+p[1].toFixed(1);};
 
@@ -513,20 +510,16 @@ function annulusStrip(ci,ri,ro,fill){
   }
 }
 order.forEach(ci=>{
-  // Draft contigs alternate black and grey, so where one ends shows.
-  annulusStrip(ci,R.bbI,R.bbO,DRAFT&&ci%2?"#9a9a9a":"#000000");
+  annulusStrip(ci,R.bbI,R.bbO,"#000000");
   const L=D.contigs[ci].len, step=L>3e6?1e6:5e5;
-  // A draft's hundreds of small contigs get no ticks: one each made a fringe.
-  if(!DRAFT || L>=25e4) for(let p=0;p<=L;p+=step){
+  // Positions only along a single replicon (see MULTI above).
+  if(!MULTI) for(let p=0;p<=L;p+=step){
     const a=ang(ci,p),[x0,y0]=pol(R.bbO,a),[x1,y1]=pol(R.bbO+8,a);
     svg.appendChild(el("line",{x1:x0,y1:y0,x2:x1,y2:y1,stroke:"#000000","stroke-width":.8}));
     if(L>=25e4 && p%step===0){const[tx,ty]=pol(R.bbO+20,a);
       const t=el("text",{x:tx,y:ty,"font-size":10,fill:"#000000","text-anchor":"middle","dominant-baseline":"middle"});
       t.textContent=(p/1e6).toFixed(1); svg.appendChild(t);}
   }
-  if(order.length>1 && (!DRAFT || D.contigs[ci].len/total>=LABEL_SHARE)){const mid=lay[ci].start-lay[ci].span/2,[lx,ly]=pol(R.bbO+40,mid);
-    const t=el("text",{x:lx,y:ly,"font-size":11,fill:"#000000","text-anchor":"middle","dominant-baseline":"middle"});
-    t.textContent=contigLabel(D.contigs[ci]); svg.appendChild(t);}
 });
 
 // ---- gene layer (event-delegated) ----
@@ -872,11 +865,11 @@ document.getElementById("showFlags").onchange=paint;
   if(!svg) return;
   const BASE={x:0,y:0,w:780,h:780};
   let vb={...BASE};
-  const MIN_W=780/40, MAX_W=780;      // 40x in, never zoom out past the full map
+  const MIN_W=780/40, MAX_W=780*3;    // 40x in, and out to a third of the default size
 
   function apply(){ svg.setAttribute("viewBox",`${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
     const btn=document.getElementById("zreset");
-    if(btn) btn.disabled = (vb.w>=MAX_W-0.5 && Math.abs(vb.x)<0.5 && Math.abs(vb.y)<0.5);
+    if(btn) btn.disabled = (Math.abs(vb.w-BASE.w)<0.5 && Math.abs(vb.x)<0.5 && Math.abs(vb.y)<0.5);
   }
   // Client px -> current viewBox units.
   function toSvg(ev){ const r=svg.getBoundingClientRect();
