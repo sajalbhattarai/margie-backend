@@ -816,9 +816,9 @@ function operonFigureSVG(id){
   s+=`<line x1="${MX}" y1="${headY+7}" x2="${W-MX}" y2="${headY+7}" stroke="#000000" stroke-width="0.8"/>`;
   s+=T(MX,headY,'#',11.5,700);
   // Two swatch columns precede the product name: arrow colour, then tier.
-  s+=T(MX+14,headY,'map',9.5,700);
-  s+=T(MX+28,headY,'tier',9.5,700);
-  s+=T(MX+48,headY,'gene product',11.5,700);
+  s+=T(MX+21.5,headY,'map',8.5,700,'middle');
+  s+=T(MX+41.5,headY,'tier',8.5,700,'middle');
+  s+=T(MX+58,headY,'gene product',11.5,700);
   s+=T(CX.loc,headY,'location (bp)',11.5,700);
   s+=T(CX.c1,headY,'C1',11.5,700,'end');
   s+=T(CX.c2,headY,'C2',11.5,700,'end');
@@ -837,8 +837,8 @@ function operonFigureSVG(id){
           tn=g.ti<0?'non-coding':TIER_NAMES[g.ti];
     s+=T(MX,y,String(k+1),11);
     s+=`<rect x="${MX+16}" y="${y-9}" width="11" height="11" fill="${c}" stroke="#000000" stroke-width="0.5"/>`;
-    s+=`<rect x="${MX+30}" y="${y-9}" width="11" height="11" fill="${ct}" stroke="#000000" stroke-width="0.5"/>`;
-    s+=T(MX+48,y,(g.nm||'(unnamed)').slice(0,54),12);
+    s+=`<rect x="${MX+36}" y="${y-9}" width="11" height="11" fill="${ct}" stroke="#000000" stroke-width="0.5"/>`;
+    s+=T(MX+58,y,(g.nm||'(unnamed)').slice(0,54),12);
     s+=T(CX.loc,y,`${g.s.toLocaleString()}–${g.e.toLocaleString()} ${g.st>0?'+':'−'}`,11);
     s+=T(CX.c1,y,dec(g.c1),12,null,'end');
     s+=T(CX.c2,y,dec(g.c2),12,null,'end');

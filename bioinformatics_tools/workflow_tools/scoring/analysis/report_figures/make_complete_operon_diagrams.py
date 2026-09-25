@@ -67,12 +67,9 @@ def _members(op_row) -> list[dict]:
 
 
 def _block_height(members: list[dict]) -> float:
-    """Figure inches an operon block needs (for pagination): title gap + wrapped
-    arrow rows + gap + full table + inter-block gap. Mirrors render_operon_page."""
-    n = len(members)
-    nrows = math.ceil(n / _PER_ROW) if n > _PER_ROW else 1
-    table_in = max(L.member_table_units(members, _DESC_WRAP), 1.0) * _LINE_IN
-    return _TRACK_ROW_IN * nrows + table_in + 0.96   # 0.46 title +0.12 intra +0.38 inter
+    """Figure inches an operon block needs (for pagination), as render_operon_page
+    draws it: the viewer's operon map, 96 px to the inch."""
+    return L.operon_block_px(len(members)) / 96.0
 
 
 def _paginate(ops: list, heights: list[float]) -> list[list[int]]:
@@ -98,12 +95,10 @@ def _render_page(ops_page: list, size: int, page: int, npages: int,
     blocks, rows = [], []
     for r in ops_page:
         members = _members(r)
-        nrows = math.ceil(len(members) / _PER_ROW) if len(members) > _PER_ROW else 1
         k = k_lookup(r)
         where = f"in {k} pangenome genomes" if k != 1 else "in 1 pangenome genome"
-        wrapnote = f"  ({nrows} rows)" if nrows > 1 else ""
-        blocks.append({"members": members,
-                       "title": f"{size}-gene operon  |  {r['operon_id']}  |  {where}{wrapnote}"})
+        blocks.append({"members": members, "heading": r["operon_id"],
+                       "detail": f"{size}-gene operon  |  {where}"})
         rows.append({"operon_id": r["operon_id"], "size": size,
                      "pangenome_organisms": k,
                      "pangenome_occurrences": int(r.get("pangenome_occurrences", 0) or 0),

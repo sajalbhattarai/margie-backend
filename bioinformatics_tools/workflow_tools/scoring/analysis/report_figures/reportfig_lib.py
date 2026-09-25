@@ -27,7 +27,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")  # headless / SLURM
 import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.patches import FancyBboxPatch, Polygon  # noqa: E402
+from matplotlib.patches import FancyBboxPatch, Polygon, Rectangle  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
@@ -663,6 +663,7 @@ def build_operons(genes: pd.DataFrame) -> pd.DataFrame:
                 errors="coerce").tolist(),
             "review_reasons": g.get("needs_review_reason",
                                     pd.Series([""] * len(g))).tolist(),
+            "tiers": g.get("confidence_tier", pd.Series([""] * len(g))).tolist(),
         })
     return pd.DataFrame(rows)
 
@@ -1793,126 +1794,195 @@ def render_gene_table(ax, entries, fontsize: float = 7.6, show_location: bool = 
         y -= len(wlines) * line_h
 
 
-def render_operon_page(outpath, blocks, *, org_label, suptitle, run_root=None,
-                       provenance=None, note=None, footer_sources=None,
-                       fig_width=22.0, table_fs=13.0, desc_wrap=60,
-                       per_row=None, min_span=None, dpi=170, badges=None,
-                       legend_handles=None) -> None:
-    """Render ONE page of operon blocks (arrow track + full C1-C4 breakdown table)
-    in the UNIFIED format shared by the full-genome atlas and the representative
-    report galleries, so their images look identical:
-      * deterministic absolute placement -- every arrow row is _TRACK_ROW_IN tall,
-        so arrows are a constant physical size no matter how an operon wraps;
-      * ONE page-level column layout (breakdown_col_layout over EVERY block's
-        entries) so all stacked tables align their columns;
-      * a CENTERED content column (x0 = (1-xw)/2) -> equal left/right page margins
-        and the table sits within the same margins as the arrow map;
-      * a font hierarchy scaled off `table_fs` (one knob for the whole page).
-    `blocks` = list of {"members": [...], "title": "..."}.  Returns nothing; writes
-    the PNG to `outpath`."""
-    n = len(blocks)
-    if n == 0:
+# ---- operon figures, drawn as the genome viewer's downloadable operon map ------
+# The static operon pages (the full-genome atlas and the report galleries) are
+# the SAME figure the genome viewer saves from an operon card (operonFigureSVG in
+# viz/gen_genome_viewer.py): a white page, the operon's id and one line on it,
+# arrows to scale along the genome and numbered above with the intergenic
+# distance below, then one row per gene -- arrow colour, tier colour, product,
+# location, C1..C4, final (adjusted/hybrid), tier and review -- and the tier key.
+# Geometry is in the viewer's pixels (1 px = 1/96 in) so the two read the same.
+VIEWER_TIER_COL = ["#1F77FF", "#00B84D", "#FFCC00", "#FF8C00", "#EE2233"]
+VIEWER_OPERON_CYCLE = ["#1F77FF", "#FF8C00", "#00B84D", "#B65CFF", "#00C2D1", "#EE2233"]
+VIEWER_NONCODE = "#d5d5d5"
+VIEWER_REVIEW = "#c0143c"
+_VW = 1480                      # page width (px)
+_VMX = 32                       # side margin (px)
+_V_ROW = 21                     # table row height (px)
+_V_SERIF = ["Times New Roman", "Times", "Nimbus Roman", "Liberation Serif", "DejaVu Serif"]
+
+
+def _v_tier_index(tier) -> int:
+    t = (str(tier or "")).strip().lower()
+    return CONF_TIER_ORDER.index(t) if t in CONF_TIER_ORDER else -1
+
+
+def _v_review_short(reason) -> str:
+    """The viewer's revShort: a full review sentence -> its short trigger tag(s)."""
+    if not reason or str(reason).strip() in ("", "nan", "-"):
+        return "yes"
+    s, t = str(reason).lower(), []
+    if "ec conflict" in s:
+        t.append("EC conflict")
+    if "low confidence" in s:
+        t.append("low conf.")
+    if "operon inference ambig" in s:
+        t.append("operon ambig.")
+    return "; ".join(t) if t else (str(reason) if len(str(reason)) <= 20 else str(reason)[:18] + "…")
+
+
+def _v_num(v):
+    try:
+        f = float(v)
+        return None if f != f else f
+    except (TypeError, ValueError):
+        return None
+
+
+def _v_dec(v) -> str:
+    f = _v_num(v)
+    return "—" if f is None else f"{f:.2f}"
+
+
+def _v_flagged(m) -> bool:
+    return str(m.get("needs_review") or "").strip().lower() in ("yes", "true", "1")
+
+
+def operon_block_px(n_genes: int) -> int:
+    """Height (px) of one operon block: its three heading lines, the arrows, and
+    the table; used by the atlas to fill pages."""
+    return 104 + 30 + 48 + 24 + _V_ROW * max(n_genes, 1) + 40
+
+
+def _v_block(ax, y0, members, heading, detail):
+    """Draw one operon (or a stretch of genes) at vertical offset y0 (px);
+    returns the block's height. A port of operonFigureSVG."""
+    T = lambda x, y, text, px, bold=False, ha="left": ax.text(
+        x, y, text, fontsize=px * 0.75, fontweight="bold" if bold else "normal",
+        ha=ha, va="baseline", color="#000000", family=_V_SERIF)
+    genes = [m for m in members if _v_num(m.get("start")) is not None and _v_num(m.get("end")) is not None]
+    genes.sort(key=lambda m: min(_v_num(m["start"]), _v_num(m["end"])))
+    n = len(genes)
+    if not n:
+        return 0
+    s_ = lambda m: min(_v_num(m["start"]), _v_num(m["end"]))
+    e_ = lambda m: max(_v_num(m["start"]), _v_num(m["end"]))
+    lo, hi = min(s_(g) for g in genes), max(e_(g) for g in genes)
+    rng = max(1.0, hi - lo)
+    aw = _VW - 2 * _VMX
+    sx = lambda v: _VMX + aw * (v - lo) / rng
+    arr_y, arr_h = y0 + 104, 30
+    head_y = arr_y + arr_h + 48
+
+    T(_VMX, y0 + 30, heading, 20, bold=True)
+    if detail:
+        T(_VMX, y0 + 52, detail, 13)
+    T(_VMX, y0 + 72, f"{n} genes  |  {(hi - lo) / 1000:.1f} kb region  |  arrow length ∝ gene length"
+                     "  |  intergenic distances shown below arrows", 12.5)
+    ax.plot([_VMX, _VW - _VMX], [arr_y + arr_h / 2] * 2, color="#cccccc", lw=1.2 * 0.75, zorder=1)
+
+    spans, prev_end = [], None
+    for k, g in enumerate(genes):
+        x0, x1 = sx(s_(g)), sx(e_(g))
+        if x1 - x0 < 7:
+            x1 = x0 + 7
+        if prev_end is not None and x0 < prev_end + 2:
+            w = x1 - x0
+            x0, x1 = prev_end + 2, prev_end + 2 + w
+        prev_end = x1
+        spans.append((x0, x1))
+        hd = min(12.0, (x1 - x0) * 0.5)
+        ti = _v_tier_index(g.get("tier"))
+        col = VIEWER_NONCODE if ti < 0 else VIEWER_OPERON_CYCLE[k % len(VIEWER_OPERON_CYCLE)]
+        yt, yb, ym = arr_y, arr_y + arr_h, arr_y + arr_h / 2
+        plus = str(g.get("strand") or "+").strip() != "-"
+        pts = ([(x0, yt), (x1 - hd, yt), (x1, ym), (x1 - hd, yb), (x0, yb)] if plus
+               else [(x1, yt), (x0 + hd, yt), (x0, ym), (x0 + hd, yb), (x1, yb)])
+        flag = _v_flagged(g)
+        ax.add_patch(Polygon(pts, closed=True, facecolor=col,
+                             edgecolor=VIEWER_REVIEW if flag else "#000000",
+                             linewidth=(1.8 if flag else 0.7) * 0.75, joinstyle="miter", zorder=3))
+        T((x0 + x1) / 2, arr_y - 10, str(k + 1), 11, ha="center")
+    for k in range(n - 1):
+        gap = int(s_(genes[k + 1]) - e_(genes[k]) - 1)
+        lab = "‹1 bp" if gap <= 0 else (f"{gap} bp" if gap < 1000 else f"{gap / 1000:.1f} kb")
+        T((spans[k][1] + spans[k + 1][0]) / 2, arr_y + arr_h + 15, lab, 10, ha="center")
+
+    cx = {"loc": 432, "c1": 710, "c2": 770, "c3": 903, "c4": 965, "fin": 1090, "tier": 1180, "rev": _VW - _VMX}
+    ax.plot([_VMX, _VW - _VMX], [head_y + 7] * 2, color="#000000", lw=0.8 * 0.75)
+    T(_VMX, head_y, "#", 11.5, bold=True)
+    T(_VMX + 21.5, head_y, "map", 8.5, bold=True, ha="center")
+    T(_VMX + 41.5, head_y, "tier", 8.5, bold=True, ha="center")
+    T(_VMX + 58, head_y, "gene product", 11.5, bold=True)
+    T(cx["loc"], head_y, "location (bp)", 11.5, bold=True)
+    for key, lab in (("c1", "C1"), ("c2", "C2"), ("c3", "C3 adj/hyb"), ("c4", "C4"),
+                     ("fin", "final adj/hyb"), ("tier", "tier"), ("rev", "review")):
+        T(cx[key], head_y, lab, 11.5, bold=True, ha="right")
+    for k, g in enumerate(genes):
+        y = head_y + 24 + _V_ROW * k
+        ti = _v_tier_index(g.get("tier"))
+        c = VIEWER_NONCODE if ti < 0 else VIEWER_OPERON_CYCLE[k % len(VIEWER_OPERON_CYCLE)]
+        ct = VIEWER_NONCODE if ti < 0 else VIEWER_TIER_COL[ti]
+        tn = "non-coding" if ti < 0 else CONF_TIER_ORDER[ti]
+        T(_VMX, y, str(k + 1), 11)
+        for dx, fill in ((16, c), (36, ct)):
+            ax.add_patch(Rectangle((_VMX + dx, y - 9), 11, 11, facecolor=fill,
+                                   edgecolor="#000000", linewidth=0.5 * 0.75, zorder=3))
+        name = str(g.get("label") or "").strip() or "(unnamed)"
+        T(_VMX + 58, y, name[:54], 12)
+        plus = str(g.get("strand") or "+").strip() != "-"
+        T(cx["loc"], y, f"{int(s_(g)):,}–{int(e_(g)):,} {'+' if plus else '−'}", 11)
+        T(cx["c1"], y, _v_dec(g.get("c1")), 12, ha="right")
+        T(cx["c2"], y, _v_dec(g.get("c2")), 12, ha="right")
+        T(cx["c3"], y, f"{_v_dec(g.get('c3'))}/{_v_dec(g.get('c3_hybrid'))}", 12, ha="right")
+        T(cx["c4"], y, _v_dec(g.get("c4")), 12, ha="right")
+        T(cx["fin"], y, f"{_v_dec(g.get('operon_adjusted'))}/{_v_dec(g.get('operon_adjusted_hybrid'))}",
+          12, bold=True, ha="right")
+        T(cx["tier"], y, tn, 11, ha="right")
+        T(cx["rev"], y, _v_review_short(g.get("review_reason")) if _v_flagged(g) else "", 11, ha="right")
+    return operon_block_px(n)
+
+
+def render_operon_page(outpath, blocks, *, org_label, suptitle, dpi=288, **_legacy) -> None:
+    """Write ONE page of operon blocks, each drawn as the genome viewer's
+    downloadable operon map (see _v_block), under the page title and organism,
+    with the tier key once at the foot. `blocks` = [{"members": [...],
+    "heading": "operon_0443", "detail": "10-gene operon | in 3 pangenome genomes"}];
+    a block with only a "title" shows it as its heading. Older layout arguments
+    (fig_width, table_fs, per_row, notes, footers...) are accepted and ignored:
+    the viewer's figure has none of them."""
+    blocks = [b for b in blocks if b.get("members")]
+    if not blocks:
         return
-    members_per = [b["members"] for b in blocks]
-
-    # Page geometry, computed up front so the descriptor wrap can be fit to the
-    # real column width -- this keeps the wrap, the table row count, and the column
-    # layout in agreement so long descriptors never spill into the location column.
-    xw = 0.945
-    x0 = (1.0 - xw) / 2.0                  # CENTERED axis -> equal left/right margins
-    page_width_in = fig_width * xw
-    span_ref = min_span or max((len(m) for m in members_per), default=1)
-    left_frac = 0.10 / (span_ref + 0.40)
-    desc_wrap = _fit_desc_wrap(members_per, table_fs, page_width_in, desc_wrap,
-                               left_frac, 1.0 - left_frac)
-
-    def _nrows(m):
-        return (-(-len(m) // per_row)) if (per_row and len(m) > per_row) else 1
-    nrows_per = [_nrows(m) for m in members_per]
-    units_per = [member_table_units(m, desc_wrap) for m in members_per]
-    track_h = [_TRACK_ROW_IN * nr for nr in nrows_per]
-    line_in = round(table_fs / 72.0 * 1.42, 3)
-    table_h = [max(units_per[i], 1.0) * line_in for i in range(n)]
-
-    # one knob (table_fs) drives the whole font hierarchy so it scales cleanly
-    title_fs = table_fs + 1.0          # per-operon "N-gene operon | ..." title
-    tag_fs = table_fs + 1.0            # gene numbers above the arrows
-    gap_fs = table_fs - 1.5            # intergenic "N bp" labels
-    prov_fs = table_fs - 0.5           # provenance line
-    note_fs = table_fs - 1.0           # method note / legend
-    foot_fs = table_fs - 2.0           # sources footer
-    sup_fs = table_fs + 4.0            # page suptitle
-    org_fs = table_fs + 2.0            # organism scientific name
-
-    has_legend = bool(legend_handles)
-    _HEADER_IN = 2.30 if has_legend else 1.90
-    _TITLE_GAP, _INTRA_GAP, _INTER_GAP, _FOOTER_IN = 0.46, 0.12, 0.38, 0.85
-    block_in = [_TITLE_GAP + track_h[i] + _INTRA_GAP + table_h[i] for i in range(n)]
-    H = _HEADER_IN + sum(block_in) + _INTER_GAP * (n - 1) + _FOOTER_IN
-
-    # The arrow backbone spans axis x = -0.60..span-0.40 over an xlim of span+0.40,
-    # i.e. axis fractions [left_frac, 1-left_frac]. Lay the title, the table and the
-    # arrows all between those SAME mirrored bounds so the ink is symmetric within
-    # the axis -> the page crops to EQUAL left/right margins and the table sits
-    # within the same margins as the operon map.
-    fig = plt.figure(figsize=(fig_width, H))
-    track_axes, tables = [], []
-    cur_top = H - _HEADER_IN
-    for i, b in enumerate(blocks):
-        members = members_per[i]
-        t_top = cur_top - _TITLE_GAP
-        t_bot = t_top - track_h[i]
-        axT = fig.add_axes([x0, t_bot / H, xw, track_h[i] / H])
-        tab_top = t_bot - _INTRA_GAP
-        tab_bot = tab_top - table_h[i]
-        axTab = fig.add_axes([x0, tab_bot / H, xw, table_h[i] / H])
-        # hide the axes' background rectangles so savefig's tight crop bounds to the
-        # actual INK, not the full-width axis patch
-        axT.patch.set_visible(False)
-        axTab.patch.set_visible(False)
-        track_axes.append(axT)
-        wrap = per_row if (per_row and len(members) > per_row) else None
-        entries = draw_gene_track(axT, members, show_gaps=True, min_span=min_span,
-                                  per_row=wrap, badge_per_operon=badges,
-                                  tag_fs=tag_fs, gap_fs=gap_fs)
-        # inset the title to left_frac (not the axis edge) so it doesn't anchor the
-        # far-left margin past where the arrow map / table start
-        ttl = axT.set_title(b["title"], fontsize=title_fs, pad=6, loc="left",
-                            fontweight="bold")
-        ttl.set_x(left_frac)
-        tables.append((axTab, entries))
-        cur_top = tab_bot - _INTER_GAP
-
-    # single page-level column layout from EVERY block's entries -> aligned tables
-    all_entries = [e for _, es in tables for e in es]
-    col_layout = breakdown_col_layout(all_entries, table_fs, page_width_in, desc_wrap,
-                                      left=left_frac, right=1.0 - left_frac)
-    for axTab, entries in tables:
-        render_gene_table(axTab, entries, fontsize=table_fs, desc_wrap=desc_wrap,
-                          full_breakdown=True, col_layout=col_layout)
-    for axT in track_axes:
-        pin_track_scale(axT)
-
-    fh = H
-    st = fig.suptitle(suptitle, y=1 - 0.48 / fh, fontweight="bold", fontsize=sup_fs)
-    extras = [st]
-    draw_organism_line(fig, org_label, y=1 - 1.02 / fh, fontsize=org_fs)
-    if provenance is not None:
-        set_provenance(provenance)
-    pv = draw_provenance_line(fig, 1 - 1.46 / fh, fontsize=prov_fs)
-    if pv is not None:
-        extras.append(pv)
-    if has_legend:
-        lg = fig.legend(handles=legend_handles, loc="upper center",
-                        ncol=len(legend_handles), bbox_to_anchor=(0.5, 1 - 1.86 / fh),
-                        fontsize=note_fs, frameon=False, handlelength=1.4)
-        extras.append(lg)
-    fig._report_extra_artists = getattr(fig, "_report_extra_artists", []) + extras
-    if note:
-        draw_method_note(fig, note, fontsize=note_fs)
-    if footer_sources and run_root is not None:
-        draw_sources_footer(fig, run_root, footer_sources, fontsize=foot_fs)
-    savefig(fig, Path(outpath), dpi=dpi)
+    top = 30 + (22 if org_label else 0) + 26
+    body = sum(operon_block_px(len(b["members"])) for b in blocks)
+    H = top + body + 40
+    fig = plt.figure(figsize=(_VW / 96.0, H / 96.0))
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, _VW)
+    ax.set_ylim(H, 0)
+    ax.axis("off")
+    ax.text(_VMX, 30, suptitle, fontsize=22 * 0.75, fontweight="bold", va="baseline", family=_V_SERIF)
+    if org_label:
+        ax.text(_VMX, 52, str(org_label).replace("_", " "), fontsize=14 * 0.75, va="baseline",
+                style="italic", fontweight="normal", family=_V_SERIF)
+    y = top
+    for b in blocks:
+        heading = b.get("heading") or b.get("title") or (b["members"][0].get("operon_id") or "")
+        y += _v_block(ax, y, b["members"], heading, b.get("detail", ""))
+    lx, ly = _VMX, H - 26
+    for i, nm in enumerate(CONF_TIER_ORDER + ["non-coding"]):
+        ax.add_patch(Rectangle((lx, ly), 12, 12, facecolor=VIEWER_TIER_COL[i] if i < 5 else VIEWER_NONCODE,
+                               edgecolor="#000000", linewidth=0.5 * 0.75))
+        ax.text(lx + 16, ly + 10, nm, fontsize=11 * 0.75, va="baseline", fontweight="normal", family=_V_SERIF)
+        lx += 16 + len(nm) * 6.3 + 20
+    ax.text(lx + 4, ly + 10, "red outline = flagged for review", fontsize=11 * 0.75, va="baseline",
+            fontweight="normal", family=_V_SERIF)
+    path = Path(outpath)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=dpi, facecolor="white")
+    plt.close(fig)
+    print(f"[reportfig] wrote {path.name}", file=sys.stderr)
 
 
 def operon_members_informative(members_in_order: str, min_informative: int | None = None):
@@ -1947,6 +2017,7 @@ def operon_to_members(op_row) -> list[dict]:
     nrs = col("needs_reviews")
     ftys = col("feature_types")
     reasons = col("review_reasons")
+    tiers = col("tiers")
     for i in range(len(labels)):
         out.append({
             "start": op_row["starts"][i],
@@ -1967,5 +2038,6 @@ def operon_to_members(op_row) -> list[dict]:
             "c2": c2s[i] if i < len(c2s) else None,
             "c1": c1s[i] if i < len(c1s) else None,
             "c4": c4s[i] if i < len(c4s) else None,
+            "tier": tiers[i] if i < len(tiers) else None,
         })
     return out

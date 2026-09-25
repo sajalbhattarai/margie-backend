@@ -55,12 +55,12 @@ csv.field_size_limit(10 ** 8)
 #
 # Keep this in sync with TIER_COL in gen_genome_viewer.py.
 TIER = [
-    ("highest", "#0b2842"),   # darkest
-    ("high", "#154064"),
-    ("medium", "#256291"),
-    ("fair", "#4184b5"),
-    ("low", "#6ba3c8"),       # lightest
-    ("NOT_APPLICABLE_NON_CODING", "#c8c8c8"),
+    ("highest", "#1F77FF"),   # blue
+    ("high", "#00B84D"),      # green
+    ("medium", "#FFCC00"),    # amber
+    ("fair", "#FF8C00"),      # orange
+    ("low", "#EE2233"),       # red
+    ("NOT_APPLICABLE_NON_CODING", "#bdbdbd"),
 ]
 TCOL = dict(TIER)
 # Review flags are a RESERVED STATUS colour, never a tier step -- an alarm must
@@ -94,10 +94,24 @@ GC_AMP = 0.13                        # GC deviation amplitude
 GC_SCALE = 0.09                      # GC deviation (frac) mapped to full amplitude
 
 
+# Gene callers name their own columns after themselves -- RAST_start from
+# RASTtk, PRODIGAL_start from Prodigal -- so a column asked for by one caller's
+# name is matched by what follows it.
+GENE_CALLERS = ("rast", "rasttk", "prodigal")
+
+
 def col(row, name):
+    want = name.strip().lower()
+    head, _, rest = want.partition("_")
+    alt = rest if head in GENE_CALLERS and rest else ""
     for k in row:
-        if re.sub(r"^Column-[A-Z]+:\s*", "", k or "").strip().lower() == name.lower():
+        bare = re.sub(r"^Column-[A-Z]+:\s*", "", k or "").strip().lower()
+        if bare == want:
             return row[k] or ""
+        if alt:
+            k_head, _, k_rest = bare.partition("_")
+            if k_rest == alt and k_head in GENE_CALLERS:
+                return row[k] or ""
     return ""
 
 

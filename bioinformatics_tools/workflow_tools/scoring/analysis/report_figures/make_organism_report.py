@@ -308,7 +308,10 @@ def fig05(genes: pd.DataFrame, outdir: Path, org_label: str) -> None:
                 "c2": getattr(r, "c2_score_from_operon_probability", None),
                 "c1": getattr(r, "c1_score", None), "c4": getattr(r, "c4_score", None),
                 "preliminary": r.preliminary_confidence_c1_c4,
-                "operon_adjusted": r.final_confidence_operon_context}
+                "operon_adjusted": r.final_confidence_operon_context,
+                "operon_adjusted_hybrid": getattr(r, "final_confidence_operon_context_hybrid", None),
+                "c3_hybrid": getattr(r, "c3_score_operon_context_hybrid", None),
+                "tier": getattr(r, "confidence_tier", "")}
                for r in win.itertuples()]
     badges = {m["operon_id"]: m["operon_id"]
               for m in members if L.is_operon(m.get("operon_id"))}
@@ -317,8 +320,10 @@ def fig05(genes: pd.DataFrame, outdir: Path, org_label: str) -> None:
                      label="gene  (arrow points 5'→3' along its coding strand)")]
     # SHARED renderer -> identical formatting to the atlas (full C1-C4 table, fonts,
     # symmetry); a real contiguous stretch of the genome, operon bands captioned.
+    span = f"{int(win.gene_start.min()):,}–{int(win.gene_end.max()):,} bp"
     L.render_operon_page(outdir / "fig05_operon_neighbourhood.png",
-                         [{"members": members, "title": ""}],
+                         [{"members": members, "heading": span,
+                           "detail": "neighbouring genes, each operon's members side by side"}],
                          org_label=org_label, suptitle="A real stretch of the genome",
                          run_root=_RUN_ROOT, note=L.OPERON_CORRECTION_NOTE,
                          footer_sources=L.organism_source_lines(_RUN_ROOT, org_label, coords=True),
@@ -358,8 +363,8 @@ def _operon_gallery(ops_ranked: pd.DataFrame, outdir: Path, org_label: str,
             where = f"lowered by weak conservation — operon seen in {ofn} genomes"
         else:
             where = f"conserved in {ofn} genomes" if k != 1 else f"in 1 of {pool_n or '?'} genomes"
-        blocks.append({"members": members,
-                       "title": f"{size}-gene operon  |  {r['operon_id']}  |  {where}"})
+        blocks.append({"members": members, "heading": r["operon_id"],
+                       "detail": f"{size}-gene operon  |  {where}"})
         rows.append({"operon_id": r["operon_id"], "size": size,
                      "pangenome_organisms": k,
                      "operon_database_pool_organisms": pool_n,
