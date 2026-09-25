@@ -2,6 +2,7 @@
 Workflow tools generate
 Invoked: $ dane_wf wf: example <params/options/io>
 '''
+import hashlib
 import logging
 import os
 import re
@@ -34,6 +35,29 @@ from bioinformatics_tools.workflow_tools.workflow_registry import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+_SCRIPT_VERSIONS: dict[str, str] = {}
+
+
+def _scripts_versioned(step: str) -> str:
+    """<step>@<fingerprint of its scripts>, the name a step whose work is
+    MARGIE's own code (consolidation, labeling) is cached under.
+
+    output_cache is keyed by the genome and the step's name only, so a fix to
+    labeling (eggNOG's "Psort location ..." texts no longer taken as product
+    names, 2026-09-24) would never reach a genome annotated before: its old
+    labels came back from the cache. With the scripts' fingerprint in the
+    name, changed code is a cache miss and recomputes; the tools' own cached
+    outputs are unaffected, and nothing earlier is deleted."""
+    if step not in _SCRIPT_VERSIONS:
+        folder = Path(__file__).parent / step
+        digest = hashlib.sha256()
+        for f in sorted(folder.glob('*')):
+            if f.is_file() and f.suffix in ('.py', '.sh', '.json', '.tsv'):
+                digest.update(f.name.encode() + b'\0' + f.read_bytes())
+        _SCRIPT_VERSIONS[step] = f'{step}@{digest.hexdigest()[:12]}'
+    return _SCRIPT_VERSIONS[step]
 
 # Must mirror margie_sb.smk's INTERPRO_ANALYSIS_TO_BASENAME.values() exactly --
 # duplicated here because margie_sb.smk isn't an importable Python module.
@@ -1055,7 +1079,7 @@ class WorkflowBase(ProgramBase):
                 fasta_hash = fasta_hashes(genome_files[genome])
                 missing_selected = [
                     t for t, hit in genome_restored.items()
-                    if not hit and smk_config.get(f'run_{t}', True) not in (False, 'false', '0', 'no')
+                    if not hit and smk_config.get(f"run_{t.split('@')[0]}", True) not in (False, 'false', '0', 'no')
                 ]
                 # Scoring is never cached (see _genome_cache_map): the OCC operon
                 # reference grows over time, so a genome must be RE-SCORED on every
@@ -1684,7 +1708,7 @@ class WorkflowBase(ProgramBase):
             # Phase 9 (consolidation): include the wide merged TSV so labeling
             # can re-run from cache if it ever has a cache miss while
             # consolidation does not.
-            cache_map['consolidation'] = [
+            cache_map[_scripts_versioned('consolidation')] = [
                 f'{prefix}consolidation/detected-columns.json',
                 f'{prefix}consolidation/consolidated-merged-all-columns.tsv',
                 f'{prefix}consolidation/consolidated-no-stat.tsv',
@@ -1693,7 +1717,7 @@ class WorkflowBase(ProgramBase):
                 f'{prefix}consolidation/consolidation_db.tkn',
             ]
             # Phase 10 (labeling)
-            cache_map['labeling'] = [
+            cache_map[_scripts_versioned('labeling')] = [
                 f'{prefix}labeling/labeled-genes.tsv',
                 f'{prefix}labeling/labeled-genes-ec-consensus.tsv',
                 f'{prefix}labeling/labeled-genes-operon-info.tsv',
