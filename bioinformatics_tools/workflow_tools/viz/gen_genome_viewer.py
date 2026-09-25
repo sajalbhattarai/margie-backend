@@ -78,10 +78,24 @@ def fmt_pid(v):
     return f"{round(x)}% id"
 
 
+# Gene callers name their own columns after themselves -- RAST_start from
+# RASTtk, PRODIGAL_start from Prodigal -- so a column asked for by one caller's
+# name is matched by what follows it.
+GENE_CALLERS = ("rast", "rasttk", "prodigal")
+
+
 def col(row, name):
+    want = name.strip().lower()
+    head, _, rest = want.partition("_")
+    alt = rest if head in GENE_CALLERS and rest else ""
     for k in row:
-        if re.sub(r"^Column-[A-Z]+:\s*", "", k or "").strip().lower() == name.lower():
+        bare = re.sub(r"^Column-[A-Z]+:\s*", "", k or "").strip().lower()
+        if bare == want:
             return row[k] or ""
+        if alt:
+            k_head, _, k_rest = bare.partition("_")
+            if k_rest == alt and k_head in GENE_CALLERS:
+                return row[k] or ""
     return ""
 
 
@@ -310,11 +324,12 @@ TEMPLATE = r"""<!doctype html>
     /* pure white page, black text, no shading (single theme, by request) */
     --surface:#ffffff; --ink:#000000; --muted:#000000; --line:#cfcfcf; --panel:#ffffff;
     --btn:#ffffff; --btn-ink:#000000; --shadow:none;
-    /* bright confidence-tier palette */
-    --t0:#0b2842; --t1:#154064; --t2:#256291; --t3:#4184b5; --t4:#6ba3c8; --tn:#c8c8c8;
+    /* confidence tiers, the same five colours the app's tables use */
+    --t0:#1F77FF; --t1:#00B84D; --t2:#FFCC00; --t3:#FF8C00; --t4:#EE2233; --tn:#bdbdbd;
     --operon:#1667e0; --nonop:#c79a5c; --flag:#666666;
   }
   *{box-sizing:border-box}
+  [hidden]{display:none !important}
   html,body{margin:0;background:#ffffff;color:#000000;
     /* Serif throughout, per request. Times New Roman first, with a
        platform-serif fallback chain so Linux and older browsers do not
@@ -333,6 +348,19 @@ TEMPLATE = r"""<!doctype html>
   .opts{font-size:12px;color:var(--muted);margin:6px 0 2px;display:flex;gap:14px;align-items:center}
   .opts label{cursor:pointer;user-select:none}
   .plate{background:#ffffff;border:1px solid var(--line);border-radius:14px;padding:6px;box-shadow:var(--shadow)}
+  /* The circle reads better small: it leaves room for the scorecard beside it. */
+  #circPlate{max-width:560px}
+  .viewbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;margin:8px 0 6px}
+  .modebar.small button{font-size:13px;padding:5px 14px}
+  .linctl{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;font-size:12.5px;color:var(--muted)}
+  .linctl select{font-family:inherit;font-size:12.5px;padding:2px 4px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink)}
+  .linpos{font-variant-numeric:tabular-nums}
+  .linplate{max-width:none}
+  .linscroll{position:relative;overflow-x:auto;overflow-y:hidden}
+  .linspacer{height:1px}
+  #lin{position:sticky;left:0;width:100%;height:210px;display:block}
+  .zsel{fill:rgba(31,119,255,.14);stroke:#1F77FF;stroke-width:1.5;stroke-dasharray:4 3}
+  .zbtn.on{background:var(--ink);color:#fff;border-color:var(--ink)}
   svg{width:100%;height:auto;display:block;touch-action:none}
   .gene{cursor:pointer}
   .sel{stroke:#111;stroke-width:2;paint-order:stroke}
@@ -360,8 +388,15 @@ TEMPLATE = r"""<!doctype html>
   .dlbtn{flex:0 0 auto;font-family:inherit;font-size:11.5px;padding:5px 11px;border:1px solid var(--line);
     background:var(--btn);color:var(--btn-ink);border-radius:8px;cursor:pointer;white-space:nowrap;transition:background .12s}
   .dlbtn:hover{background:var(--ink);color:var(--surface);border-color:var(--ink)}
-  .kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:13px;margin:8px 0}
-  .kv b{color:var(--muted);font-weight:normal}
+  /* A boxed table, not free text: every figure sits in its own cell. */
+  .kv{display:grid;grid-template-columns:auto 1fr;font-size:13px;margin:10px 0;
+      border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .kv b,.kv span{padding:5px 10px;border-top:1px solid var(--line)}
+  .kv b:first-child,.kv b:first-child + span{border-top:0}
+  .kv b{color:var(--muted);font-weight:normal;border-right:1px solid var(--line);background:#fafafa}
+  .kv span{font-variant-numeric:tabular-nums}
+  .two{display:inline-grid;grid-auto-flow:column;gap:0 10px}
+  .two i{font-style:normal;color:var(--muted)}
   .bar{height:9px;border-radius:0;background:#ffffff;border:1px solid #cfcfcf;overflow:hidden;margin:2px 0}
   .bar>i{display:block;height:100%}
   .members{margin-top:10px;max-height:260px;overflow:auto;border-top:1px solid var(--line);padding-top:8px}
@@ -410,23 +445,47 @@ TEMPLATE = r"""<!doctype html>
       <label><input type="checkbox" id="showFlags"> show review flags (grey)</label>
       <span id="hint"></span>
     </div>
-    <div class="plate"><div class="zoombar"><button id="zout" class="zbtn" type="button" title="Zoom out" aria-label="Zoom out">−</button><button id="zin" class="zbtn" type="button" title="Zoom in" aria-label="Zoom in">+</button><button id="zreset" class="zreset" type="button" title="Reset zoom (or double-click the map)" disabled>Reset</button></div><svg id="map" viewBox="0 0 780 780" aria-label="circular genome map, scroll to zoom and drag to pan"></svg><div class="zhint">+ / − or scroll to zoom · drag to pan · double-click to reset</div></div>
+    <div class="viewbar">
+      <div class="modebar small">
+        <button id="vCirc" class="on" type="button">Circular</button>
+        <button id="vLin" type="button">Linear</button>
+      </div>
+      <span id="linctl" class="linctl" hidden>
+        <label>replicon <select id="linContig"></select></label>
+        <label>genes shown <select id="linN"><option>10</option><option>20</option><option>40</option></select></label>
+        <span id="linPos" class="linpos"></span>
+      </span>
+    </div>
+    <div class="plate" id="circPlate">
+      <div class="zoombar">
+        <button id="zarea" class="zbtn" type="button" title="Drag a box to zoom into it (or hold Shift and drag)" aria-label="Zoom into an area"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-dasharray="3 2"/></svg></button>
+        <button id="zout" class="zbtn" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+        <button id="zin" class="zbtn" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+        <button id="zreset" class="zreset" type="button" title="Reset zoom (or double-click the map)" disabled>Reset</button>
+      </div>
+      <svg id="map" viewBox="0 0 780 780" aria-label="circular genome map: scroll to zoom, drag to pan, drag a box to zoom into it"></svg>
+      <div class="zhint">+ / − or scroll to zoom | drag to pan | Shift-drag (or the dotted button) to box a region | double-click to reset</div>
+    </div>
+    <div class="plate linplate" id="linPlate" hidden>
+      <div class="linscroll" id="linScroll"><div class="linspacer" id="linSpacer"></div><svg id="lin" aria-label="linear gene map"></svg></div>
+      <div class="zhint">scroll sideways through the replicon | click a gene for its scorecard</div>
+    </div>
     <div class="legend" id="legend"></div>
     <div class="foot">Every value is read verbatim from FINAL_ANNOTATION_WITH_CONFIDENCE.tsv. Click a gene or operon for details.</div>
   </div>
   <div class="right">
-    <div class="panel" id="panel"><div class="empty">Hover to preview, click to pin.<br><br>In <b>Gene mode</b>, each arc is a gene coloured by its confidence tier. In <b>Operon mode</b>, blue arcs are operonic genes and light-brown arcs are non-operonic; selecting an operon shows its member genes and its context scores.</div></div>
+    <div class="panel" id="panel"><div class="empty">Hover to preview, click to pin.<br><br>In <b>Gene mode</b>, each arc is a gene coloured by its confidence tier. In <b>Operon mode</b>, each operon takes its own colour and grey arcs are non-operonic; selecting an operon shows its member genes and its context scores. <b>Linear</b> lays the same genes out along the replicon, ten at a time.</div></div>
   </div>
 </div>
 <div id="tip"></div>
 <script>
 const D = /*__DATA__*/;
 const TIER_NAMES=["highest","high","medium","fair","low"];
-// Ordered tiers -> sequential single-hue ramp, darkest = highest confidence.
-// Validated ordinal (monotone L, gaps >= 0.06, 10 deg hue spread, light end
-// 2.66:1 on white). The old rainbow failed all four ordinal checks and was
-// indistinguishable in grayscale. Keep in sync with TIER in make_circular_genome.py.
-const TIER_COL=["#0b2842","#154064","#256291","#4184b5","#6ba3c8"];
+// Ordered tiers, blue (highest) through green and amber to red (low): the
+// same five colours the app's tables and rings use, so one gene reads the
+// same everywhere. Bright and far apart at a glance, which a single-hue ramp
+// was not on a dense map. Keep in sync with TIER in make_circular_genome.py.
+const TIER_COL=["#1F77FF","#00B84D","#FFCC00","#FF8C00","#EE2233"];
 // FLAG is a RESERVED status colour -- never reused as a tier step, so an
 // alarm can never be confused with a ranking. Operon/non-operon are a separate
 // categorical pair used only in operon mode, where the tier ramp is not shown.
@@ -435,28 +494,15 @@ const TIER_COL=["#0b2842","#154064","#256291","#4184b5","#6ba3c8"];
 // Cycled by a hash of the operon id, so an operon keeps its colour across
 // renders and modes instead of depending on iteration order.
 //
-// This is Okabe-Ito, the canonical colour-vision-deficiency-safe qualitative
-// set. It is the only 6-hue palette tried that passes the STRICT ALL-PAIRS CVD
-// check, not merely adjacent pairs: worst all-pairs dE 7.6 (deutan), 8.5
-// (tritan), and the normal-vision floor passes at 15.6.
-//
-// Why not a brighter, more saturated set: CVD is not a light-sensitivity
-// condition. In protan/deutan vision the L/M cone pigments are missing or
-// shifted, so specific HUES collapse together no matter how bright they are.
-// Raising saturation while keeping lightness similar is the classic failure --
-// the previous bright cycle put orange and olive at dE 1.2 under protanopia,
-// i.e. indistinguishable. Okabe-Ito instead spreads the hues along the
-// blue-yellow axis (preserved in almost all CVD) and separates them in
-// lightness, which is what actually survives.
-//
-// Adding a 7th colour breaks it -- both yellow #F0E442 and black were tried and
-// fail all-pairs. Six is the ceiling for this palette; the cycle repeats past
-// that, which is fine because it delineates neighbouring operons rather than
-// encoding identity (hover names the operon, click opens its card).
-const OPERON_CYCLE=["#0072B2","#E69F00","#009E73","#CC79A7","#56B4E9","#D55E00"];
+// Bright by request, and still spread along the blue-yellow axis that survives
+// colour-vision deficiency, with the hues separated in lightness too. Six is
+// the ceiling; the cycle repeats past that, which is fine because the colour
+// delineates neighbouring operons rather than naming them (hover names the
+// operon, click opens its card).
+const OPERON_CYCLE=["#1F77FF","#FF8C00","#00B84D","#B65CFF","#00C2D1","#EE2233"];
 // Retained for the legend swatch and the operon card tag.
 const OPERON=OPERON_CYCLE[0];
-const NONCODE="#c8c8c8", NONOP="#8a8a8a", FLAG="#b32b1e";
+const NONCODE="#d5d5d5", NONOP="#6b6b6b", FLAG="#b32b1e";
 // Stable per-operon colour: hash the id so a given operon keeps its colour
 // across renders and modes, instead of depending on iteration order.
 function opColor(id){
@@ -538,7 +584,7 @@ D.genes.forEach((g,i)=>{
 });
 // centre label
 const cInfo=el("text",{x:CX,y:CY+2,"font-size":14,fill:"#000000","text-anchor":"middle"});
-cInfo.textContent=(D.totLen/1e6).toFixed(2)+" Mb · "+D.genes.length.toLocaleString()+" genes"; svg.appendChild(cInfo);
+cInfo.textContent=(D.totLen/1e6).toFixed(2)+" Mb  |  "+D.genes.length.toLocaleString()+" genes"; svg.appendChild(cInfo);
 const cInfo2=el("text",{x:CX,y:CY+22,"font-size":12.5,fill:"#000000","text-anchor":"middle"});
 svg.appendChild(cInfo2);
 
@@ -556,6 +602,7 @@ function paint(){
     ? D.nOperons.toLocaleString()+" operons"
     : D.nFlag.toLocaleString()+" flagged for review";
   renderLegend(); applySelection();
+  if(typeof LIN!=="undefined" && LIN.visible()) LIN.render();
 }
 function renderLegend(){
   const L=document.getElementById("legend"); L.innerHTML="";
@@ -563,7 +610,7 @@ function renderLegend(){
     ? OPERON_CYCLE.map((c,i)=>[i===0?"operon (colour cycles)":"",c])
         .concat([["non-operonic",NONOP],["non-coding",NONCODE]])
     : mode==="review"
-    ? TIER_NAMES.map((n,i)=>["flagged · "+n,TIER_COL[i]]).concat([["not flagged","#ececea"]])
+    ? TIER_NAMES.map((n,i)=>["flagged | "+n,TIER_COL[i]]).concat([["not flagged","#ececea"]])
     : TIER_NAMES.map((n,i)=>[n,TIER_COL[i]]).concat([["non-coding",NONCODE]]);
   items.forEach(([n,c])=>{const s=document.createElement("span");
     s.innerHTML=`<i class="sw" style="background:${c}"></i>${n}`; L.appendChild(s);});
@@ -593,19 +640,19 @@ function geneCard(i){
   h+=`<span class="ptag" style="background:${tc}">${tn}</span>`;
   h+=`<div class="kv">`;
   h+=`<b>location</b><span>${cn}:${g.s.toLocaleString()}–${g.e.toLocaleString()} (${strand})</span>`;
-  h+=`<b>operon</b><span>${g.op?`<a class="oplink" data-op-link="${g.op}">${g.op}</a> · P=`+pct(g.pr):"none (singleton)"}</span>`;
+  h+=`<b>operon</b><span>${g.op?`<a class="oplink" data-op-link="${g.op}">${g.op}</a> | P = `+pct(g.pr):"none (singleton)"}</span>`;
   h+=`</div>`;
   h+=`<div class="kv">`;
   h+=`<b>C1 database coverage</b><span>${pct(g.c1)}</span>`;
   h+=`<b>C2 operon membership</b><span>${pct(g.c2)}</span>`;
-  h+=`<b>C3 operon context</b><span>adj ${pct(g.c3)} · hyb ${pct(g.c3h)}</span>`;
-  h+=`<b>C4 EC agreement</b><span>${pct(g.c4)}${g.ecs?" · "+esc(g.ecs):""}</span>`;
+  h+=`<b>C3 operon context</b><span>${pct(g.c3)} (adj) | ${pct(g.c3h)} (hyb)</span>`;
+  h+=`<b>C4 EC agreement</b><span>${pct(g.c4)}${g.ecs?" | "+esc(g.ecs):""}</span>`;
   h+=`</div>`;
   h+=`<div class="kv"><b>preliminary (C1 × C4)</b><span>${pct(g.pre)}</span></div>${bar(g.pre,"#888")}`;
-  h+=`<div class="kv"><b>final confidence</b><span>adj ${pct(g.fin)} · hyb ${pct(g.finh)}</span></div>${bar(g.fin,tc)}`;
-  h+=`<div class="kv"><b>confidence tier</b><span>adj ${tierBadge(g.ti)[0]} · hyb ${tierBadge(g.tih)[0]}</span></div>`;
+  h+=`<div class="kv"><b>final confidence</b><span>${pct(g.fin)} (adj) | ${pct(g.finh)} (hyb)</span></div>${bar(g.fin,tc)}`;
+  h+=`<div class="kv"><b>confidence tier</b><span>${tierBadge(g.ti)[0]} (adj) | ${tierBadge(g.tih)[0]} (hyb)</span></div>`;
   if(g.up)h+=`<div class="uphit"><b>UniProt best hit</b> ${g.up.pid!=null?g.up.pid+"% id":"—"}`
-    +` · ${esc(g.up.en||"")} · ${esc(g.up.desc||"")}${g.up.inf?"":` <span class="uninf">(uninformative — not used)</span>`}</div>`;
+    +` | ${esc(g.up.en||"")} | ${esc(g.up.desc||"")}${g.up.inf?"":` <span class="uninf">(uninformative — not used)</span>`}</div>`;
   if(g.rv)h+=`<div class="flagtag">⚑ flagged for review — ${esc(g.rr||"")}</div>`;
   h+=evidenceTrail(g);
   return h;
@@ -619,7 +666,7 @@ function evidenceTrail(g){
   const infN=ev.filter(r=>r[3]).length;
   let h=`<div class="trail"><h4>evidence trail — every database's call (EC numbers kept)</h4>`
        +`<div class="cnt">${infN} of ${ev.length} databases returned an informative name`
-       +`${g.src?` · chosen: <b>${esc(g.src)}</b>`:""}</div>`;
+       +`${g.src?` | chosen: <b>${esc(g.src)}</b>`:""}</div>`;
   if(g.c4!=null && g.c4<1)
     h+=`<div class="ecflag">⚑ EC conflict — C4 = ${pct(g.c4)}${g.ecs?" ("+esc(g.ecs)+")":""}. `
       +`${esc(g.c4r||"tools disagree on the EC number; compare the [EC:…] tags below.")}</div>`;
@@ -643,7 +690,7 @@ function operonCard(id){
   const flagged=sorted.filter(([,g])=>g.rv).length;
   let h=`<div class="cardhead"><div class="cardhead-l">`
        +`<div class="ptitle">${id}</div>`
-       +`<span class="ptag" style="background:${opColor(id)}">${idx.length} genes · operon</span></div>`
+       +`<span class="ptag" style="background:${opColor(id)}">${idx.length} genes | operon</span></div>`
        +`<button class="dlbtn" data-dl="${id}" title="Download this operon map as an image">⤓ map</button></div>`;
   h+=`<div class="kv">`;                                        // structural facts only (no recomputed scores)
   h+=`<b>span</b><span>${(span/1000).toFixed(1)} kb</span>`;
@@ -651,7 +698,7 @@ function operonCard(id){
   h+=`<b>flagged for review</b><span>${flagged} / ${idx.length}</span>`;
   h+=`</div>`;
   h+=operonArrowMap(sorted);
-  h+=`<div class="cnt">arrows point 5′→3′, coloured by tier · per-gene C1–C4 / final adj·hyb in the downloaded map · click an arrow to open a gene</div>`;
+  h+=`<div class="cnt">arrows point 5′→3′, coloured by tier | per-gene C1–C4 and final (adj) / (hyb) in the downloaded map | click an arrow to open a gene</div>`;
   h+=`<div class="members">`;
   sorted.forEach(([i,g],k)=>{
     const c=g.ti<0?NONCODE:TIER_COL[g.ti];
@@ -675,7 +722,7 @@ function operonArrowMap(sorted){
       ? `${x0.toFixed(1)},${yt} ${(x1-hd).toFixed(1)},${yt} ${x1.toFixed(1)},${ym} ${(x1-hd).toFixed(1)},${yb} ${x0.toFixed(1)},${yb}`
       : `${x1.toFixed(1)},${yt} ${(x0+hd).toFixed(1)},${yt} ${x0.toFixed(1)},${ym} ${(x0+hd).toFixed(1)},${yb} ${x1.toFixed(1)},${yb}`;
     s+=`<polygon points="${pts}" fill="${c}" stroke="rgba(0,0,0,.2)" stroke-width="0.6" data-goto="${i}">`
-      +`<title>${esc((k+1)+". "+(g.nm||"(unnamed)"))} · ${g.st>0?"+":"−"} · final ${pct(g.fin)}${g.rv?" · ⚑":""}</title></polygon>`;
+      +`<title>${esc((k+1)+". "+(g.nm||"(unnamed)"))} | ${g.st>0?"+":"−"} | final ${pct(g.fin)}${g.rv?" | ⚑":""}</title></polygon>`;
     s+=`<text x="${((x0+x1)/2).toFixed(1)}" y="${y-4}" font-size="9" fill="#8a8a86" text-anchor="middle">${k+1}</text>`;
   });
   return s+`</svg>`;
@@ -697,10 +744,10 @@ geneLayer.addEventListener("mousemove",e=>{
   const t=e.target.closest(".gene"); if(!t){tipHide();return;}
   const i=+t.dataset.i, g=D.genes[i];
   if(mode==="operon"&&g.op){
-    tipShow(`<b>${g.op}</b> · ${operons[g.op].length} genes<br>${esc((g.nm||"").slice(0,60))}`,e.clientX,e.clientY);
+    tipShow(`<b>${g.op}</b> | ${operons[g.op].length} genes<br>${esc((g.nm||"").slice(0,60))}`,e.clientX,e.clientY);
   } else {
     const[tn]=tierBadge(g.ti);
-    tipShow(`${esc((g.nm||"(unnamed)").slice(0,64))}<br><b>${tn}</b> · final ${pct(g.fin)}${g.rv?" · ⚑":""}`,e.clientX,e.clientY);
+    tipShow(`${esc((g.nm||"(unnamed)").slice(0,64))}<br><b>${tn}</b> | final ${pct(g.fin)}${g.rv?" | ⚑":""}`,e.clientX,e.clientY);
   }
 });
 geneLayer.addEventListener("mouseleave",tipHide);
@@ -741,7 +788,7 @@ function operonFigureSVG(id){
   s+=`<rect width="${W}" height="${H}" fill="#ffffff"/>`;
   s+=T(MX,30,id,20,700);
   s+=T(MX,52,D.organism,13);                               // genome identifier / filename, verbatim
-  s+=T(MX,72,`${n} genes  ·  ${((hi-lo)/1000).toFixed(1)} kb region  ·  arrow length ∝ gene length  ·  intergenic distances shown below arrows`,12.5);
+  s+=T(MX,72,`${n} genes  |  ${((hi-lo)/1000).toFixed(1)} kb region  |  arrow length ∝ gene length  |  intergenic distances shown below arrows`,12.5);
   s+=`<line x1="${MX}" y1="${arrY+arrH/2}" x2="${W-MX}" y2="${arrY+arrH/2}" stroke="#cccccc" stroke-width="1.2"/>`;
   const ax=[]; let prevEnd=null;
   sorted.forEach((g,k)=>{
@@ -764,7 +811,7 @@ function operonFigureSVG(id){
   });
   for(let k=0;k<n-1;k++)
     s+=T((ax[k][1]+ax[k+1][0])/2,arrY+arrH+15,igd(sorted[k+1].s-sorted[k].e-1),10,null,'middle');
-  // table: # · swatch · gene product · location · C1 · C2 · C3 adj/hyb · C4 · final adj/hyb · tier · review
+  // table: # | swatch | gene product | location | C1 | C2 | C3 (adj)/(hyb) | C4 | final (adj)/(hyb) | tier | review
   const CX={loc:432, c1:710,c2:770,c3:903,c4:965,fin:1090,tier:1180,rev:W-MX};
   s+=`<line x1="${MX}" y1="${headY+7}" x2="${W-MX}" y2="${headY+7}" stroke="#000000" stroke-width="0.8"/>`;
   s+=T(MX,headY,'#',11.5,700);
@@ -806,7 +853,7 @@ function operonFigureSVG(id){
     s+=`<rect x="${lx}" y="${legY}" width="12" height="12" fill="${i<5?TIER_COL[i]:NONCODE}" stroke="#000000" stroke-width="0.5"/>`;
     s+=T(lx+16,legY+10,nm,11); lx+=16+nm.length*6.3+20;
   });
-  s+=T(lx+4,legY+10,'· red outline = flagged for review',11);
+  s+=T(lx+4,legY+10,'red outline = flagged for review',11);
   return s+`</svg>`;
 }
 function dlSVG(svg,id){
@@ -829,6 +876,89 @@ function downloadOperon(id){
   img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);
 }
 
+// ---- linear view: the same arrows as an operon map, along the replicon ----
+// The whole replicon is scrollable, but only the genes in view are drawn, so
+// 4,000 genes cost no more than 12 polygons at a time.
+const LIN=(function(){
+  const plateC=document.getElementById("circPlate"), plateL=document.getElementById("linPlate");
+  const scroll=document.getElementById("linScroll"), spacer=document.getElementById("linSpacer");
+  const svgL=document.getElementById("lin"), ctl=document.getElementById("linctl");
+  const selC=document.getElementById("linContig"), selN=document.getElementById("linN"), posEl=document.getElementById("linPos");
+  const bC=document.getElementById("vCirc"), bL=document.getElementById("vLin");
+  if(!plateL||!scroll||!svgL) return {render(){},visible(){return false;}};
+
+  const byContig=D.contigs.map(()=>[]);
+  D.genes.forEach((g,i)=>byContig[g.ci].push(i));
+  byContig.forEach(a=>a.sort((x,y)=>D.genes[x].s-D.genes[y].s));
+  D.contigs.forEach((c,i)=>{ const o=document.createElement("option");
+    o.value=i; o.textContent=c.name+"  |  "+(c.len/1e6).toFixed(2)+" Mb ("+byContig[i].length.toLocaleString()+" genes)";
+    selC.appendChild(o); });
+  if(D.contigs.length<2) selC.parentElement.hidden=true;
+
+  let ci=0, per=10, on=false, frame=0;
+  const H=210, TOP=58, AH=52;                 // svg height, arrow top, arrow height
+  const slot=()=>Math.max(70, scroll.clientWidth/per);
+
+  function layout(){ spacer.style.width=(byContig[ci].length*slot())+"px"; render(); }
+
+  function render(){
+    if(!on) return;
+    const list=byContig[ci], sw=slot(), W=scroll.clientWidth||600;
+    svgL.setAttribute("viewBox",`0 0 ${W} ${H}`);
+    const left=scroll.scrollLeft;
+    const first=Math.max(0,Math.floor(left/sw)-1), last=Math.min(list.length-1,first+per+2);
+    let out=`<line x1="0" y1="${TOP+AH/2}" x2="${W}" y2="${TOP+AH/2}" stroke="#d7d7d2" stroke-width="2"/>`;
+    for(let k=first;k<=last;k++){
+      const i=list[k], g=D.genes[i];
+      const x=k*sw-left, w=sw*0.82, x0=x+sw*0.09, x1=x0+w;
+      const hd=Math.min(16,w*0.3), yt=TOP, yb=TOP+AH, ym=TOP+AH/2;
+      const pts=g.st>0
+        ? `${x0},${yt} ${x1-hd},${yt} ${x1},${ym} ${x1-hd},${yb} ${x0},${yb}`
+        : `${x1},${yt} ${x0+hd},${yt} ${x0},${ym} ${x0+hd},${yb} ${x1},${yb}`;
+      const c=geneFill(g), nm=(g.nm||"(unnamed)");
+      out+=`<polygon class="gene" data-i="${i}" points="${pts}" fill="${c}" stroke="rgba(0,0,0,.35)" stroke-width="0.8"></polygon>`
+        +`<text x="${x+sw/2}" y="${TOP-26}" font-size="11" fill="#000" text-anchor="middle">${k+1}</text>`
+        +`<text x="${x+sw/2}" y="${TOP-10}" font-size="11.5" fill="#000" text-anchor="middle">${esc(nm.length>Math.floor(sw/7)?nm.slice(0,Math.max(6,Math.floor(sw/7)-1))+"…":nm)}</text>`
+        +`<text x="${x+sw/2}" y="${yb+16}" font-size="10.5" fill="#444" text-anchor="middle">${(g.s/1000).toFixed(1)}–${(g.e/1000).toFixed(1)} kb</text>`
+        +`<text x="${x+sw/2}" y="${yb+31}" font-size="10.5" fill="#444" text-anchor="middle">${g.st>0?"+":"−"} | ${pct(g.fin)}${g.rv?" | ⚑":""}</text>`;
+    }
+    svgL.innerHTML=out;
+    const lo=list[Math.min(first+1,list.length-1)], hi=list[Math.min(last,list.length-1)];
+    posEl.textContent=`genes ${Math.min(first+2,list.length).toLocaleString()}–${(last+1).toLocaleString()} of ${list.length.toLocaleString()}`
+      +`  |  ${(D.genes[lo].s/1e6).toFixed(3)}–${(D.genes[hi].e/1e6).toFixed(3)} Mb`;
+  }
+
+  scroll.addEventListener("scroll",()=>{ if(frame) return; frame=requestAnimationFrame(()=>{frame=0;render();}); });
+  addEventListener("resize",()=>{ if(on) layout(); });
+  selC.addEventListener("change",()=>{ ci=+selC.value; scroll.scrollLeft=0; layout(); });
+  selN.addEventListener("change",()=>{ per=+selN.value||10; layout(); });
+  svgL.addEventListener("click",e=>{ const t=e.target.closest(".gene"); if(!t) return;
+    const i=+t.dataset.i, g=D.genes[i];
+    if(mode==="operon"&&g.op) showOperon(g.op); else showGene(i); });
+  svgL.addEventListener("mousemove",e=>{ const t=e.target.closest(".gene"); if(!t){tipHide();return;}
+    const g=D.genes[+t.dataset.i], [tn]=tierBadge(g.ti);
+    tipShow(`${esc((g.nm||"(unnamed)").slice(0,64))}<br><b>${tn}</b> | final ${pct(g.fin)}${g.op?" | "+esc(g.op):""}`,e.clientX,e.clientY); });
+  svgL.addEventListener("mouseleave",tipHide);
+
+  function show(linear){
+    on=linear;
+    plateC.hidden=linear; plateL.hidden=!linear; ctl.hidden=!linear;
+    bC.classList.toggle("on",!linear); bL.classList.toggle("on",linear);
+    if(linear) layout();
+  }
+  bC.addEventListener("click",()=>show(false));
+  bL.addEventListener("click",()=>show(true));
+  /** Bring gene *i* into view, switching replicon if it sits on another. */
+  function goto_(i){
+    const g=D.genes[i]; if(!on) return;
+    if(g.ci!==ci){ ci=g.ci; selC.value=String(ci); layout(); }
+    const k=byContig[ci].indexOf(i); if(k<0) return;
+    scroll.scrollLeft=Math.max(0,(k-Math.floor(per/2))*slot());
+    render();
+  }
+  return {render, visible:()=>on, goto:goto_};
+})();
+
 // ---- mode toggle ----
 function setMode(m){
   mode=m;
@@ -839,13 +969,13 @@ function setMode(m){
     ? "arcs coloured by confidence tier"
     : m==="review"
     ? "only review-flagged genes are coloured (by tier); the rest are greyed"
-    : "blue = operonic · brown = non-operonic · click an operon";
+    : "each operon takes its own colour | grey = non-operonic | click an operon";
   selKind=null;selVal=null;
   panel.innerHTML=`<div class="empty">${m==="gene"
     ? "Click any gene arc for its full confidence scorecard (C1–C4, preliminary, final, review status)."
     : m==="review"
     ? "Only the "+D.nFlag.toLocaleString()+" genes flagged for review are shown in colour. Click one for its scorecard — if it sits in an operon, use the operon link to jump to that operon."
-    : "Click a blue operon to see its member genes and how genome context changed their confidence."}</div>`;
+    : "Click an operon to see its member genes and how genome context changed their confidence."}</div>`;
   paint();
 }
 document.getElementById("mGene").onclick=()=>setMode("gene");
@@ -865,7 +995,9 @@ document.getElementById("showFlags").onchange=paint;
   if(!svg) return;
   const BASE={x:0,y:0,w:780,h:780};
   let vb={...BASE};
-  const MIN_W=780/40, MAX_W=780*3;    // 40x in, and out to a third of the default size
+  // 40x in, and out to a third of the map's size, so the whole circle can be
+  // made smaller than the plate rather than only filling it.
+  const MIN_W=780/40, MAX_W=780*3;
 
   function apply(){ svg.setAttribute("viewBox",`${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
     const btn=document.getElementById("zreset");
@@ -887,6 +1019,38 @@ document.getElementById("showFlags").onchange=paint;
     clamp(); apply();
   },{passive:false});
 
+  // Boxing a region: ⬚ makes a plain drag draw the box, and Shift always does.
+  const areaBtn=document.getElementById("zarea");
+  let areaMode=false, band=null, rect=null;
+  if(areaBtn) areaBtn.addEventListener("click",()=>{
+    areaMode=!areaMode; areaBtn.classList.toggle("on",areaMode);
+    svg.style.cursor=areaMode?"crosshair":"grab";
+  });
+  const NSU="http://www.w3.org/2000/svg";
+  function bandStart(p){
+    band={x0:p.x,y0:p.y,x1:p.x,y1:p.y};
+    rect=document.createElementNS(NSU,"rect"); rect.setAttribute("class","zsel");
+    svg.appendChild(rect); bandDraw();
+  }
+  function bandDraw(){
+    if(!band||!rect) return;
+    rect.setAttribute("x",Math.min(band.x0,band.x1)); rect.setAttribute("y",Math.min(band.y0,band.y1));
+    rect.setAttribute("width",Math.abs(band.x1-band.x0)); rect.setAttribute("height",Math.abs(band.y1-band.y0));
+  }
+  function bandEnd(){
+    if(!band) return false;
+    const w=Math.abs(band.x1-band.x0), h=Math.abs(band.y1-band.y0);
+    const x=Math.min(band.x0,band.x1), y=Math.min(band.y0,band.y1);
+    if(rect) rect.remove();
+    band=null; rect=null;
+    if(w<6||h<6) return false;                       // a stray click, not a box
+    // Fit the box, keeping the map square: the longer side decides.
+    const side=Math.max(Math.min(Math.max(w,h),MAX_W),MIN_W);
+    vb={x:x+w/2-side/2, y:y+h/2-side/2, w:side, h:side};
+    clamp(); apply();
+    return true;
+  }
+
   let drag=null;
   // Capture is deferred until the pointer has actually MOVED. setPointerCapture
   // retargets every subsequent pointer event -- including the click -- to the
@@ -896,10 +1060,21 @@ document.getElementById("showFlags").onchange=paint;
   const DRAG_PX = 4;
   svg.addEventListener("pointerdown",(e)=>{
     if(e.button!==0) return;
-    drag={x:e.clientX,y:e.clientY,vx:vb.x,vy:vb.y,moved:false,id:e.pointerId,cap:false};
+    drag={x:e.clientX,y:e.clientY,vx:vb.x,vy:vb.y,moved:false,id:e.pointerId,cap:false,
+          box:(areaMode||e.shiftKey)};
   });
   svg.addEventListener("pointermove",(e)=>{
     if(!drag || e.pointerId!==drag.id) return;
+    if(drag.box){
+      if(!drag.moved){
+        if(Math.abs(e.clientX-drag.x)+Math.abs(e.clientY-drag.y) <= DRAG_PX) return;
+        drag.moved=true;
+        try{ svg.setPointerCapture(drag.id); drag.cap=true; }catch(_){}
+        bandStart(toSvg({clientX:drag.x,clientY:drag.y}));
+      }
+      const p=toSvg(e); band.x1=p.x; band.y1=p.y; bandDraw();
+      return;
+    }
     if(!drag.moved){
       if(Math.abs(e.clientX-drag.x)+Math.abs(e.clientY-drag.y) <= DRAG_PX) return;
       drag.moved=true;
@@ -914,9 +1089,10 @@ document.getElementById("showFlags").onchange=paint;
   });
   function endDrag(e){
     if(!drag) return;
-    const wasDrag=drag.moved, cap=drag.cap, id=drag.id;
+    const wasDrag=drag.moved, cap=drag.cap, id=drag.id, wasBox=drag.box;
     drag=null;
-    svg.style.cursor="grab";
+    if(wasBox) bandEnd();
+    svg.style.cursor=areaMode?"crosshair":"grab";
     if(cap){ try{ svg.releasePointerCapture(id); }catch(_){} }
     // Suppress only the click that closes a real drag, so panning across the
     // map does not also select a gene. A click that never moved is untouched.
@@ -956,10 +1132,10 @@ document.getElementById("showFlags").onchange=paint;
 
 document.getElementById("org").textContent=D.short;   // genome identifier / filename, verbatim
 document.getElementById("sub").textContent=
-  "confidence genome viewer  ·  "+(D.totLen/1e6).toFixed(2)+" Mb  ·  "
-  +D.genes.length.toLocaleString()+" genes  ·  "+D.contigs.length.toLocaleString()
+  "confidence genome viewer  |  "+(D.totLen/1e6).toFixed(2)+" Mb  |  "
+  +D.genes.length.toLocaleString()+" genes  |  "+D.contigs.length.toLocaleString()
   +(DRAFT?" contigs (draft assembly)":" replicon"+(D.contigs.length>1?"s":""))
-  +"  ·  "+D.nOperons.toLocaleString()+" operons  ·  "+D.nFlag.toLocaleString()+" flagged";
+  +"  |  "+D.nOperons.toLocaleString()+" operons  |  "+D.nFlag.toLocaleString()+" flagged";
 setMode("gene");
 </script>
 </body>
