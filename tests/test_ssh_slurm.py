@@ -25,10 +25,10 @@ class TestFindActiveJobsInWorkdir:
 
     def test_matches_running_job(self):
         mock_connection, _ = _mock_connection_for_exec(
-            b"39600517|RUNNING|/scratch/negishi/u/margie/output/2026-06-21-1118|1:02:03\n"
+            b"39600517|RUNNING|/scratch/cluster/u/margie/output/2026-06-21-1118|1:02:03\n"
         )
         result = ssh_slurm.find_active_jobs_in_workdir(
-            "/scratch/negishi/u/margie/output/2026-06-21-1118", "u", connection=mock_connection,
+            "/scratch/cluster/u/margie/output/2026-06-21-1118", "u", connection=mock_connection,
         )
         assert result == [{"job_id": "39600517", "state": "RUNNING", "time": "1:02:03"}]
 

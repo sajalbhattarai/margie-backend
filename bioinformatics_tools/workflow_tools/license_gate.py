@@ -191,7 +191,7 @@ def _interactive_accept(current_version: str) -> dict:
         "email": email,
         "os_user": os_user,
         "hostname": socket.gethostname(),
-        "operator": os.getenv("MARGIE_OPERATOR", "lindems"),
+        "operator": os.getenv("MARGIE_OPERATOR", ""),
         "accepted_at_utc": accepted_at,
         "terms_version": terms["version"],
         "terms_sha256": terms["sha256"],

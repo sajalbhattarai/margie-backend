@@ -172,12 +172,12 @@ class TestOwnershipFiltering:
     def test_legacy_ownerless_rows_can_fallback_to_cluster_path(self, tmp_path):
         db_path = str(tmp_path / "legacy_ownerless.db")
         job_history.record_job_created(
-            db_path, "legacy-a", "margie_sb", "/scratch/negishi/alice/genomes/a.fasta",
-            "/scratch/negishi/alice/margie-output/2026-08-04-1200",
+            db_path, "legacy-a", "margie_sb", "/scratch/cluster/alice/genomes/a.fasta",
+            "/scratch/cluster/alice/margie-output/2026-08-04-1200",
         )
         job_history.record_job_created(
-            db_path, "legacy-b", "margie_sb", "/scratch/negishi/bob/genomes/b.fasta",
-            "/scratch/negishi/bob/margie-output/2026-08-04-1200",
+            db_path, "legacy-b", "margie_sb", "/scratch/cluster/bob/genomes/b.fasta",
+            "/scratch/cluster/bob/margie-output/2026-08-04-1200",
         )
 
         rows = job_history.list_jobs(

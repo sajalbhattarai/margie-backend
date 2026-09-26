@@ -8,6 +8,7 @@ Copies run as a SLURM job (or detached on the login node) driven by a plan file;
 from __future__ import annotations
 
 import json
+import os
 import logging
 import posixpath
 import re
@@ -18,9 +19,10 @@ from bioinformatics_tools.utilities import ssh_sftp
 
 LOGGER = logging.getLogger(__name__)
 
-DEPOT = '/depot/lindems/data/margie'
+# Shared storage for the group (MARGIE_SHARED_ROOT on the server); empty: none.
+DEPOT = os.environ.get('MARGIE_SHARED_ROOT', '').rstrip('/')
 # Base copies, one folder per database; each user's backups go beside them.
-GENERATED = f'{DEPOT}/databases/margie-generated-databases'
+GENERATED = f'{DEPOT}/databases/margie-generated-databases' if DEPOT else ''
 # Folder under the user's scratch that holds every store and run output folder.
 ROOT_NAME = 'margie-2026'
 # Bookkeeping folder inside it: the store manifest and the copy under way.
@@ -35,7 +37,7 @@ STORES: list[dict] = [
         'label': 'Job database',
         'note': 'Every run’s results and the job history, in SQLite.',
         'kind': 'file',
-        'base': f'{GENERATED}/sqlite/margie-thesis-22-prokaryotes-base.db',
+        'base': f'{GENERATED}/sqlite/margie-thesis-22-prokaryotes-base.db' if GENERATED else '',
         'depot_sub': 'sqlite',
         'sub': 'sqlite',
         'name': 'margie-thesis-22-prokaryotes-base',
@@ -48,7 +50,7 @@ STORES: list[dict] = [
         'label': 'Operon reference',
         'note': 'The cross-genome operon (OCC) reference scoring reads and adds each genome to.',
         'kind': 'file',
-        'base': f'{GENERATED}/operon-database/occ_reference.pkl',
+        'base': f'{GENERATED}/operon-database/occ_reference.pkl' if GENERATED else '',
         'depot_sub': 'operon-database',
         'sub': 'operon-database',
         'name': 'occ_reference',
@@ -62,7 +64,7 @@ STORES: list[dict] = [
         'label': 'Fingerprint databases',
         'note': 'The gene fingerprint database and the four operon fingerprint databases beside it.',
         'kind': 'dir',
-        'base': f'{GENERATED}/fingerprint-database',
+        'base': f'{GENERATED}/fingerprint-database' if GENERATED else '',
         # Only the database files, not the backups and locks beside them.
         'base_files': [
             'fingerprint-database.tsv',
@@ -90,7 +92,7 @@ STORES: list[dict] = [
         'label': 'Genome pool',
         'note': 'Genomes ANI and AAI compare against; every annotated genome joins it.',
         'kind': 'dir',
-        'base': f'{GENERATED}/genome-pool',
+        'base': f'{GENERATED}/genome-pool' if GENERATED else '',
         # Only the genome folders, not the backups beside them.
         'base_files': ['fna', 'faa'],
         'depot_sub': 'genome-pool',
@@ -163,7 +165,7 @@ def _cfg_set(cfg: dict, dotted: str, value) -> None:
 
 def scratch_root(conn, cfg: dict) -> str:
     """Returns margie_sb.stores_root if set, else /scratch/<cluster>/<user>/margie-2026.
-    The cluster short name comes from the login node's domain (login07.negishi... -> negishi).
+    The cluster short name comes from the login node's domain (login01.mycluster.example.edu -> mycluster).
     """
     chosen = _cfg_get(cfg, 'margie_sb.stores_root')
     if isinstance(chosen, str) and chosen.strip():
@@ -617,6 +619,9 @@ def start_setup(conn, cfg: dict, user: str) -> dict:
             label = f"{s['label']} (from your backup v{backups[-1]})"
         else:
             src = s['base']
+            if not src:
+                raise StoreError('No base databases to copy from: set MARGIE_SHARED_ROOT on the server, '
+                                 'or restore from a backup of your own.', 409)
             version = 1
             label = s['label']
         dst = working_path(s, root, user, version)
@@ -704,6 +709,8 @@ def start_backup(conn, cfg: dict, user: str, store_id: str) -> dict:
     st = status(conn, cfg, user)
     if _busy(st['op']):
         raise StoreError('A copy is already under way.', 409)
+    if not backup_root(cfg):
+        raise StoreError('No backup folder: set margie_sb.backup_root in Settings.', 409)
     check = backup_check(conn, cfg, user, store_id)
     if not check['fits']:
         gb = lambda n: f'{n / 1024 ** 3:.1f} GB'

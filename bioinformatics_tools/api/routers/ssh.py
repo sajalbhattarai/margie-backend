@@ -1108,7 +1108,7 @@ def _check_genome_path_exists(genome_path: str, workflow: str, conn) -> None:
         raise HTTPException(
             status_code=400,
             detail=f"Path not found on the cluster: '{genome_path}'. "
-                   "Make sure the path is a Negishi path, not a path on your local machine.",
+                   "Make sure the path is on the cluster, not on your local machine.",
         )
     except IsADirectoryError:
         raise HTTPException(

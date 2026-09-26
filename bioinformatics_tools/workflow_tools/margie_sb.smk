@@ -30,7 +30,9 @@ SIGNALP4_SCRIPT = os.path.join(WORKFLOW_DIR, "process_signalp4.py")
 
 # Store root when the config names none: the user's scratch, never the depot bases.
 STORE_ROOT = rc('margie_sb.stores_root', '', config=config) or default_store_root()
-BASES = '/depot/lindems/data/margie/databases/margie-generated-databases'
+# The group's base databases (MARGIE_SHARED_ROOT on the cluster); without one, the user's own stores.
+_SHARED = os.environ.get('MARGIE_SHARED_ROOT', '').rstrip('/')
+BASES = f'{_SHARED}/databases/margie-generated-databases' if _SHARED else STORE_ROOT
 
 
 def _resolve_cfg_path(preferred_key: str, legacy_key: str, default: str) -> str:
@@ -83,11 +85,11 @@ def runtime_min(key: str, default: int, config=None) -> int:
     return max(MIN_SLURM_RUNTIME_MINUTES, minutes)
 
 # Account-wide mutex directory serializing run_rasttk's BV-BRC submissions.
-# It lives on /depot: a per-run path can inherit a stale lock from a staged
-# older run, and $HOME is not fully bind-mounted into the rasttk container.
+# It lives in the store root, not a per-run path (which can inherit a stale lock from a
+# staged older run) nor $HOME (not fully bind-mounted into the rasttk container).
 RASTTK_BVBRC_LOCK = _resolve_shared_dir(
     'rasttk.bvbrc_lock_dir', 'rasttk_bvbrc_lock_dir',
-    '/depot/lindems/data/margie/rasttk_bvbrc.lock',
+    f'{STORE_ROOT}/rasttk_bvbrc.lock',
 )
 os.makedirs(os.path.dirname(RASTTK_BVBRC_LOCK), exist_ok=True)
 

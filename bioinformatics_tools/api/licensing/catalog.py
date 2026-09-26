@@ -19,7 +19,7 @@ _HERE = Path(__file__).resolve().parent
 _TERMS_PATH = _HERE / "terms.md"
 _CATALOG_PATH = _HERE / "licensing_catalog.json"
 
-_DEFAULT_RECORDS_DIR = "/depot/lindems/data/margie/licensing-records"
+_DEFAULT_RECORDS_DIR = ""
 _VERSION_RE = re.compile(r"terms_version:\s*([0-9A-Za-z._-]+)")
 
 # Acknowledgments the user must check; ids are stored in each record, text mirrors terms.md.
@@ -140,11 +140,12 @@ def save_local_record(username: str, record: dict, terms_text: str,
 
 
 def _records_dir() -> Path:
-    return Path(os.getenv("LICENSE_RECORDS_DIR", _DEFAULT_RECORDS_DIR))
+    shared = os.getenv("LICENSE_RECORDS_DIR", _DEFAULT_RECORDS_DIR)
+    return Path(shared) if shared else _local_records_dir()
 
 
 def _operator() -> str:
-    return os.getenv("MARGIE_OPERATOR", "lindems")
+    return os.getenv("MARGIE_OPERATOR", "")
 
 
 def load_terms() -> dict:

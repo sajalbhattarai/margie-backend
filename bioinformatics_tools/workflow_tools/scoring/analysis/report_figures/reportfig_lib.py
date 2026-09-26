@@ -7,6 +7,7 @@ gene-track and operon-page drawing used by every report figure (PNG plus TSV).
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 import textwrap
@@ -645,13 +646,8 @@ def load_operon_recurrence(depot_db: Path, restrict_to=None) -> dict[str, dict]:
 
 
 # Default depot locations of the operon recurrence DB and the OCC reference.
-DEFAULT_OPERON_DB = Path(
-    "/depot/lindems/data/margie/databases/margie-generated-databases/fingerprint-database/"
-    "operon-fingerprint-database-label-ordered.tsv"
-)
-DEFAULT_OCC_REFERENCE = Path(
-    "/depot/lindems/data/margie/databases/margie-generated-databases/operon-database/occ_reference.pkl"
-)
+DEFAULT_OPERON_DB = Path(os.environ.get("MARGIE_OPERON_FINGERPRINT_DB", "operon-fingerprint-database-label-ordered.tsv"))
+DEFAULT_OCC_REFERENCE = Path(os.environ.get("MARGIE_OCC_REFERENCE", "occ_reference.pkl"))
 
 
 def load_occ_organisms(occ_reference=DEFAULT_OCC_REFERENCE):

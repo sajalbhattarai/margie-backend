@@ -54,7 +54,7 @@ class TestSlurmSubmitRegex:
         line = (
             "[2026-06-23 04:53:32] INFO bioinformatics_tools.workflow_tools.workflow: "
             "[snakemake] Job f2bd3300-d2be-5a07-91a9-b299cb448c4f has been submitted "
-            "with SLURM jobid 39684417 (log: /scratch/negishi/bhattar3/margie/output/"
+            "with SLURM jobid 39684417 (log: /scratch/cluster/user/margie/output/"
             "2026-06-23-0453/.snakemake/slurm_logs/"
             "group_rasttk_load_rasttk_to_db_run_rasttk/39684417.log)."
         )

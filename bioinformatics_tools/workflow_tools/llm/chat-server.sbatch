@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=margie-chat-llm
-#SBATCH --account=lindems
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
@@ -10,6 +9,7 @@
 #SBATCH --time=08:00:00
 #SBATCH --output=%x-%j.log
 #
+# The account is your default SLURM account, or SBATCH_ACCOUNT when set.
 # ---------------------------------------------------------------------------
 # Long-lived inference endpoint for "Chat about the genome".
 #
@@ -33,14 +33,14 @@
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
-BACKEND="${MARGIE_BACKEND:-/scratch/negishi/bhattar3/margie-backend/bioinformatics-tools}"
-SIF="${MARGIE_LLM_SIF:-/scratch/negishi/bhattar3/margie/sif/llm.sif}"
+BACKEND="${MARGIE_BACKEND:-$HOME/bioinformatics-tools}"
+SIF="${MARGIE_LLM_SIF:-$HOME/margie/sif/llm.sif}"
 # The BASE model, deliberately -- not fused-model. Chat is a separate feature
 # from phase15: phase15 uses the LoRA-fused model because it was fine-tuned to
 # emit scores, and that is exactly the wrong bias here. This feature has to say
 # "the evidence does not answer that" rather than produce a confident number,
 # and refusing was never a rewarded behaviour for the fuse.
-MODEL="${MARGIE_LLM_MODEL:-/scratch/negishi/bhattar3/margie/db/llm/base}"
+MODEL="${MARGIE_LLM_MODEL:-$HOME/margie/db/llm/base}"
 # Must be on a shared filesystem: this job runs on a GPU node, the API runs on
 # a login node. /tmp is node-local and would be invisible to the reader.
 ADVERTISE="${MARGIE_CHAT_ADVERTISE:-$HOME/.local/share/bsp/chat-endpoint.json}"

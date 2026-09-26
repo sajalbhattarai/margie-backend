@@ -17,9 +17,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # sif_dir()/db_path()/do_margie_sb(). Input/output paths stay user-provided.
 WORKFLOW_PATH_DEFAULTS: dict[str, dict[str, str]] = {
     'margie_sb': {
-        'sif_path': '/depot/lindems/data/margie/sif',
+        'sif_path': '',
         # The tools' reference databases (read only, shared by everyone).
-        'db_root': '/depot/lindems/data/margie/databases/reference-database-for-annotation/db',
+        'db_root': '',
         'input_path': '',
         'output_path': '',
     },
@@ -302,7 +302,7 @@ def db_path(tool: str, config=None, default_root: str | None = None,
         return config_path(explicit)
 
     if default_root is None:
-        default_root = WORKFLOW_PATH_DEFAULTS.get(workflow_id, {}).get('db_root', '/depot/lindems/data/Databases')
+        default_root = WORKFLOW_PATH_DEFAULTS.get(workflow_id, {}).get('db_root', '')
 
     db_root_key = f'{workflow_id}.db_root' if workflow_id else 'db_root'
     db_root = rc(db_root_key, default_root, config=config)

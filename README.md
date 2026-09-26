@@ -62,7 +62,7 @@ main_database: path-to-sqlite-database.db
 `main_database` is the SQLite database file used to store run metadata and results.
 It is different from the `output_dir` folder used for generated run files, and different from fingerprint-related databases.
 
-Databases default to `/depot/lindems/...`. To use your own, set those paths in the config — empty folders fill up as you run.
+Databases have no default location: set `db_root` (and any per-tool `db.<tool>` paths) in the config. Set `MARGIE_SHARED_ROOT` on the server when a group shares base databases; empty folders fill up as you run.
 
 If you use the GUI, you can also open the **File Explorer** page, browse to `~/.config/bioinformatics-tools/`, and edit `config.yaml` directly there. That same config file contains both the shared pipeline paths and the per-tool resource settings (threads, memory, runtime, partition overrides).
 

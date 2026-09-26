@@ -290,7 +290,7 @@ class TestGenomeFromLogPath:
 
     def test_extracts_organism_from_a_per_genome_rule(self):
         from bioinformatics_tools.api.services.job_runner import GENOME_FROM_LOG_PATH_RE
-        path = ("/scratch/negishi/bhattar3/margie-output/2026-08-01-2242/.snakemake"
+        path = ("/scratch/cluster/user/margie-output/2026-08-01-2242/.snakemake"
                 "/slurm_logs/rule_run_scoring/Afipia_carboxidovorans_OM5_GCF_000218565.1"
                 "/41469531.log")
         m = GENOME_FROM_LOG_PATH_RE.search(path)

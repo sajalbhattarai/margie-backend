@@ -6,6 +6,7 @@ Each workflow is registered as a WorkflowKey with metadata for execution,
 frontend display, and configuration.
 """
 import logging
+import os
 
 from bioinformatics_tools.workflow_tools.models import WorkflowKey
 from bioinformatics_tools.workflow_tools.workflow_helpers import WORKFLOW_PATH_DEFAULTS
@@ -15,7 +16,7 @@ LOGGER = logging.getLogger(__name__)
 # Root for the per-user writable stores a run appends to (OCC operon reference,
 # fingerprint databases, genome pool, scoring archive). {user} is filled in by
 # resolve_user_paths(); read-only reference data stays shared.
-MARGIE_DEPOT_ROOT = '/depot/lindems/data/margie'
+MARGIE_DEPOT_ROOT = os.environ.get('MARGIE_SHARED_ROOT', '').rstrip('/')
 MARGIE_USER_ROOT = f'{MARGIE_DEPOT_ROOT}/users/{{user}}'
 
 
@@ -111,7 +112,7 @@ def workflow_path_params(wf_id: str, include_sif: bool = True, include_db_root: 
     if include_db_root:
         params.append({
             'param': f'{wf_id}.db_root',
-            'default': defaults.get('db_root', '/depot/lindems/data/Databases'),
+            'default': defaults.get('db_root', ''),
             'description': f'Root folder containing per-tool database subfolders for {wf_id} (e.g. db_root/cog/) — not every tool needs one',
             'type': 'path'
         })
@@ -276,7 +277,7 @@ def _margie_sb_tool_params() -> list[dict]:
             },
             {
                 'param': f'margie_sb.{key}.db',
-                'default': f'/depot/lindems/data/Databases/{key}',
+                'default': '',
                 'description': f'Phase {phase}: database path for {label}',
                 'type': 'path'
             },
@@ -529,7 +530,7 @@ WORKFLOWS: dict[str, WorkflowKey] = {
             },
             {
                 'param': 'margie_sb.backup_root',
-                'default': f'{MARGIE_DEPOT_ROOT}/databases/margie-generated-databases',
+                'default': f'{MARGIE_DEPOT_ROOT}/databases/margie-generated-databases' if MARGIE_DEPOT_ROOT else '',
                 'description': 'Where "Back up to depot" puts copies of your databases, beside the bases every user starts from',
                 'type': 'path'
             },
