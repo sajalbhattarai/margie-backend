@@ -1404,6 +1404,68 @@ def setup_stores(current_user: dict = Depends(get_current_user)):
     return _stores_call(user_stores.start_setup, conn, user_config, current_user["cluster_username"])
 
 
+# ---------------------------------------------------------------------------
+# The AI keys for "Chat with the genome", kept in the user's own home on the
+# cluster when they ask for it, so a key set up once works from any computer
+# they connect from. ~/.config/margie is made 700 before the file is written,
+# so there is never a moment anyone else could read it; the file is 600.
+# It may also be written by hand: JSON {"keys": {...}}, or a provider=key line
+# each (anthropic, openai, gemini, custom).
+# ---------------------------------------------------------------------------
+
+_AI_KEYS_DIR = ".config/margie"
+_AI_KEYS_FILE = "ai-keys.json"
+_AI_PROVIDERS = {"anthropic", "openai", "gemini", "custom"}
+
+
+@router.get("/ai-keys")
+def get_ai_keys(current_user: dict = Depends(get_current_user)):
+    """The keys kept on the cluster, by provider ({} when none)."""
+    conn = _build_connection(current_user)
+    path = f"{current_user['home_dir']}/{_AI_KEYS_DIR}/{_AI_KEYS_FILE}"
+    code, out = user_stores._run(conn, f"cat {shlex.quote(path)} 2>/dev/null")
+    text = out if code == 0 else ""
+    keys: dict = {}
+    try:
+        data = json.loads(text) if text.strip() else {}
+        keys = (data.get("keys") if isinstance(data, dict) else None) or {}
+    except json.JSONDecodeError:
+        # Written by hand (in VS Code on the cluster, say): a provider=key line each.
+        for line in text.splitlines():
+            name, sep, value = line.strip().partition("=")
+            if sep and not line.lstrip().startswith("#"):
+                keys[name.strip().lower()] = value.strip().strip("'\"")
+    return {"keys": {k: v for k, v in keys.items() if k in _AI_PROVIDERS and isinstance(v, str) and v}}
+
+
+@router.put("/ai-keys")
+def put_ai_keys(body: dict | None = None, current_user: dict = Depends(get_current_user)):
+    """Replace the keys kept on the cluster. body: {keys: {provider: key}}."""
+    keys = (body or {}).get("keys") or {}
+    if not isinstance(keys, dict):
+        raise HTTPException(status_code=400, detail="Expected {keys: {provider: key}}.")
+    clean = {k: str(v).strip() for k, v in keys.items() if k in _AI_PROVIDERS and isinstance(v, str) and v.strip()}
+    conn = _build_connection(current_user)
+    home = current_user["home_dir"]
+    folder = f"{home}/{_AI_KEYS_DIR}"
+    code, out = user_stores._run(conn, f"mkdir -p {shlex.quote(folder)} && chmod 700 {shlex.quote(folder)}")
+    if code != 0:
+        raise HTTPException(status_code=500, detail=f"Could not make {folder}: {out.strip()}")
+    path = f"{folder}/{_AI_KEYS_FILE}"
+    ssh_sftp.write_remote_text_file(path, json.dumps({"keys": clean}) + "\n", connection=conn)
+    user_stores._run(conn, f"chmod 600 {shlex.quote(path)}")
+    return {"saved": sorted(clean)}
+
+
+@router.delete("/ai-keys")
+def delete_ai_keys(current_user: dict = Depends(get_current_user)):
+    """Forget the keys kept on the cluster."""
+    conn = _build_connection(current_user)
+    path = f"{current_user['home_dir']}/{_AI_KEYS_DIR}/{_AI_KEYS_FILE}"
+    user_stores._run(conn, f"rm -f {shlex.quote(path)}")
+    return {"ok": True}
+
+
 @router.post("/stores/run-here")
 def run_store_copy_here(current_user: dict = Depends(get_current_user)):
     """The copy waiting in the SLURM queue (databases, backups, tool setup), run
