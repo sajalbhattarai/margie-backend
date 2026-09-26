@@ -10,7 +10,7 @@ Annotates prokaryotic genomes, finds operons, and scores how confident it is abo
 <img src="docs/img/operon_0313_operon_map.png" width="820" alt="Operon map for Operon_0313 in Sedimenticola_thiotaurini_GCF_001007875.1 ">
 
 [![Hosted app](https://img.shields.io/badge/Hosted_app-Open-2ea44f?style=for-the-badge)](https://bsp.anvilcloud.rcac.purdue.edu/)
-[![Front-end (GUI)](https://img.shields.io/badge/Front--end-biolab--fe-1f6feb?style=for-the-badge)](https://github.com/sajalbhattarai/biolab-fe)
+[![Front-end (GUI)](https://img.shields.io/badge/Front--end-biolab--fe-1f6feb?style=for-the-badge)](https://github.com/sajalbhattarai/biolab-fe/tree/margie-frontend)
 [![Built with Snakemake](https://img.shields.io/badge/Built_with-Snakemake-039475?style=for-the-badge)](https://snakemake.readthedocs.io/)
 
 <a href="#install"><b>Install</b></a> &nbsp;|&nbsp;
@@ -31,16 +31,15 @@ Prefer clicking to typing? MARGIE also has a **web interface**. Use the hosted a
 
 ## Repo scope
 
-This repository is the **backend** repository for MARGIE.
-It contains backend code and backend operations only (pipeline, CLI, API, licensing gate, and backend runtime/config behavior).
-It does **not** contain frontend GUI code.
+This is the **`margie-backend`** branch of bioinformatics-tools: MARGIE's backend (pipeline, CLI, API, licensing gate, and runtime/config behaviour). The MARGIE app runs this code on your HPC cluster when you connect.
+It does **not** contain the interface.
 
-For frontend setup and browser usage, use **[biolab-fe](https://github.com/sajalbhattarai/biolab-fe)**.
+For the desktop app, the interface and running on your own computer, use **[biolab-fe, branch `margie-frontend`](https://github.com/sajalbhattarai/biolab-fe/tree/margie-frontend)**.
 
 ## Install
 
 ```bash
-git clone path-to-repository ~/bioinformatics-tools
+git clone -b margie-backend https://github.com/sajalbhattarai/bioinformatics-tools.git ~/bioinformatics-tools
 cd ~/bioinformatics-tools
 uv sync
 source .venv/bin/activate
@@ -156,7 +155,7 @@ This backend can be used from the command line or from the separate frontend rep
 
 - **Just use it** — the hosted app at **[bsp.anvilcloud.rcac.purdue.edu](https://bsp.anvilcloud.rcac.purdue.edu/)**. Nothing to install; sign in and submit.
 - **Run your own** — clone `biolab-fe` and run its one-time `setup.sh`. That frontend launcher starts this backend on your HPC over SSH, opens a tunnel, and launches the app in your browser.
-- **Run it on your own computer (local mode)** — clone this repo into any folder, then run `biolab-fe`'s `setup.sh --local` and click **Use MARGIE locally on this computer** on the login page, pointing it at that folder. The app installs this backend's packages with `uv` and starts it on your computer (listening on `127.0.0.1` only). Local accounts need only a username and password. Running analyses locally is still in progress.
+- **Run it on your own computer** — use the MARGIE desktop app for macOS or Windows ([biolab-fe releases](https://github.com/sajalbhattarai/biolab-fe/releases)). It runs the pipeline on your computer without this backend.
 
 Both routes drive this backend's `dane-api`, and both use the same licensing acceptance described above.
 
