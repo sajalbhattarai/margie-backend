@@ -1405,6 +1405,46 @@ def setup_stores(current_user: dict = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
+# A genome's interactive map (FINAL_GENOME_VIEWER.html) made again with the
+# viewer this backend has now. A run writes the map once, with the code of its
+# day; a map from an earlier run lacks what was added since (the gene report,
+# operon map downloads, the contig and two-strand views). Same script and
+# Python as the workflow's run_genome_viewer_one_genome rule, run as the user;
+# written beside the old one and moved over it only once it is complete.
+# ---------------------------------------------------------------------------
+
+@router.post("/genome-viewer/refresh")
+def refresh_genome_viewer(body: dict | None = None, current_user: dict = Depends(get_current_user)):
+    """body: {folder} -- a genome's results folder. Returns {viewer}: the map's path."""
+    folder = str((body or {}).get("folder") or "").strip()
+    if not folder:
+        raise HTTPException(status_code=400, detail="Which genome folder?")
+    folder = _resolve_browse_path(folder, current_user)
+    conn = _build_connection(current_user)
+    q = shlex.quote
+    home = current_user["home_dir"]
+    repo = f"{home}/bioinformatics-tools"
+    script = f"{repo}/bioinformatics_tools/workflow_tools/viz/gen_genome_viewer.py"
+    cmd = (
+        f"cd {q(folder)} || exit 3; "
+        "T=FINAL_ANNOTATION_WITH_CONFIDENCE.tsv; [ -f \"$T\" ] || T=scoring/$T; [ -f \"$T\" ] || exit 4; "
+        "V=FINAL_GENOME_VIEWER.html; [ -f \"$V\" ] || { [ -f scoring/$V ] && V=scoring/$V; }; "
+        f"PY=${{MARGIE_PYTHON:-{q(repo)}/.venv/bin/python}}; "
+        f"\"$PY\" {q(script)} \"$T\" \"$V.new\" > .viewer-refresh.log 2>&1 && mv -f \"$V.new\" \"$V\" && echo \"$V\""
+    )
+    code, out = user_stores._run(conn, cmd, timeout=600)
+    if code == 3:
+        raise HTTPException(status_code=404, detail=f"No folder {folder} on the cluster.")
+    if code == 4:
+        raise HTTPException(status_code=404, detail="This genome has no report table yet, so there is no map to make.")
+    if code != 0:
+        _, log = user_stores._run(conn, f"tail -n 15 {q(folder)}/.viewer-refresh.log 2>/dev/null")
+        raise HTTPException(status_code=500, detail=f"The map could not be made again: {(log or out).strip()[-600:]}")
+    viewer = out.strip().splitlines()[-1] if out.strip() else "FINAL_GENOME_VIEWER.html"
+    return {"viewer": f"{folder}/{viewer}"}
+
+
+# ---------------------------------------------------------------------------
 # The AI keys for "Chat with the genome", kept in the user's own home on the
 # cluster when they ask for it, so a key set up once works from any computer
 # they connect from. ~/.config/margie is made 700 before the file is written,
