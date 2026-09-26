@@ -17,7 +17,9 @@ HTML so the file opens offline with no server and no external assets.
 
 Usage: gen_genome_viewer.py <FINAL.tsv> <out.html>
 """
+import base64
 import csv
+import gzip
 import json
 import re
 import sys
@@ -150,6 +152,33 @@ def find_consolidated(final_path, explicit=None):
     return None
 
 
+def load_fingerprints(final_path):
+    """feature_id -> {h: pattern hash, l: label, f: [[field, value], ...]} from the
+    genome's fingerprint/labeled-genes-fingerprint-full.tsv (next to scoring/), or {}.
+    Each cell reads "pattern hash: X || label: Y || fingerprint: F1: v | F2: v ...";
+    empty fields are left out."""
+    base = Path(final_path).resolve().parent
+    for rel in ("../fingerprint/labeled-genes-fingerprint-full.tsv", "fingerprint/labeled-genes-fingerprint-full.tsv"):
+        p = (base / rel).resolve()
+        if p.is_file():
+            break
+    else:
+        return {}
+    out = {}
+    for r in csv.DictReader(open(p, newline=""), delimiter="\t"):
+        cell = r.get("fingerprint", "") or ""
+        parts = {k.strip(): v.strip() for k, _, v in (seg.partition(":") for seg in cell.split(" || "))}
+        fields = []
+        for seg in parts.get("fingerprint", "").split(" | "):
+            k, _, v = seg.partition(":")
+            if k.strip() and v.strip():
+                fields.append([k.strip(), v.strip()])
+        out[r.get("feature_id", "")] = {"h": parts.get("pattern hash", ""), "l": parts.get("label", ""), "f": fields,
+                                        "raw": parts.get("fingerprint", "")}
+    print(f"fingerprints from {p}", file=sys.stderr)
+    return out
+
+
 def main():
     argv = [a for a in sys.argv[1:] if a != "--artifact"]
     explicit_cons = None
@@ -242,7 +271,18 @@ def main():
     cidx = {c: i for i, c in enumerate(order)}
     contigs = [{"name": c, "len": clen[c]} for c in order]
 
+    fps = load_fingerprints(final)
     genes = []
+    # The gene report's longer text (formulas, reasoning, audit trail, the
+    # one-line fingerprint): per gene, in XF order, gzipped into the page and
+    # unpacked only when a report is downloaded -- it would triple the file.
+    XF = ["gene_id", "FEATURE_TYPE", "ENVELOPE", "ENVELOPE_reason", "best_consensus_product_descriptor_source_hierarchy_order",
+          "best_consensus_product_descriptor_source_audit_trail", "specialized_database_hits", "localization_and_topology_hits",
+          "C1_reasoning", "C2_score_formula", "C2_score_reasoning", "C3_score_formula", "C3_score_reasoning",
+          "C4_score_formula", "C4_score_reasoning", "PRELIMINARY_confidence_C1_C4_formula", "PRELIMINARY_confidence_C1_C4_reasoning",
+          "ADJUSTED_CONFIDENCE_WITH_OPERON_CONTEXT_formula", "ADJUSTED_CONFIDENCE_WITH_OPERON_CONTEXT_reasoning",
+          "DOES_OPERON_CONTEXT_IMPROVE_CONFIDENCE?", "NEEDS_REVIEW_REASON"]
+    extras = []
     for r in rows:
         gid = col(r, "gene_id")
         if not gid:
@@ -282,7 +322,10 @@ def main():
             "src": col(r, "best_consensus_product_descriptor_source"),
             "up": uniprot_hit(col(r, "RAST_feature_id")),
             "ev": evidence_of(col(r, "RAST_feature_id")),
+            "fid": col(r, "RAST_feature_id"),
+            "fp": ({k: v for k, v in fps[col(r, "RAST_feature_id")].items() if k != "raw"} if col(r, "RAST_feature_id") in fps else None),
         })
+        extras.append([col(r, k) for k in XF] + [(fps.get(col(r, "RAST_feature_id")) or {}).get("raw", "")])
 
     n_op = len({g["op"] for g in genes if g["op"]})
     n_flag = sum(g["rv"] for g in genes)
@@ -297,7 +340,9 @@ def main():
         "totLen": sum(clen.values()),
         "evNames": EV_NAMES, "evGroups": EV_GROUPS,
     }
-    html = TEMPLATE.replace("/*__DATA__*/", json.dumps(data, separators=(",", ":")))
+    packed = base64.b64encode(gzip.compress(json.dumps({"fields": XF + ["fingerprint_line"], "rows": extras},
+                                                        separators=(",", ":")).encode("utf-8"), 9)).decode("ascii")
+    html = TEMPLATE.replace("/*__DATA__*/", json.dumps(data, separators=(",", ":"))).replace("__XTRA__", packed)
 
     if "--artifact" in sys.argv:
         # Artifact host supplies its own <!doctype>/<html>/<head>/<body>; emit only
@@ -342,12 +387,12 @@ TEMPLATE = r"""<!doctype html>
   h1{font-size:18px;margin:0 0 2px;overflow-wrap:anywhere;word-break:break-word}
   h1 em{font-style:italic}
   .sub{color:var(--muted);font-size:13px;margin-bottom:12px}
-  .modebar{display:flex;gap:0;margin:6px 0 4px;border:1px solid var(--line);border-radius:9px;overflow:hidden;width:max-content;box-shadow:var(--shadow)}
+  .modebar{display:flex;gap:0;margin:6px 0 4px;border:1px solid var(--line);border-radius:3px;overflow:hidden;width:max-content;box-shadow:var(--shadow)}
   .modebar button{font-family:inherit;font-size:14px;padding:7px 20px;border:0;background:var(--btn);color:var(--btn-ink);cursor:pointer;transition:background .12s}
   .modebar button.on{background:var(--ink);color:var(--surface)}
   .opts{font-size:12px;color:var(--muted);margin:6px 0 2px;display:flex;gap:14px;align-items:center}
   .opts label{cursor:pointer;user-select:none}
-  .plate{background:#ffffff;border:1px solid var(--line);border-radius:14px;padding:6px;box-shadow:var(--shadow)}
+  .plate{background:#ffffff;border:1px solid var(--line);border-radius:4px;padding:6px;box-shadow:var(--shadow)}
   /* The circle reads better small: it leaves room for the scorecard beside it. */
   #circPlate{max-width:560px}
   .viewbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;margin:8px 0 6px}
@@ -359,6 +404,7 @@ TEMPLATE = r"""<!doctype html>
   .linscroll{position:relative;overflow-x:auto;overflow-y:hidden}
   .linspacer{height:1px}
   #lin{position:sticky;left:0;width:100%;height:210px;display:block}
+  .strandkey{font-size:12px;margin-top:6px}
   .zsel{fill:rgba(31,119,255,.14);stroke:#1F77FF;stroke-width:1.5;stroke-dasharray:4 3}
   .zbtn.on{background:var(--ink);color:#fff;border-color:var(--ink)}
   svg{width:100%;height:auto;display:block;touch-action:none}
@@ -379,18 +425,18 @@ TEMPLATE = r"""<!doctype html>
   .legend{display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:10px;font-size:12.5px}
   .legend span{display:inline-flex;align-items:center;gap:6px;color:var(--ink)}
   .sw{width:14px;height:14px;border-radius:3px;display:inline-block;border:1px solid rgba(0,0,0,.12)}
-  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;min-height:280px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:14px 16px;min-height:280px}
   .panel .empty{color:var(--muted);font-size:13px;line-height:1.5}
   .ptitle{font-size:17px;margin:0 0 2px;line-height:1.25}
-  .ptag{display:inline-block;font-size:12px;padding:2px 9px;border-radius:20px;color:#fff;margin-bottom:8px}
+  .ptag{display:inline-block;font-size:12px;padding:1px 7px;border-radius:2px;color:#fff;margin-bottom:8px}
   .cardhead{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
   .cardhead-l{min-width:0}
   .dlbtn{flex:0 0 auto;font-family:inherit;font-size:11.5px;padding:5px 11px;border:1px solid var(--line);
-    background:var(--btn);color:var(--btn-ink);border-radius:8px;cursor:pointer;white-space:nowrap;transition:background .12s}
+    background:var(--btn);color:var(--btn-ink);border-radius:3px;cursor:pointer;white-space:nowrap;transition:background .12s}
   .dlbtn:hover{background:var(--ink);color:var(--surface);border-color:var(--ink)}
   /* A boxed table, not free text: every figure sits in its own cell. */
   .kv{display:grid;grid-template-columns:auto 1fr;font-size:13px;margin:10px 0;
-      border:1px solid var(--line);border-radius:8px;overflow:hidden}
+      border:1px solid var(--line);border-radius:3px;overflow:hidden}
   .kv b,.kv span{padding:5px 10px;border-top:1px solid var(--line)}
   .kv b:first-child,.kv b:first-child + span{border-top:0}
   .kv b{color:var(--muted);font-weight:normal;border-right:1px solid var(--line);background:#fafafa}
@@ -410,6 +456,26 @@ TEMPLATE = r"""<!doctype html>
   .omap polygon{cursor:pointer}
   .flagtag{color:var(--flag);font-size:11.5px;margin-top:6px}
   .trail{margin-top:12px;border-top:1px solid var(--line);padding-top:9px;max-height:340px;overflow:auto}
+  .fphash{margin-top:4px;font-size:11px}
+  /* A tall window (full screen, or a big monitor): the map grows with the height
+     and the page uses the whole width instead of leaving margins. */
+  @media (min-height:820px){
+    .wrap{max-width:none}
+    #circPlate{max-width:min(100%,calc(100vh - 180px))}
+    .right{max-width:520px}
+  }
+  /* contigs: the list view, and the backbone's alternating shades */
+  .ctgplate{padding:0}
+  .ctghead{display:flex;justify-content:space-between;gap:12px;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px}
+  .ctglist{max-height:min(640px,calc(100vh - 260px));overflow:auto}
+  .crow{display:grid;grid-template-columns:minmax(0,1fr) 90px 60px 140px;gap:10px;align-items:center;padding:5px 12px;border-bottom:1px solid #eee;font-size:12.5px;cursor:pointer}
+  .crow:hover,.crow.on{background:#f3f6ff}
+  .crow .cnm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .crow .cnum{text-align:right;font-variant-numeric:tabular-nums}
+  .tbar,.kv .tbar{display:flex;height:8px;border:1px solid #cfcfcf;overflow:hidden;padding:0;width:100%}
+  .tbar i{display:block;height:100%}
+  .bb{cursor:pointer}
+  .mrow .mnum.kb{width:auto;white-space:nowrap}
   .trail h4{font-size:12px;margin:0 0 2px;color:var(--muted);font-weight:normal;letter-spacing:.5px;text-transform:uppercase}
   .trail .cnt{color:var(--muted);font-size:12px;margin-bottom:4px}
   .grp{font-size:11.5px;color:var(--muted);margin:9px 0 2px;font-style:italic}
@@ -417,7 +483,7 @@ TEMPLATE = r"""<!doctype html>
   .erow .etool{color:var(--muted);white-space:nowrap}
   .erow.win .etool{color:var(--operon);font-weight:bold}
   .erow.win .edesc{font-weight:bold}
-  .chosen{display:inline-block;font-size:9.5px;color:#fff;background:var(--operon);border-radius:10px;padding:1px 7px;margin-left:7px;vertical-align:1px}
+  .chosen{display:inline-block;font-size:9.5px;color:#fff;background:var(--operon);border-radius:2px;padding:1px 7px;margin-left:7px;vertical-align:1px}
   .emetric{display:inline-block;font-size:10.5px;color:var(--operon);font-variant-numeric:tabular-nums}
   .erow.uninf{opacity:.5}
   .ecflag{font-size:11.5px;color:#c0143c;margin:6px 0 2px;line-height:1.35}
@@ -449,10 +515,12 @@ TEMPLATE = r"""<!doctype html>
       <div class="modebar small">
         <button id="vCirc" class="on" type="button">Circular</button>
         <button id="vLin" type="button">Linear</button>
+        <button id="vCtg" type="button" hidden>Contigs</button>
       </div>
       <span id="linctl" class="linctl" hidden>
-        <label>replicon <select id="linContig"></select></label>
+        <label><span id="linWhat">replicon</span> <select id="linContig"></select></label>
         <label>genes shown <select id="linN"><option>10</option><option>20</option><option>40</option></select></label>
+        <label>strands <select id="linStr"><option value="one">one line</option><option value="two">two strands</option></select></label>
         <span id="linPos" class="linpos"></span>
       </span>
     </div>
@@ -470,6 +538,10 @@ TEMPLATE = r"""<!doctype html>
       <div class="linscroll" id="linScroll"><div class="linspacer" id="linSpacer"></div><svg id="lin" aria-label="linear gene map"></svg></div>
       <div class="zhint">scroll sideways through the replicon | click a gene for its scorecard</div>
     </div>
+    <div class="plate ctgplate" id="ctgPlate" hidden>
+      <div class="ctghead"><span id="ctgCount"></span><span>longest first | click a contig for its genes</span></div>
+      <div class="ctglist" id="ctgList"></div>
+    </div>
     <div class="legend" id="legend"></div>
     <div class="foot">Every value is read verbatim from FINAL_ANNOTATION_WITH_CONFIDENCE.tsv. Click a gene or operon for details.</div>
   </div>
@@ -478,6 +550,7 @@ TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 <div id="tip"></div>
+<script type="application/octet-stream" id="xtra">__XTRA__</script>
 <script>
 const D = /*__DATA__*/;
 const TIER_NAMES=["highest","high","medium","fair","low"];
@@ -552,11 +625,15 @@ function annulusStrip(ci,ri,ro,fill){
   const s=lay[ci].start, sp=lay[ci].span, seg=Math.max(2,Math.ceil(sp/2));
   for(let k=0;k<seg;k++){
     const a0=s-sp*k/seg, a1=s-sp*(k+1)/seg;
-    svg.appendChild(el("polygon",{points:`${P(ro,a0)} ${P(ro,a1)} ${P(ri,a1)} ${P(ri,a0)}`,fill,stroke:"none"}));
+    const q=el("polygon",{points:`${P(ro,a0)} ${P(ro,a1)} ${P(ri,a1)} ${P(ri,a0)}`,fill,stroke:"none",class:"bb"});
+    q.dataset.ci=ci; svg.appendChild(q);
   }
 }
-order.forEach(ci=>{
-  annulusStrip(ci,R.bbI,R.bbO,"#000000");
+// A genome in pieces: the backbone alternates black and grey from one contig
+// to the next, so where each begins and ends shows without labels.
+const CONTIG_SHADE=["#000000","#8c8c8c"];
+order.forEach((ci,k)=>{
+  annulusStrip(ci,R.bbI,R.bbO,MULTI?CONTIG_SHADE[k%2]:"#000000");
   const L=D.contigs[ci].len, step=L>3e6?1e6:5e5;
   // Positions only along a single replicon (see MULTI above).
   if(!MULTI) for(let p=0;p<=L;p+=step){
@@ -590,7 +667,26 @@ svg.appendChild(cInfo2);
 
 // ---- colouring ----
 let mode="gene", selKind=null, selVal=null;
+// ---- which genes to show ----
+// The page that embeds the map chooses, by its address: #show=all (the
+// default), a tier (highest, high, medium, fair, low), noncoding, flagged,
+// operonic or nonoperonic. The rest stay on the ring, greyed like review
+// mode's unflagged genes, so where the chosen ones sit still reads.
+const HIDDEN="#ececea";
+let SHOW="all";
+function readShow(){const m=/(?:^#|&)show=([a-z]+)/.exec(location.hash);SHOW=m?m[1]:"all";}
+function shown(g){
+  switch(SHOW){
+    case "all": return true;
+    case "noncoding": return g.ti<0;
+    case "flagged": return !!g.rv;
+    case "operonic": return !!g.op;
+    case "nonoperonic": return !g.op && g.ti>=0;
+    default: { const k=TIER_NAMES.indexOf(SHOW); return k<0 || g.ti===k; }
+  }
+}
 function geneFill(g){
+  if(!shown(g)) return HIDDEN;
   if(mode==="gene") return g.ti<0?NONCODE:TIER_COL[g.ti];
   if(mode==="review") return g.rv?(g.ti<0?NONCODE:TIER_COL[g.ti]):"#ececea";
   return g.op?opColor(g.op):(g.ti<0?NONCODE:NONOP);
@@ -598,7 +694,11 @@ function geneFill(g){
 function paint(){
   D.genes.forEach((g,i)=>nodes[i].setAttribute("fill",geneFill(g)));
   document.getElementById("showFlags").checked ? flagLayer.style.display="" : flagLayer.style.display="none";
-  cInfo2.textContent = mode==="operon"
+  flagLayer.querySelectorAll("line").forEach(l=>{ l.style.display=shown(D.genes[+l.dataset.flag])?"":"none"; });
+  const nShown=SHOW==="all"?0:D.genes.filter(shown).length;
+  cInfo2.textContent = SHOW!=="all"
+    ? "showing "+nShown.toLocaleString()+" "+(SHOW==="noncoding"?"non-coding":SHOW==="operonic"?"in operons":SHOW==="nonoperonic"?"not in operons":SHOW)
+    : mode==="operon"
     ? D.nOperons.toLocaleString()+" operons"
     : D.nFlag.toLocaleString()+" flagged for review";
   renderLegend(); applySelection();
@@ -616,14 +716,78 @@ function renderLegend(){
     s.innerHTML=`<i class="sw" style="background:${c}"></i>${n}`; L.appendChild(s);});
   if(document.getElementById("showFlags").checked){const s=document.createElement("span");
     s.innerHTML=`<i class="sw" style="background:${FLAG}"></i>review flag`; L.appendChild(s);}
+  {const s=document.createElement("span");
+    s.innerHTML=`outer ring: + strand (5′→3′ clockwise) | inner ring: − strand (5′→3′ anticlockwise)`; L.appendChild(s);}
+  if(MULTI){const s=document.createElement("span");
+    s.innerHTML=`<i class="sw" style="background:linear-gradient(90deg,#000 50%,#8c8c8c 50%)"></i>contigs (backbone alternates; hover or click one)`; L.appendChild(s);}
 }
+
+// ---- contigs ----
+let VIEWNOW="circ";
+const contigGenes=D.contigs.map(()=>[]);
+D.genes.forEach((g,i)=>contigGenes[g.ci].push(i));
+const contigRank=D.contigs.map((c,i)=>i).sort((a,b)=>D.contigs[b].len-D.contigs[a].len);
+function tierBar(list){
+  const n=[0,0,0,0,0,0]; list.forEach(i=>{ const t=D.genes[i].ti; n[t<0?5:t]++; });
+  const tot=list.length||1, col=[...TIER_COL,NONCODE];
+  return `<span class="tbar" title="${TIER_NAMES.map((t,k)=>t+" "+n[k]).join(" | ")} | non-coding ${n[5]}">${n.map((v,k)=>v?`<i style="width:${v/tot*100}%;background:${col[k]}"></i>`:"").join("")}</span>`;
+}
+function contigCard(ci){
+  const c=D.contigs[ci], list=contigGenes[ci];
+  const ops=new Set(list.map(i=>D.genes[i].op).filter(Boolean)), fl=list.filter(i=>D.genes[i].rv).length;
+  let h=`<div class="ptitle">${esc(c.name)}</div><span class="ptag" style="background:#555">contig ${contigRank.indexOf(ci)+1} of ${D.contigs.length}</span>`;
+  h+=`<div class="kv"><b>length</b><span>${c.len.toLocaleString()} bp</span><b>genes</b><span>${list.length.toLocaleString()}</span>`
+    +`<b>operons</b><span>${ops.size.toLocaleString()}</span><b>flagged</b><span>${fl.toLocaleString()}</span></div>`;
+  h+=`<div class="kv"><b>confidence tiers</b><span>${tierBar(list)}</span></div>`;
+  h+=`<div class="cardhead" style="margin:8px 0"><button class="dlbtn" data-ctg-map="${ci}">Show on the map</button><button class="dlbtn" data-ctg-lin="${ci}">Linear view</button></div>`;
+  h+=`<div class="trail"><h4>genes, in order</h4>`;
+  list.slice().sort((a,b)=>D.genes[a].s-D.genes[b].s).forEach(i=>{ const g=D.genes[i], [tn,tc]=tierBadge(g.ti);
+    h+=`<div class="mrow" data-gene-open="${i}"><span class="dot" style="background:${tc}"></span><span class="mnm">${esc(g.nm||"(unnamed)")}</span><span class="mnum kb">${(g.s/1000).toFixed(1)} kb</span></div>`; });
+  return h+`</div>`;
+}
+function showContig(ci){ selKind="contig"; selVal=ci; panel.innerHTML=contigCard(ci); applySelection();
+  document.querySelectorAll(".crow").forEach(r=>r.classList.toggle("on",+r.dataset.ci===ci)); }
+function renderContigList(){
+  const box=document.getElementById("ctgList"); if(!box) return;
+  document.getElementById("ctgCount").textContent=`${D.contigs.length.toLocaleString()} contigs | ${D.totLen.toLocaleString()} bp`;
+  box.innerHTML=`<div class="crow" style="cursor:default;font-weight:bold"><span>contig</span><span class="cnum">length (bp)</span><span class="cnum">genes</span><span>tiers</span></div>`
+    +contigRank.map(ci=>`<div class="crow" data-ci="${ci}"><span class="cnm" title="${esc(D.contigs[ci].name)}">${esc(D.contigs[ci].name)}</span>`
+      +`<span class="cnum">${D.contigs[ci].len.toLocaleString()}</span><span class="cnum">${contigGenes[ci].length}</span>${tierBar(contigGenes[ci])}</div>`).join("");
+}
+document.addEventListener("click",e=>{
+  const row=e.target.closest(".crow[data-ci]"); if(row){ showContig(+row.dataset.ci); return; }
+  const m=e.target.closest("[data-ctg-map]"); if(m){ VIEW.set("circ"); showContig(+m.dataset.ctgMap); return; }
+  const l=e.target.closest("[data-ctg-lin]"); if(l){ VIEW.set("lin"); LIN.showContig(+l.dataset.ctgLin); return; }
+  const o=e.target.closest("[data-gene-open]"); if(o){ showGene(+o.dataset.geneOpen); if(LIN.visible()) LIN.goto(+o.dataset.geneOpen); }
+});
+svg.addEventListener("mousemove",e=>{ const t=e.target.closest(".bb"); if(!t||!MULTI) return;
+  const ci=+t.dataset.ci, c=D.contigs[ci];
+  tipShow(`<b>${esc(c.name)}</b><br>contig ${contigRank.indexOf(ci)+1} of ${D.contigs.length} | ${c.len.toLocaleString()} bp | ${contigGenes[ci].length} genes`,e.clientX,e.clientY); });
+svg.addEventListener("click",e=>{ const t=e.target.closest(".bb"); if(t&&MULTI) showContig(+t.dataset.ci); });
 
 // ---- selection / highlight ----
 function clearFX(){nodes.forEach(n=>n.classList.remove("sel","dim","hi"));}
+/*
+ * Tell MARGIE (when this page is shown inside it) what is open: the view, the
+ * colouring, and the gene, operon or contig selected. Chat with the genome
+ * takes it as the subject of the next question.
+ */
+function tell(){
+  if(window.parent===window) return;
+  let sel=null;
+  if(selKind==="gene"&&selVal!=null){ const g=D.genes[selVal]; sel={kind:"gene",id:g.fid||"",label:g.nm||"",contig:D.contigs[g.ci].name,operon:g.op||""}; }
+  else if(selKind==="operon"&&operons[selVal]) sel={kind:"operon",id:selVal,label:operons[selVal].length+" genes"};
+  else if(selKind==="contig"&&selVal!=null){ const c=D.contigs[selVal]; sel={kind:"contig",id:c.name,label:c.len.toLocaleString()+" bp, "+contigGenes[selVal].length+" genes"}; }
+  window.parent.postMessage({margie:"selection",genome:D.short,sel,view:VIEWNOW,mode},"*");
+}
 function applySelection(){
+  tell();
   clearFX();
   if(selKind==="operon" && operons[selVal]){
     const set=new Set(operons[selVal]);
+    nodes.forEach((n,i)=>{ if(set.has(i))n.classList.add("hi"); else n.classList.add("dim"); });
+  } else if(selKind==="contig" && selVal!=null){
+    const set=new Set(contigGenes[selVal]);
     nodes.forEach((n,i)=>{ if(set.has(i))n.classList.add("hi"); else n.classList.add("dim"); });
   } else if(selKind==="gene" && selVal!=null){
     nodes[selVal].classList.add("sel");
@@ -636,15 +800,16 @@ function bar(v,c){return `<div class="bar"><i style="width:${Math.round((v||0)*1
 function geneCard(i){
   const g=D.genes[i], [tn,tc]=tierBadge(g.ti);
   const strand=g.st>0?"+":"−", cn=D.contigs[g.ci].name;
-  let h=`<div class="ptitle">${esc(g.nm||"(unnamed)")}</div>`;
-  h+=`<span class="ptag" style="background:${tc}">${tn}</span>`;
+  let h=`<div class="cardhead"><div class="cardhead-l"><div class="ptitle">${esc(g.nm||"(unnamed)")}</div>`
+    +`<span class="ptag" style="background:${tc}">${tn}</span></div>`
+    +`<button class="dlbtn" data-gene-dl="${i}" title="Everything about this gene: identity, every score with its formula and reasoning, the fingerprint, the evidence trail, its operon's genes, and any AI interpretation">Download gene report</button></div>`;
   h+=`<div class="kv">`;
   h+=`<b>location</b><span>${cn}:${g.s.toLocaleString()}–${g.e.toLocaleString()} (${strand})</span>`;
   h+=`<b>operon</b><span>${g.op?`<a class="oplink" data-op-link="${g.op}">${g.op}</a> | P = `+pct(g.pr):"none (singleton)"}</span>`;
   h+=`</div>`;
   h+=`<div class="kv">`;
   h+=`<b>C1 database coverage</b><span>${pct(g.c1)}</span>`;
-  h+=`<b>C2 operon membership</b><span>${pct(g.c2)}</span>`;
+  h+=`<b>C2 operon membership</b><span>${pct(g.c2)} (${g.op?"in an operon":"singleton"})</span>`;
   h+=`<b>C3 operon context</b><span>${pct(g.c3)} (adj) | ${pct(g.c3h)} (hyb)</span>`;
   h+=`<b>C4 EC agreement</b><span>${pct(g.c4)}${g.ecs?" | "+esc(g.ecs):""}</span>`;
   h+=`</div>`;
@@ -652,11 +817,128 @@ function geneCard(i){
   h+=`<div class="kv"><b>final confidence</b><span>${pct(g.fin)} (adj) | ${pct(g.finh)} (hyb)</span></div>${bar(g.fin,tc)}`;
   h+=`<div class="kv"><b>confidence tier</b><span>${tierBadge(g.ti)[0]} (adj) | ${tierBadge(g.tih)[0]} (hyb)</span></div>`;
   if(g.up)h+=`<div class="uphit"><b>UniProt best hit</b> ${g.up.pid!=null?g.up.pid+"% id":"—"}`
-    +` | ${esc(g.up.en||"")} | ${esc(g.up.desc||"")}${g.up.inf?"":` <span class="uninf">(uninformative — not used)</span>`}</div>`;
-  if(g.rv)h+=`<div class="flagtag">⚑ flagged for review — ${esc(g.rr||"")}</div>`;
+    +` | ${esc(g.up.en||"")} | ${esc(g.up.desc||"")}${g.up.inf?"":` <span class="uninf">(uninformative, not used)</span>`}</div>`;
+  if(g.rv)h+=`<div class="flagtag">⚑ flagged for review: ${esc(g.rr||"")}</div>`;
   h+=evidenceTrail(g);
+  h+=fingerprintBox(g);
   return h;
 }
+// The gene's fingerprint: its label, and the fields that are filled in (the hash kept small).
+function fingerprintBox(g){
+  const fp=g.fp;
+  if(!fp) return "";
+  let h=`<div class="trail"><h4>fingerprint</h4>`;
+  if(fp.l) h+=`<div class="cnt">label: <b>${esc(fp.l)}</b></div>`;
+  (fp.f||[]).forEach(([k,v])=>{ h+=`<div class="erow"><span class="etool">${esc(k.replace(/_/g," "))}</span><span class="edesc">${esc(v)}</span></div>`; });
+  if(fp.h) h+=`<div class="cnt fphash">pattern hash ${esc(fp.h)}</div>`;
+  return h+`</div>`;
+}
+// ---- the gene report ----------------------------------------------------
+// A plain-text report of one gene: identity, confidence (every score with its
+// formula and reasoning), fingerprint (one line, then database by database),
+// the evidence trail, the genes of its operon (the same sections, indented),
+// and, when the page is shown inside MARGIE, the AI conversation about it.
+const SEP="=====x====x====";
+let XTRA=null;
+async function extras(){
+  if(XTRA) return XTRA;
+  try{
+    const b64=document.getElementById("xtra").textContent.trim();
+    const bin=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));
+    const d=await new Response(new Blob([bin]).stream().pipeThrough(new DecompressionStream("gzip"))).json();
+    XTRA=d.rows.map(r=>Object.fromEntries(d.fields.map((f,k)=>[f,r[k]||""])));
+  }catch(err){ XTRA=D.genes.map(()=>({})); }
+  return XTRA;
+}
+/** Fingerprint fields grouped by database: RAST_description -> RAST: description. */
+function byDatabase(fields){
+  const out=[], at={};
+  (fields||[]).forEach(([k,v])=>{ const j=k.indexOf("_"), db=j>0?k.slice(0,j):k, f=j>0?k.slice(j+1).replace(/_/g," "):"value";
+    if(!(db in at)){ at[db]=out.length; out.push([db,[]]); } out[at[db]][1].push([f,v]); });
+  return out;
+}
+function geneSections(i,X,pad){
+  const g=D.genes[i], x=X[i]||{}, cn=D.contigs[g.ci].name, P=(n)=>pad+"  ".repeat(n);
+  const L=[], kv=(n,k,v)=>{ if(v!==undefined&&v!==null&&String(v).trim()!=="") L.push(`${P(n)}${k}: ${v}`); };
+  const sub=(n,k,v)=>kv(n+1,k,v);
+  L.push(`${pad}GENE: ${g.nm||"(unnamed)"}`);
+  kv(1,"Feature id",g.fid); kv(1,"Gene id",x.gene_id); kv(1,"Type",x.FEATURE_TYPE);
+  kv(1,"Location",`${cn}:${g.s.toLocaleString()}-${g.e.toLocaleString()} (${g.st>0?"+":"-"})`);
+  kv(1,"Operon",g.op?`${g.op} (P = ${pct(g.pr)})`:"none (singleton)");
+  kv(1,"Name chosen from",g.src); kv(1,"Source rank",x.best_consensus_product_descriptor_source_hierarchy_order);
+  kv(1,"Envelope",x.ENVELOPE); kv(1,"Envelope reason",x.ENVELOPE_reason);
+  L.push(pad+SEP);
+  L.push(`${pad}CONFIDENCE`);
+  kv(1,"Tier",`${tierBadge(g.ti)[0]} (adj) | ${tierBadge(g.tih)[0]} (hyb)`);
+  kv(1,"Final confidence",`${pct(g.fin)} (adj) | ${pct(g.finh)} (hyb)`);
+  sub(1,"formula",x.ADJUSTED_CONFIDENCE_WITH_OPERON_CONTEXT_formula); sub(1,"reasoning",x.ADJUSTED_CONFIDENCE_WITH_OPERON_CONTEXT_reasoning);
+  kv(1,"Operon context changes it",x["DOES_OPERON_CONTEXT_IMPROVE_CONFIDENCE?"]);
+  kv(1,"Preliminary (C1 x C4)",pct(g.pre));
+  sub(1,"formula",x.PRELIMINARY_confidence_C1_C4_formula); sub(1,"reasoning",x.PRELIMINARY_confidence_C1_C4_reasoning);
+  kv(1,"C1 database coverage",pct(g.c1)); sub(1,"reasoning",x.C1_reasoning);
+  kv(1,"C2 operon membership",`${pct(g.c2)} (${g.op?"in an operon":"singleton"})`);
+  sub(1,"formula",x.C2_score_formula); sub(1,"reasoning",x.C2_score_reasoning);
+  kv(1,"C3 operon context",`${pct(g.c3)} (adj) | ${pct(g.c3h)} (hyb)`);
+  sub(1,"formula",x.C3_score_formula); sub(1,"reasoning",x.C3_score_reasoning);
+  kv(1,"C4 EC agreement",`${pct(g.c4)}${g.ecs?" | "+g.ecs:""}`);
+  sub(1,"formula",x.C4_score_formula); sub(1,"reasoning",x.C4_score_reasoning);
+  kv(1,"Review",g.rv?`flagged: ${x.NEEDS_REVIEW_REASON||g.rr||""}`:"not flagged");
+  L.push(pad+SEP);
+  L.push(`${pad}FINGERPRINT`);
+  if(g.fp){
+    kv(1,"Label",g.fp.l); kv(1,"Pattern hash",g.fp.h);
+    kv(1,"Fingerprint (one line)",x.fingerprint_line||(g.fp.f||[]).map(([k,v])=>`${k}: ${v}`).join(" | "));
+    L.push(`${P(1)}By database:`);
+    byDatabase(g.fp.f).forEach(([db,items])=>{ L.push(`${P(2)}${db}`); items.forEach(([f,v])=>L.push(`${P(3)}${f}: ${v}`)); });
+  } else L.push(`${P(1)}no fingerprint for this gene`);
+  L.push(pad+SEP);
+  L.push(`${pad}EVIDENCE TRAIL (every database's call)`);
+  const ev=g.ev||[]; let last=null;
+  if(!ev.length) L.push(`${P(1)}no per-tool record for this feature`);
+  ev.forEach(r=>{ const grp=D.evGroups[r[0]], name=D.evNames[r[0]];
+    if(grp!==last){ L.push(`${P(1)}${GRP_LABEL[grp]||grp}`); last=grp; }
+    L.push(`${P(2)}${name}${r[2]?" ("+r[2]+")":""}: ${r[1]}${isWin(name,g.src)?"  [chosen]":""}${r[3]?"":"  [uninformative]"}`); });
+  if(g.up) kv(1,"UniProt best hit",`${g.up.en||""} | ${g.up.pid!=null?g.up.pid+"% id | ":""}${g.up.desc||""}${g.up.inf?"":" (uninformative, not used)"}`);
+  kv(1,"Name audit trail",x.best_consensus_product_descriptor_source_audit_trail);
+  kv(1,"Specialised database hits",x.specialized_database_hits);
+  kv(1,"Localisation and topology",x.localization_and_topology_hits);
+  return L;
+}
+/** The AI conversation about this gene, asked of MARGIE when the page is shown inside it. */
+function askAI(i){
+  return new Promise(res=>{
+    if(window.parent===window){ res(""); return; }
+    const g=D.genes[i], x=(XTRA||[])[i]||{}, id="r"+Math.random().toString(36).slice(2);
+    const done=(t)=>{ removeEventListener("message",on); res(t); };
+    const on=(e)=>{ const d=e.data||{}; if(d.margie==="ai-text"&&d.id===id) done(String(d.text||"")); };
+    addEventListener("message",on);
+    window.parent.postMessage({margie:"ai-for-gene",id,genome:D.short,fid:g.fid||"",gene:x.gene_id||"",product:g.nm||""},"*");
+    setTimeout(()=>done(""),1500);
+  });
+}
+async function geneReport(i){
+  const X=await extras(), g=D.genes[i];
+  const L=[`MARGIE gene report`,`Genome: ${D.short}`,`Written: ${new Date().toLocaleString()}`,SEP];
+  L.push(...geneSections(i,X,""));
+  L.push(SEP);
+  if(g.op&&operons[g.op]){
+    const mem=operons[g.op];
+    L.push(`OPERON ${g.op} (P = ${pct(g.pr)}): ${mem.length} genes, in order`);
+    mem.forEach((j,k)=>{ L.push(""); L.push(`    [${k+1}/${mem.length}]${j===i?" (this gene)":""}`); L.push(...geneSections(j,X,"    ")); });
+  } else L.push(`OPERON: none (singleton)`);
+  L.push(SEP);
+  const ai=await askAI(i);
+  if(ai){ L.push(`AI INTERPRETATION (from Chat with the genome; check it against the evidence above)`); L.push(ai); L.push(SEP); }
+  return L.join("\n")+"\n";
+}
+async function downloadGene(i){
+  const g=D.genes[i], name=(g.fid||("gene_"+i)).replace(/[^A-Za-z0-9._-]+/g,"_");
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([await geneReport(i)],{type:"text/plain"}));
+  a.download=`${D.short}_${name}_gene_report.txt`; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1500);
+}
+document.addEventListener("click",e=>{ const b=e.target.closest("[data-gene-dl]"); if(b) downloadGene(+b.dataset.geneDl); });
 const GRP_LABEL={decision:"decision databases (set C1)",domain:"domain / family signatures",special:"specialised callers"};
 function isWin(name,src){ if(!src)return false; const a=name.toUpperCase().replace(/[^A-Z]/g,""),b=src.toUpperCase().replace(/[^A-Z]/g,"");
   return a&&b&&(b.indexOf(a)>=0||a.indexOf(b)>=0); }
@@ -664,11 +946,11 @@ function evidenceTrail(g){
   const ev=g.ev||[];
   if(!ev.length) return `<div class="trail"><h4>evidence trail</h4><div class="cnt">no per-tool record for this feature.</div></div>`;
   const infN=ev.filter(r=>r[3]).length;
-  let h=`<div class="trail"><h4>evidence trail — every database's call (EC numbers kept)</h4>`
+  let h=`<div class="trail"><h4>evidence trail</h4>`
        +`<div class="cnt">${infN} of ${ev.length} databases returned an informative name`
        +`${g.src?` | chosen: <b>${esc(g.src)}</b>`:""}</div>`;
   if(g.c4!=null && g.c4<1)
-    h+=`<div class="ecflag">⚑ EC conflict — C4 = ${pct(g.c4)}${g.ecs?" ("+esc(g.ecs)+")":""}. `
+    h+=`<div class="ecflag">⚑ EC conflict: C4 = ${pct(g.c4)}${g.ecs?" ("+esc(g.ecs)+")":""}. `
       +`${esc(g.c4r||"tools disagree on the EC number; compare the [EC:…] tags below.")}</div>`;
   let last=null;
   ev.forEach(row=>{
@@ -691,7 +973,7 @@ function operonCard(id){
   let h=`<div class="cardhead"><div class="cardhead-l">`
        +`<div class="ptitle">${id}</div>`
        +`<span class="ptag" style="background:${opColor(id)}">${idx.length} genes | operon</span></div>`
-       +`<button class="dlbtn" data-dl="${id}" title="Download this operon map as an image">⤓ map</button></div>`;
+       +`<button class="dlbtn" data-dl="${id}" title="Download this operon map as an image">Download map (PNG)</button></div>`;
   h+=`<div class="kv">`;                                        // structural facts only (no recomputed scores)
   h+=`<b>span</b><span>${(span/1000).toFixed(1)} kb</span>`;
   h+=`<b>raised by operon context</b><span>${raised} / ${idx.length} gene${idx.length>1?"s":""}</span>`;
@@ -896,31 +1178,55 @@ const LIN=(function(){
   if(D.contigs.length<2) selC.parentElement.hidden=true;
 
   let ci=0, per=10, on=false, frame=0;
-  const H=210, TOP=58, AH=52;                 // svg height, arrow top, arrow height
+  const TOP=58, AH=52;                         // arrow top, arrow height
+  // One line: every gene on one track, pointing its way. Two strands: + genes
+  // (read 5'->3' left to right) on the upper track, - genes (5'->3' right to
+  // left) on the lower one, each labelled on its outer side.
+  let two=false;
+  const LOW=TOP+AH+44;                          // the lower track's top, in two-strand view
+  const heightNow=()=>two?LOW+AH+50:210;
+  const selS=document.getElementById("linStr");
   const slot=()=>Math.max(70, scroll.clientWidth/per);
 
   function layout(){ spacer.style.width=(byContig[ci].length*slot())+"px"; render(); }
 
   function render(){
     if(!on) return;
-    const list=byContig[ci], sw=slot(), W=scroll.clientWidth||600;
-    svgL.setAttribute("viewBox",`0 0 ${W} ${H}`);
+    const list=byContig[ci], sw=slot(), W=scroll.clientWidth||600, H=heightNow();
+    svgL.setAttribute("viewBox",`0 0 ${W} ${H}`); svgL.style.height=H+"px";
     const left=scroll.scrollLeft;
     const first=Math.max(0,Math.floor(left/sw)-1), last=Math.min(list.length-1,first+per+2);
-    let out=`<line x1="0" y1="${TOP+AH/2}" x2="${W}" y2="${TOP+AH/2}" stroke="#d7d7d2" stroke-width="2"/>`;
+    let out=two
+      ? `<line x1="0" y1="${TOP+AH/2}" x2="${W}" y2="${TOP+AH/2}" stroke="#d7d7d2" stroke-width="2"/>`
+        +`<line x1="0" y1="${LOW+AH/2}" x2="${W}" y2="${LOW+AH/2}" stroke="#d7d7d2" stroke-width="2"/>`
+        +`<text x="6" y="${TOP+AH+16}" font-size="11" fill="#555">+ strand (5′→3′, left to right)</text>`
+        +`<text x="6" y="${LOW-6}" font-size="11" fill="#555">− strand (5′→3′, right to left)</text>`
+      : `<line x1="0" y1="${TOP+AH/2}" x2="${W}" y2="${TOP+AH/2}" stroke="#d7d7d2" stroke-width="2"/>`;
+    const short=(nm)=>esc(nm.length>Math.floor(sw/7)?nm.slice(0,Math.max(6,Math.floor(sw/7)-1))+"…":nm);
     for(let k=first;k<=last;k++){
       const i=list[k], g=D.genes[i];
-      const x=k*sw-left, w=sw*0.82, x0=x+sw*0.09, x1=x0+w;
-      const hd=Math.min(16,w*0.3), yt=TOP, yb=TOP+AH, ym=TOP+AH/2;
+      const x=k*sw-left, w=sw*0.82, x0=x+sw*0.09, x1=x0+w, cx=x+sw/2;
+      const top=two&&g.st<0?LOW:TOP;
+      const hd=Math.min(16,w*0.3), yt=top, yb=top+AH, ym=top+AH/2;
       const pts=g.st>0
         ? `${x0},${yt} ${x1-hd},${yt} ${x1},${ym} ${x1-hd},${yb} ${x0},${yb}`
         : `${x1},${yt} ${x0+hd},${yt} ${x0},${ym} ${x0+hd},${yb} ${x1},${yb}`;
       const c=geneFill(g), nm=(g.nm||"(unnamed)");
-      out+=`<polygon class="gene" data-i="${i}" points="${pts}" fill="${c}" stroke="rgba(0,0,0,.35)" stroke-width="0.8"></polygon>`
-        +`<text x="${x+sw/2}" y="${TOP-26}" font-size="11" fill="#000" text-anchor="middle">${k+1}</text>`
-        +`<text x="${x+sw/2}" y="${TOP-10}" font-size="11.5" fill="#000" text-anchor="middle">${esc(nm.length>Math.floor(sw/7)?nm.slice(0,Math.max(6,Math.floor(sw/7)-1))+"…":nm)}</text>`
-        +`<text x="${x+sw/2}" y="${yb+16}" font-size="10.5" fill="#444" text-anchor="middle">${(g.s/1000).toFixed(1)}–${(g.e/1000).toFixed(1)} kb</text>`
-        +`<text x="${x+sw/2}" y="${yb+31}" font-size="10.5" fill="#444" text-anchor="middle">${g.st>0?"+":"−"} | ${pct(g.fin)}${g.rv?" | ⚑":""}</text>`;
+      // Narrow slots get the position only; wider ones the score too.
+      const kb=`${(g.s/1000).toFixed(1)}–${(g.e/1000).toFixed(1)} kb`+(sw>=150?` | ${pct(g.fin)}${g.rv?" | ⚑":""}`:"");
+      out+=`<polygon class="gene" data-i="${i}" points="${pts}" fill="${c}" stroke="rgba(0,0,0,.35)" stroke-width="0.8"></polygon>`;
+      if(!two){
+        out+=`<text x="${cx}" y="${TOP-26}" font-size="11" fill="#000" text-anchor="middle">${k+1}</text>`
+          +`<text x="${cx}" y="${TOP-10}" font-size="11.5" fill="#000" text-anchor="middle">${short(nm)}</text>`
+          +`<text x="${cx}" y="${yb+16}" font-size="10.5" fill="#444" text-anchor="middle">${(g.s/1000).toFixed(1)}–${(g.e/1000).toFixed(1)} kb</text>`
+          +`<text x="${cx}" y="${yb+31}" font-size="10.5" fill="#444" text-anchor="middle">${g.st>0?"+":"−"} | ${pct(g.fin)}${g.rv?" | ⚑":""}</text>`;
+      } else if(g.st>0){                       // upper track: labels above
+        out+=`<text x="${cx}" y="${yt-26}" font-size="11" fill="#000" text-anchor="middle">${k+1} | ${short(nm)}</text>`
+          +`<text x="${cx}" y="${yt-10}" font-size="10.5" fill="#444" text-anchor="middle">${kb}</text>`;
+      } else {                                  // lower track: labels below
+        out+=`<text x="${cx}" y="${yb+16}" font-size="10.5" fill="#444" text-anchor="middle">${kb}</text>`
+          +`<text x="${cx}" y="${yb+32}" font-size="11" fill="#000" text-anchor="middle">${k+1} | ${short(nm)}</text>`;
+      }
     }
     svgL.innerHTML=out;
     const lo=list[Math.min(first+1,list.length-1)], hi=list[Math.min(last,list.length-1)];
@@ -932,6 +1238,7 @@ const LIN=(function(){
   addEventListener("resize",()=>{ if(on) layout(); });
   selC.addEventListener("change",()=>{ ci=+selC.value; scroll.scrollLeft=0; layout(); });
   selN.addEventListener("change",()=>{ per=+selN.value||10; layout(); });
+  if(selS) selS.addEventListener("change",()=>{ two=selS.value==="two"; layout(); });
   svgL.addEventListener("click",e=>{ const t=e.target.closest(".gene"); if(!t) return;
     const i=+t.dataset.i, g=D.genes[i];
     if(mode==="operon"&&g.op) showOperon(g.op); else showGene(i); });
@@ -946,8 +1253,8 @@ const LIN=(function(){
     bC.classList.toggle("on",!linear); bL.classList.toggle("on",linear);
     if(linear) layout();
   }
-  bC.addEventListener("click",()=>show(false));
-  bL.addEventListener("click",()=>show(true));
+  /** The linear view at the start of one contig. */
+  function showContig(c){ ci=c; selC.value=String(c); scroll.scrollLeft=0; if(on) layout(); }
   /** Bring gene *i* into view, switching replicon if it sits on another. */
   function goto_(i){
     const g=D.genes[i]; if(!on) return;
@@ -956,7 +1263,25 @@ const LIN=(function(){
     scroll.scrollLeft=Math.max(0,(k-Math.floor(per/2))*slot());
     render();
   }
-  return {render, visible:()=>on, goto:goto_};
+  return {render, visible:()=>on, goto:goto_, show, showContig};
+})();
+
+// ---- the three views: circular, linear, contigs ----
+const VIEW=(function(){
+  const bC=document.getElementById("vCirc"), bL=document.getElementById("vLin"), bK=document.getElementById("vCtg");
+  const plateK=document.getElementById("ctgPlate");
+  if(MULTI&&bK) bK.hidden=false;
+  const what=document.getElementById("linWhat"); if(what&&MULTI) what.textContent="contig";
+  function set(v){
+    VIEWNOW=v; tell();
+    if(v==="ctg"){ LIN.show(false); document.getElementById("circPlate").hidden=true; plateK.hidden=false; renderContigList(); }
+    else { plateK.hidden=true; LIN.show(v==="lin"); }
+    bC.classList.toggle("on",v==="circ"); bL.classList.toggle("on",v==="lin"); if(bK) bK.classList.toggle("on",v==="ctg");
+  }
+  bC.addEventListener("click",()=>set("circ"));
+  bL.addEventListener("click",()=>set("lin"));
+  if(bK) bK.addEventListener("click",()=>set("ctg"));
+  return {set};
 })();
 
 // ---- mode toggle ----
@@ -974,7 +1299,7 @@ function setMode(m){
   panel.innerHTML=`<div class="empty">${m==="gene"
     ? "Click any gene arc for its full confidence scorecard (C1–C4, preliminary, final, review status)."
     : m==="review"
-    ? "Only the "+D.nFlag.toLocaleString()+" genes flagged for review are shown in colour. Click one for its scorecard — if it sits in an operon, use the operon link to jump to that operon."
+    ? "Only the "+D.nFlag.toLocaleString()+" genes flagged for review are shown in colour. Click one for its scores; if it sits in an operon, the operon link to jump to that operon."
     : "Click an operon to see its member genes and how genome context changed their confidence."}</div>`;
   paint();
 }
@@ -1136,6 +1461,8 @@ document.getElementById("sub").textContent=
   +D.genes.length.toLocaleString()+" genes  |  "+D.contigs.length.toLocaleString()
   +(DRAFT?" contigs (draft assembly)":" replicon"+(D.contigs.length>1?"s":""))
   +"  |  "+D.nOperons.toLocaleString()+" operons  |  "+D.nFlag.toLocaleString()+" flagged";
+readShow();
+addEventListener("hashchange",()=>{ readShow(); paint(); });
 setMode("gene");
 </script>
 </body>
