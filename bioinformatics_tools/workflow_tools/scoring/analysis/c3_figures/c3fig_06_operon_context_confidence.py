@@ -1,43 +1,8 @@
-"""Figure 60 - Operon Context Confidence (OCC): an INDEPENDENT, per-gene operon
-reliability factor derived purely from pan-genome co-occurrence (figs 01-05).
+"""Figure 60 - Operon Context Confidence (OCC), a per-gene operon reliability factor.
 
-THE QUESTION (operon-index thread)
-==================================
-figs 01-05 established that (a) within-operon functional co-occurrence is a
-conserved, pan-genome signal; (b) recurrence - not raw partner count - is what
-earns trust (figs 03/04); and (c) UniOP's per-pair probability is orthogonal to
-that co-occurrence (fig 05).  Can we fold all of this into a single number, per
-candidate gene, that says how reliable its operon placement is - WITHOUT using
-the deterministic C1/C4 scores, so it is an independent predictor?
-
-THE FACTOR (see c3_occ.py for the full derivation)
-==================================================
-Gate: only operons with a strict informative majority (n_inf > n_unf) provide
-context (all-hypothetical / info-minority operons are excluded).
-For each functional pair we build, across all genomes, a recurrence-aware
-conditional co-occurrence (Jeffreys 95% lower bound) x an enrichment safeguard,
-in two channels - immediate-neighbour (adj) and same-operon (op).  A gene's OCC
-is the noisy-OR over its partners:
-        OCC(g) = 1 - PROD_neighbours(1-rho_adj) * PROD_comembers(1-rho_op)
-Uninformative genes in a qualifying operon inherit the operon's mean OCC.
-
-FINDING (panels)
-================
-(a) OCC spreads the full [0,1] range (median ~0.40): it genuinely discriminates.
-    A known-conserved class - ribosomal proteins - piles up near 1 (median ~0.92).
-(b) Worked examples: conserved multi-partner genes (ribosomal, NADH dehydrogenase,
-    flagellar) score ~1; context-free genes (transposases, lone transporters)
-    score ~0 - exactly the intended biology.
-(c) OCC is INDEPENDENT of the base signals: Spearman vs C4 ~ 0.02, vs UniOP
-    per-pair prob ~ 0.03 (orthogonal, echoing fig 05), vs C1 ~ 0.26 (both merely
-    prefer informative genes).  OCC therefore adds new information.
-(d) OCC rises with operon size, and that rise SURVIVES a link-reliability floor
-    (0 -> 0.20 barely moves it): the high scores of large operons come from
-    genuinely conserved links (flagellar / ribosomal / capsular modules), not
-    noisy-OR inflation over coincidental partners.
-
-Read-only prototype; the production scorer is untouched.  How OCC is folded into
-C1/C4 (log-odds shift around a neutral pivot) is left to the caller.
+Scores every gene with c3_occ and shows (a) the OCC distribution with ribosomal
+proteins overlaid, (b) high and low worked examples, (c) Spearman correlation
+with C1, C4 and UniOP probability, (d) OCC by operon size with a 0.20 link floor.
 """
 import sys
 from pathlib import Path
@@ -58,16 +23,17 @@ SIZE_COL = [L.RED, L.ORANGE, L.AMBER, L.TEAL, L.GREEN]
 
 
 def make(genes, operons, outdir):
+    """Builds the OCC reference, scores all genes and draws the four panels and TSVs."""
     run_root = outdir.parents[3]
     ref = O.build_reference(genes, run_root)
     df = O.compute_all_genes(genes, run_root, ref=ref)
     occ0 = df.attrs["occ0"]
     inf = df[~df["uninformative"]].copy()
 
-    # operon size (informative context + self) for the inflation panel
+    # Operon size counts the informative context plus the gene itself.
     inf["op_size"] = inf["n_inf_context"] + 1
 
-    # ---- independence vs the base signals ----------------------------------
+    # ---- independence vs the base signals ----
     base = genes[["organism", "feature_id", "c1_score", "c4_score", "operon_prob"]]
     m = inf.merge(base, on=["organism", "feature_id"], how="left")
     corr = {}
@@ -75,14 +41,16 @@ def make(genes, operons, outdir):
         s = m[["occ", col]].apply(pd.to_numeric, errors="coerce").dropna()
         corr[col] = (spearmanr(s["occ"], s[col]).correlation, len(s))
 
-    # ---- worked examples ----------------------------------------------------
+    # ---- worked examples ----
     def _best_instance(mask):
+        """Returns the highest-OCC gene matching mask, or None."""
         sub = inf[mask]
         if not len(sub):
             return None
         return sub.sort_values(["occ", "n_partners"], ascending=[False, False]).iloc[0]
 
     def _worst_instance(mask):
+        """Returns the lowest-OCC gene matching mask, or None."""
         sub = inf[mask]
         if not len(sub):
             return None
@@ -106,6 +74,7 @@ def make(genes, operons, outdir):
     ]
 
     def _pick(specs, hi):
+        """Returns one best (hi) or worst gene per descriptor spec, without repeats."""
         out = []
         seen = set()
         for desc, mode, _tag in specs:
@@ -126,7 +95,7 @@ def make(genes, operons, outdir):
     hi_ex = _pick(high_specs, True)[:5]
     lo_ex = _pick(low_specs, False)[:5]
 
-    # ---- size / floor robustness (reuse ref; floor only affects aggregation) --
+    # ---- size / floor robustness (link_floor only affects aggregation, so ref is reused) ----
     ref["params"]["link_floor"] = 0.20
     df_floor = O.compute_all_genes(genes, run_root, ref=ref)
     ref["params"]["link_floor"] = 0.0
@@ -134,6 +103,7 @@ def make(genes, operons, outdir):
     inf_f["op_size"] = inf_f["n_inf_context"] + 1
 
     def _band_means(frame):
+        """Returns (mean OCC, n) for each operon-size band."""
         out = []
         for lo, hi in SIZE_BANDS:
             s = frame[(frame["op_size"] >= lo) & (frame["op_size"] <= hi)]
@@ -143,14 +113,14 @@ def make(genes, operons, outdir):
     band0 = _band_means(inf)
     bandf = _band_means(inf_f)
 
-    # ======================= FIGURE =========================================
+    # ---- figure ----
     fig, axes = plt.subplots(2, 2, figsize=(15.8, 12.8))
     axA, axB, axC, axD = axes.ravel()
     fig.suptitle("Operon Context Confidence (OCC): an independent, per-gene operon-reliability factor "
                  "from pan-genome co-occurrence",
                  fontsize=15, fontweight="bold", y=0.986)
 
-    # ---- (a) OCC distribution + ribosomal overlay --------------------------
+    # ---- (a) OCC distribution + ribosomal overlay ----
     rib = inf[inf["clean_descriptor"].str.contains("ribosomal protein", na=False)]["occ"]
     edges = np.linspace(0, 1, 41)
     axA.hist(inf["occ"], bins=edges, color=L.BLUE, alpha=0.75,
@@ -176,7 +146,7 @@ def make(genes, operons, outdir):
     axA.grid(False)
     L.boldticks(axA)
 
-    # ---- (b) worked examples ----------------------------------------------
+    # ---- (b) worked examples ----
     ex = [(r, L.BLUE) for r in hi_ex] + [(r, L.RED) for r in lo_ex]
     ex.sort(key=lambda t: t[0]["occ"])
     yy = np.arange(len(ex))
@@ -213,7 +183,7 @@ def make(genes, operons, outdir):
     axB.grid(False)
     L.boldticks(axB)
 
-    # ---- (c) independence from the base signals ----------------------------
+    # ---- (c) independence from the base signals ----
     s = m[["occ", "operon_prob"]].apply(pd.to_numeric, errors="coerce").dropna()
     hb = axC.hexbin(s["operon_prob"], s["occ"], gridsize=42, cmap="viridis",
                     bins="log", mincnt=1)
@@ -237,7 +207,7 @@ def make(genes, operons, outdir):
     axC.grid(False)
     L.boldticks(axC)
 
-    # ---- (d) size relationship survives a reliability floor ----------------
+    # ---- (d) size relationship survives a reliability floor ----
     xb = np.arange(len(SIZE_BANDS))
     w = 0.38
     axD.bar(xb - w / 2, [b[0] for b in band0], width=w, color=L.BLUE,
@@ -268,7 +238,7 @@ def make(genes, operons, outdir):
     fig.tight_layout(rect=[0, 0, 1, 0.965])
     L.savefig(fig, outdir / "fig06_operon_context_confidence.png")
 
-    # ---- TSVs --------------------------------------------------------------
+    # ---- TSVs ----
     per_gene = df.sort_values(["occ", "organism"], ascending=[False, True])
     L.write_tsv(per_gene, outdir / "fig06_per_gene_occ.tsv")
 
@@ -292,7 +262,7 @@ def make(genes, operons, outdir):
                      "n": bf[1]})
     L.write_tsv(pd.DataFrame(summ), outdir / "fig06_summary.tsv")
 
-    # worked-examples table
+    # Worked-examples table.
     exrows = []
     for r, _ in ex:
         exrows.append(dict(clean_descriptor=r["clean_descriptor"],

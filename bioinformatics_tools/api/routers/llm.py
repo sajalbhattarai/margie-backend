@@ -1,22 +1,8 @@
-"""Genome chat -- evidence-grounded Q&A over a finished run.
+"""Genome chat: evidence-grounded Q&A over a finished run's FINAL table.
 
-Separate from phase15 (workflow_tools/llm/score-genes-llm.py), which *produces*
-scores as part of a run using the LoRA-fused model. This only *explains*
-results that already exist, and it runs the BASE model: the fuse was trained to
-emit a score, and the behaviour needed here is the opposite -- say "the evidence
-does not answer that" instead of producing a confident number.
-
-Route:  POST /v1/llm/chat  -> {"answer": str, "context_summary": {...}}
-        GET  /v1/llm/status -> whether the inference endpoint is up
-
-Grounding: the browser sends only an IDENTIFIER (job + organism + optional
-gene/operon). This module rebuilds the context server-side from that job's own
-FINAL table, so a tampered page cannot widen its own grounding -- constraining
-the context is the entire point of the feature.
-
-The model is reached via chat_server.py running on a GPU node, discovered
-through the advert file it publishes. No advert = chat is offline, which is
-reported as a clean 503 rather than an error.
+Routes under /v1/llm: start, stop, status, chat. The browser sends only job, organism and optional gene;
+the context is rebuilt server-side from that job's FINAL table. The BASE model (not the scoring fuse)
+runs in chat_server.py on a GPU node, found through its advert file; no advert means a 503.
 """
 from __future__ import annotations
 
@@ -50,11 +36,7 @@ ADVERT_PATH = Path(os.getenv(
 FINAL_TSV = "FINAL_ANNOTATION_WITH_CONFIDENCE.tsv"
 TIERS = ["highest", "high", "medium", "fair", "low"]
 
-# Carried over from score-genes-llm.py's SYSTEM_PROMPT where it still applies.
-# Those scoping rules encode real failure modes this pipeline already hit --
-# neighbour evidence being attributed to the candidate gene, and EC granularity
-# being read as conflict -- so they are repeated verbatim in intent rather than
-# reinvented. What is new is the grounding contract and the citation duty.
+# Scoping rules shared with score-genes-llm.py's SYSTEM_PROMPT, plus the grounding and citation rules.
 SYSTEM_PROMPT = """\
 You are explaining the results of a MARGIE(SB) genome annotation to the person \
 who ran it. You are given that pipeline's own records. Explain what they mean. \
@@ -143,25 +125,21 @@ do not list facts that were not asked for."""
 
 
 class ChatRequest(BaseModel):
+    """Body of POST /chat."""
     job_id: str
     organism: str                 # organism folder name inside the run
     question: str
     gene_id: str | None = None    # optional: narrows context to one gene
     max_tokens: int = 1000
     stream: bool = False
-    # Recent turns, oldest first: [{"role": "you"|"margie", "text": ...}].
-    # Capped server-side -- an unbounded transcript would undo the prompt
-    # trimming and slow every answer down again.
+    # Recent turns, oldest first: [{"role": "you"|"margie", "text": ...}]; capped server-side.
     history: list[dict] = []
-    # The gene the previous answer was about. Sent back by the client so a
-    # follow-up ("tell me about the gene", "what does its operon say?") stays on
-    # the same subject. Guessing it from the transcript is unreliable: the
-    # concatenated history matches many genes and the top hit is arbitrary.
+    # Gene the previous answer was about, echoed by the client so follow-ups stay on it.
     subject_gene_id: str | None = None
 
 
 def _endpoint() -> dict:
-    """Current inference endpoint, or 503 if chat is not running."""
+    """Returns the inference endpoint from the advert file, or raises 503 if chat is not running."""
     if not ADVERT_PATH.is_file():
         raise HTTPException(
             status_code=503,
@@ -176,11 +154,10 @@ def _endpoint() -> dict:
 
 
 def _read_final(job_id: str, organism: str, current_user: dict) -> list[dict]:
-    """Read this organism's FINAL table off the user's cluster."""
+    """Reads this organism's FINAL table from the user's cluster as a list of row dicts."""
     conn = _build_connection(current_user)
     work_dir = _resolve_job_work_dir(job_id, current_user, conn)
-    # Post-reorganize the FINAL table sits at the organism top level; mid-run it
-    # is still under scoring/. Try both rather than assuming a layout.
+    # The table is at the organism top level after reorganising, under scoring/ mid-run.
     for rel in (f"{organism}/{FINAL_TSV}", f"{organism}/scoring/{FINAL_TSV}"):
         try:
             raw = b"".join(ssh_sftp.stream_remote_file(f"{work_dir}/{rel}", connection=conn))
@@ -195,7 +172,7 @@ def _read_final(job_id: str, organism: str, current_user: dict) -> list[dict]:
 
 
 def _col(row: dict, name: str) -> str:
-    """FINAL tables carry prefixed headers ('Column-AS: CONFIDENCE_TIER')."""
+    """Returns a cell by bare column name, matching prefixed headers ('Column-AS: CONFIDENCE_TIER')."""
     if name in row:
         return (row[name] or "").strip()
     for k, v in row.items():
@@ -204,9 +181,7 @@ def _col(row: dict, name: str) -> str:
     return ""
 
 
-# Fields worth naming explicitly. The model cannot reason about a table whose
-# columns it has never been told the meaning of -- without this it treats every
-# header as opaque and falls back on genome totals.
+# Meanings of the key FINAL columns, given to the model so it can read per-gene records.
 _SCHEMA_HELP = {
     "gene_id": "gene identifier, <accession>_<start><strand><len>",
     "organism_name": "genome this gene belongs to",
@@ -233,7 +208,7 @@ _SCHEMA_HELP = {
 
 
 def _schema_block(rows: list[dict]) -> str:
-    """Tell the model what this run's FINAL table actually contains."""
+    """Lists this run's FINAL table columns with their meanings for the prompt."""
     if not rows:
         return ""
     names = []
@@ -246,13 +221,7 @@ def _schema_block(rows: list[dict]) -> str:
             f"{len(rows)} rows, {len(names)} columns:\n" + "\n".join(names))
 
 
-# Words that must never drive retrieval. Two groups:
-#   * ordinary question words
-#   * SCHEMA vocabulary -- "operon" appears in every operonic gene's
-#     UniOP_OPERON_id, "descriptor"/"tier"/"confidence" name columns. Matching on
-#     these selects an essentially arbitrary gene, which is exactly how "what
-#     does operon say about this gene?" landed on an unrelated formate
-#     dehydrogenase instead of the gene under discussion.
+# Words ignored in retrieval: question words and schema vocabulary, which would match arbitrary genes.
 _STOPWORDS = {
     "what", "which", "does", "have", "this", "that", "gene", "genes", "genome",
     "about", "there", "any", "can", "you", "tell", "give", "more", "into",
@@ -266,57 +235,39 @@ _STOPWORDS = {
     "annotation", "annotated", "evidence", "database", "databases", "tool",
     "tools", "hit", "hits", "value", "values", "column", "columns", "final",
 }
-# A token this short can substring-match almost anything -- a typo like "abot"
-# matched an unrelated descriptor and made the code believe it had resolved the
-# gene, which suppressed the conversation fallback entirely. Retrieval only
-# trusts tokens long enough to be distinctive.
+# Shorter tokens substring-match too much to be used for retrieval.
 _MIN_TOKEN = 5
 
 
 def _search_genes(rows: list[dict], question: str, limit: int = 6) -> list[dict]:
-    """Rows whose label/id matches meaningful words in the question.
-
-    Without this the model is handed genome totals and nothing else, and when
-    asked about a named gene it invents a per-gene answer from an aggregate --
-    the exact failure this is here to remove.
-    """
+    """Returns the rows best matching the question's distinctive words or coordinates, best first."""
     q = question.lower()
     words = {w for w in re.findall(r"[A-Za-z0-9_.\-]+", q)
              if len(w) >= _MIN_TOKEN and w not in _STOPWORDS}
 
-    # Any handle should reach the same record, so coordinates count as a handle
-    # too: "the gene at 1,234,500" or "genes between 10000 and 20000". Commas
-    # are stripped first -- people write positions with thousands separators.
+    # Numbers in the question are also matched as coordinates, thousands separators removed.
     coords = [int(n) for n in re.findall(r"\d{3,}", q.replace(",", ""))]
 
     scored = []
     for r in rows:
-        # Every textual handle the row carries: id, label, operon, feature id,
-        # EC numbers, locus tag. Matching on one of these must land the same
-        # row as matching on any other.
+        # All textual handles of the row: id, product, operon, feature id, EC status.
         hay = " ".join(filter(None, (
             _col(r, "gene_id"),
-            # The product name really is best_consensus_product_descriptor --
-            # there is no canonical_label column in this table. Column-AW is
-            # the same value copied for convenience; both are matched so either
-            # spelling of the question lands the row.
             _col(r, "best_consensus_product_descriptor"),
             _col(r, "BEST_PRODUCT_DESCRIPTOR(copied_here_for_convenience)"),
             _col(r, "UniOP_OPERON_id"), _col(r, "RAST_feature_id"),
             _col(r, "EC_EVIDENCE_STATUS"),
         ))).lower()
-        # Weight by token length: "glycosyl_hydrolase_malt_phosph" is far
-        # stronger evidence than a 5-letter fragment.
+        # Longer matched tokens weigh more.
         hits = sum(len(w) for w in words if w in hay) if hay else 0
 
-        # Positional match: a coordinate falling inside the gene is a strong
-        # signal, so it outranks a loose word match.
+        # A coordinate inside the gene outranks word matches.
         if coords:
             try:
                 s, e = int(_col(r, "RAST_start")), int(_col(r, "RAST_end"))
                 lo, hi = min(s, e), max(s, e)
                 if any(lo <= c <= hi for c in coords):
-                    hits += 40   # a coordinate inside the gene is decisive
+                    hits += 40
             except (ValueError, TypeError):
                 pass
 
@@ -326,14 +277,13 @@ def _search_genes(rows: list[dict], question: str, limit: int = 6) -> list[dict]
     return [r for _, r in scored[:limit]]
 
 
-# Context-only records exist so the model can tell "that is a different gene".
-# They do not need 49 columns each to do that job -- rendering them in full was
-# 62k of a 65k-character prompt, i.e. the entire latency problem.
+# Fields shown for context-only records, kept short to limit prompt size.
 _BRIEF_FIELDS = ("gene_id", "best_consensus_product_descriptor", "CONFIDENCE_TIER",
                  "NEEDS_REVIEW?", "UniOP_OPERON_id", "RAST_start", "RAST_end")
 
 
 def _render_brief(r: dict) -> str:
+    """Renders a context-only record as one line of key fields."""
     bits = []
     for f in _BRIEF_FIELDS:
         v = _col(r, f)
@@ -343,6 +293,7 @@ def _render_brief(r: dict) -> str:
 
 
 def _render_gene(r: dict) -> str:
+    """Renders a gene's full record, omitting the sequence and truncating long values."""
     out = []
     for k, v in r.items():
         if not k:
@@ -354,16 +305,14 @@ def _render_gene(r: dict) -> str:
         if bare == "RAST_na_sequence":
             v = f"<{len(v)} nt, omitted>"
         elif len(v) > 600:
-            # Audit trails and reasoning strings run to thousands of characters.
-            # Keep the head -- that is where the substance is -- and say it was cut
-            # so the model does not treat the tail as absent.
+            # Long audit strings keep their head and are marked as truncated.
             v = v[:600] + f" …[truncated, {len(v)} chars total]"
         out.append(f"    {bare}: {v}")
     return "\n".join(out)
 
 
 def _genome_context(rows: list[dict], organism: str) -> tuple[str, dict]:
-    """Whole-genome scope: aggregates only. Per-gene records cannot fit."""
+    """Builds whole-genome context from aggregate counts only; returns (text, summary)."""
     tally = {t: 0 for t in TIERS}
     noncoding = flagged = operonic = 0
     for r in rows:
@@ -388,7 +337,7 @@ def _genome_context(rows: list[dict], organism: str) -> tuple[str, dict]:
 
 
 def _gene_context(rows: list[dict], gene_id: str, organism: str) -> tuple[str, dict]:
-    """Single-gene scope: that gene's full FINAL record, verbatim."""
+    """Builds single-gene context from that gene's full FINAL record; returns (text, summary)."""
     match = next((r for r in rows if _col(r, "gene_id") == gene_id), None)
     if match is None:
         raise HTTPException(status_code=404, detail=f"gene_id '{gene_id}' not in this organism.")
@@ -401,7 +350,7 @@ def _gene_context(rows: list[dict], gene_id: str, organism: str) -> tuple[str, d
         v = (v or "").strip()
         if not v:
             continue
-        # The nucleotide sequence is long and never the subject of a question.
+        # The nucleotide sequence is omitted.
         if k.split(":")[-1].strip() == "RAST_na_sequence":
             v = f"<{len(v)} nt, omitted>"
         lines.append(f"  {k.split(':')[-1].strip()}: {v}")
@@ -410,12 +359,7 @@ def _gene_context(rows: list[dict], gene_id: str, organism: str) -> tuple[str, d
 
 
 def _resolve_model_path(current_user: dict) -> str:
-    """<db_root>/llm/base, where db_root is the database folder the user set in
-    the GUI. Never hardcoded: the whole point of the Profile setting is that the
-    database lives wherever the user put it.
-
-    The BASE model deliberately, not fused-model — see this module's docstring.
-    """
+    """Returns the base model folder <llm root>/base from the user's cluster config or Profile db_root."""
     conn = _build_connection(current_user)
     home = current_user["home_dir"]
     cfg = {}
@@ -425,9 +369,7 @@ def _resolve_model_path(current_user: dict) -> str:
     except Exception as exc:
         LOGGER.warning("Could not read config for db_root: %s", exc)
 
-    # Same precedence the workflow uses: an explicit db.llm wins, else
-    # <workflow>.db_root/llm. db_path() itself is Snakemake-side, so the two
-    # keys are read directly here rather than importing the workflow config.
+    # Same precedence as the workflow's db_path(): db.llm, else <workflow>.db_root/llm.
     explicit = (cfg.get("db") or {}).get("llm")
     root = None
     if explicit:
@@ -452,11 +394,8 @@ def _resolve_model_path(current_user: dict) -> str:
 
 @router.post("/start")
 def start_chat(current_user: dict = Depends(get_current_user)):
-    """Submit the GPU job that hosts the chat model — the 'Start chat' button.
-
-    Chat needs a resident model, and a SLURM allocation is the only way to hold
-    one on this cluster. Returns immediately with the job id; the model takes a
-    minute or two to load, during which /status reports offline.
+    """Submits the GPU SLURM job that hosts the chat model and returns its job id.
+    /status reports offline until the model has loaded.
     """
     if ADVERT_PATH.is_file():
         st = chat_status(current_user)
@@ -475,7 +414,7 @@ def start_chat(current_user: dict = Depends(get_current_user)):
                 detail=f"Base model not found at {model}. Check the database "
                        "folder set in Profile.",
             )
-        # Backend location is wherever this package lives on the cluster.
+        # The backend path is this package's location on the cluster.
         backend = str(Path(__file__).resolve().parents[3])
         sbatch = f"{backend}/bioinformatics_tools/workflow_tools/llm/chat-server.sbatch"
         cmd = (f"MARGIE_LLM_MODEL={model!r} MARGIE_BACKEND={backend!r} "
@@ -487,7 +426,7 @@ def start_chat(current_user: dict = Depends(get_current_user)):
             raise HTTPException(status_code=500,
                                 detail=f"sbatch failed: {stderr or job or 'no job id'}")
     finally:
-        pass  # pooled client: closing it would break concurrent requests (see SSHConnection pool)
+        pass  # pooled client: closing it would break concurrent requests
 
     LOGGER.info("chat server submitted as job %s (model %s)", job, model)
     return {"started": True, "job_id": job, "model": model,
@@ -497,12 +436,8 @@ def start_chat(current_user: dict = Depends(get_current_user)):
 
 @router.post("/stop")
 def stop_chat(current_user: dict = Depends(get_current_user)):
-    """End interactive mode — called when the map page is closed.
-
-    Asks the server to exit (which frees the GPU and removes its advert). This
-    is the fast path only: it never arrives if the browser crashed, the laptop
-    slept, or the network dropped, so chat_server also exits on its own idle
-    timeout. Never rely on this alone to release a GPU.
+    """Asks the chat server to exit, freeing the GPU; called when the map page closes.
+    chat_server also exits on its own idle timeout, since this call may never arrive.
     """
     if not ADVERT_PATH.is_file():
         return {"stopped": False, "detail": "chat was not running"}
@@ -516,8 +451,7 @@ def stop_chat(current_user: dict = Depends(get_current_user)):
         LOGGER.info("chat server on %s asked to stop", adv.get("host"))
         return {"stopped": True}
     except Exception as exc:
-        # Unreachable means it is already gone; clear the stale advert so the
-        # UI stops pointing at a dead endpoint.
+        # An unreachable server is already gone, so the stale advert is removed.
         try:
             ADVERT_PATH.unlink()
         except Exception:
@@ -527,7 +461,7 @@ def stop_chat(current_user: dict = Depends(get_current_user)):
 
 @router.get("/status")
 def chat_status(current_user: dict = Depends(get_current_user)):
-    """Whether the chat backend is reachable — lets the UI show an honest state."""
+    """Reports whether the chat backend answers its health check."""
     if not ADVERT_PATH.is_file():
         return {"online": False, "detail": "no inference server running"}
     try:
@@ -537,12 +471,13 @@ def chat_status(current_user: dict = Depends(get_current_user)):
             return {"online": True, "model": json.loads(r.read()).get("model", ""),
                     "host": adv["host"]}
     except Exception as exc:
-        # Advert present but unreachable => the job died without cleaning up.
+        # An advert without a responding server means the job died without cleaning up.
         return {"online": False, "detail": f"endpoint not responding: {exc}"}
 
 
 @router.post("/chat")
 def chat(body: ChatRequest, current_user: dict = Depends(get_current_user)):
+    """Answers a question grounded in the job's FINAL table, as JSON or a text stream."""
     question = (body.question or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
@@ -550,14 +485,13 @@ def chat(body: ChatRequest, current_user: dict = Depends(get_current_user)):
     ep = _endpoint()
     rows = _read_final(body.job_id, body.organism, current_user)
 
-    # Keep the last few turns, truncated. Enough for "it"/"that gene" to resolve,
-    # not enough to reintroduce the prompt bloat just removed.
+    # Keeps the last six turns, each truncated, for resolving "it" and "that gene".
     hist = [h for h in (body.history or [])
             if isinstance(h, dict) and (h.get("text") or "").strip()][-6:]
     hist_text = "\n".join(
         f"{'USER' if h.get('role') == 'you' else 'YOU'}: {(h.get('text') or '')[:800]}"
         for h in hist)
-    # What the user has said, for resolving references in the current question.
+    # The user's earlier turns, used to resolve follow-up references.
     prior_user = " ".join((h.get("text") or "") for h in hist
                           if h.get("role") == "you")
 
@@ -566,31 +500,20 @@ def chat(body: ChatRequest, current_user: dict = Depends(get_current_user)):
         matched = []
     else:
         context, summary = _genome_context(rows, body.organism)
-        # Pull in the full record of any gene the question names. Aggregates
-        # alone caused the model to answer per-gene questions from genome
-        # totals ("the gene is not flagged" from a count of 1212 flagged).
+        # Adds the full record of any gene the question names.
         matched = _search_genes(rows, question)
-        # A follow-up ("look more into it", "what about its neighbours") names
-        # no gene, so searching the question alone finds nothing and the answer
-        # silently falls back to genome aggregates -- which is how the earlier
-        # wrong-gene answers happened. Retry against what the user asked before.
+        # A follow-up that names no gene falls back to the previous subject, then earlier turns.
         if not matched and body.subject_gene_id:
-            # Most reliable: the client tells us what the last answer was about.
             keep = [r for r in rows if _col(r, "gene_id") == body.subject_gene_id]
             if keep:
                 matched = keep
                 LOGGER.info("follow-up stayed on subject gene %s", body.subject_gene_id)
         if not matched and prior_user:
-            # Fallback for a client that does not track the subject, or a first
-            # follow-up after a page reload.
             matched = _search_genes(rows, prior_user)
             if matched:
                 LOGGER.info("resolved follow-up via prior turns -> %s",
                             _col(matched[0], "gene_id"))
-        # An operon can only be interpreted from its MEMBERS -- their products,
-        # order and strands are the whole signal. If a matched gene sits in an
-        # operon, pull in its siblings so the model reasons about the unit
-        # rather than one gene in isolation.
+        # Adds the other members of any matched gene's operon.
         if matched:
             member_of = {_col(r, "UniOP_OPERON_id") for r in matched}
             member_of = {o for o in member_of if o.startswith("operon_")}
@@ -599,14 +522,10 @@ def chat(body: ChatRequest, current_user: dict = Depends(get_current_user)):
                 siblings = [r for r in rows
                             if _col(r, "UniOP_OPERON_id") in member_of
                             and id(r) not in have]
-                # Cap: a large operon would otherwise crowd out the question.
+                # Capped so a large operon does not crowd out the question.
                 matched = matched + siblings[:24]
         if matched:
-            # The first match is the best-scoring one. Label it as THE subject
-            # and everything else as background, or the model blends several
-            # genes into a single answer -- observed in use: asked about DNA
-            # helicase RecQ, it described a pilus assembly protein from another
-            # operon, complete with that gene's scores.
+            # The best match is labelled the subject and the rest context-only, so the model does not blend genes.
             primary, others = matched[0], matched[1:]
             context += (
                 "\n\nTHE GENE THIS QUESTION IS ABOUT — answer about THIS record "
@@ -660,9 +579,7 @@ def chat(body: ChatRequest, current_user: dict = Depends(get_current_user)):
             raise HTTPException(status_code=500, detail=f"Chat failed: {exc}")
         return {"answer": answer, "context_summary": summary, "model": ep["model"]}
 
-    # Streaming. The connection is opened here rather than inside the generator
-    # so an unreachable backend still becomes a clean 503 -- once StreamingResponse
-    # has begun, the status is already sent and errors can only go in the body.
+    # Streaming: the upstream connection opens before StreamingResponse so an unreachable backend is still a 503.
     try:
         upstream = urllib.request.urlopen(req, timeout=300)
     except urllib.error.URLError as exc:
@@ -671,6 +588,7 @@ def chat(body: ChatRequest, current_user: dict = Depends(get_current_user)):
             detail=f"Chat backend unreachable: {exc}. It may have hit walltime.")
 
     def relay():
+        """Relays the upstream answer in small chunks."""
         try:
             while True:
                 chunk = upstream.read(64)
@@ -686,8 +604,7 @@ def chat(body: ChatRequest, current_user: dict = Depends(get_current_user)):
     return StreamingResponse(
         relay(), media_type="text/plain; charset=utf-8",
         headers={
-            # The summary cannot go in the body -- that is the answer text --
-            # so it rides along as a header the client reads before streaming.
+            # The body is the answer text, so the summary travels as a header.
             "X-Context-Summary": json.dumps(summary),
             "X-Model": ep["model"],
             "Cache-Control": "no-cache",

@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
-"""detect-columns.py — Stage 1 of margie_sb's consolidation pipeline.
+"""detect-columns.py — stage 1 of consolidation.
 
-A discovery/diagnostic step: scans output/<genome>/ and reports what's
-actually there before merge-all-columns.py commits to a join -- which
-tool directories exist, their real (raw) column names vs. how they'll be
-normalised/prefixed, a real sample value per column, whether a gene can
-ever have more than one row for that tool, and (when it can) exactly what
-row-key strategy merge-all-columns.py will use to join those rows.
-
-Pure inspection -- writes nothing back, never joins anything. Safe to run
-any time as a sanity check, including against a genome that hasn't been
-merged yet.
-
-Output is JSON (detected-columns.json), not TSV -- this is inherently
-nested per-tool metadata (a list of columns per tool, a key spec per
-tool), which doesn't flatten cleanly into one TSV row shape.
+Scans output/<genome>/ and reports, per tool table, the raw and normalised
+columns, a sample value per column, and the row-key strategy used for genes
+with several rows. Read-only; writes detected-columns.json.
 """
 from __future__ import annotations
 
@@ -32,6 +21,7 @@ from _shared import (
 
 
 def first_real_sample(table: ToolTable, col: str) -> str:
+    """Returns the first non-empty value of a column in the table."""
     for rows in table.rows_by_feature.values():
         for row in rows:
             val = row.get(col, "")
@@ -41,12 +31,14 @@ def first_real_sample(table: ToolTable, col: str) -> str:
 
 
 def max_rows_per_gene(table: ToolTable) -> int:
+    """Returns the largest number of rows any one gene has in the table."""
     if not table.rows_by_feature:
         return 0
     return max(len(rows) for rows in table.rows_by_feature.values())
 
 
 def describe_tool(table: ToolTable) -> dict:
+    """Builds the JSON report entry for one tool table."""
     max_rows = max_rows_per_gene(table)
     multi_row_capable = max_rows > 1
     spec = resolve_key_spec(table.tool_name)
@@ -75,6 +67,7 @@ def describe_tool(table: ToolTable) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parses the command-line options with argparse."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input-root", required=True,
@@ -86,6 +79,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Discovers and loads every tool table and writes the column report as JSON."""
     args = parse_args()
 
     output_root = Path(args.input_root)

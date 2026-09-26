@@ -1,44 +1,11 @@
 #!/usr/bin/env python3
-"""score-c1-tool-coverage.py — margie_sb phase11 (scoring), metric C1:
-tool coverage.
+"""score-c1-tool-coverage.py — scoring stage, metric C1: tool coverage.
 
-Reads labeled-genes.tsv and labeled-genes-cluster-agreement.tsv (both
-phase10, READ-ONLY) and computes, per gene, how many of 7 INDEPENDENT
-evidence sources gave an INFORMATIVE hit -- not just any hit. A bare
-"Domain of unknown function" counts as a tool finding nothing useful,
-same is_uninformative() gate assign-canonical-label.py already applies
-when picking the best hit per tool.
-
-C1 = informative_source_count / 7
-
-7 independent sources, justified empirically on the 1,097-gene
-calibration set:
-
-  RAST, KEGG, EGGNOG, COG, PFAM, UNIPROT — each independently curated
-  databases with distinct methodologies and zero mutual dependency.
-
-  TIGRFAM_CLUSTER — PGAP, TIGRFAM, and NCBIfam collapsed into one slot.
-  NCBIfam absorbed TIGRFAM outright; PGAP's HMM library is built from
-  NCBIfam models. Empirically: 0 genes where TIGRFAM hits but NCBIFAM
-  misses; only 1 gene where PGAP hits but NCBIFAM misses. All three are
-  one independent signal.
-
-Excluded from the denominator:
-  HAMAP, PIRSF — empirically 0 unique hits beyond COG+PFAM+EGGNOG+NCBIFAM
-  on the calibration set; their models overlap completely with those tools.
-  CDD — a meta-database aggregating PFAM/TIGRFAM/COG models; by
-  construction not independent.
-  GENEPROP — uses TIGRFAM HMMs internally; every GENEPROP hit is already
-  a TIGRFAM/NCBIFAM hit. Contributes pathway-level context (relevant to
-  C3) but not independent gene-level coverage.
-  MEROPS/TCDB/DBCAN — narrow specialist DBs that structurally cannot hit
-  most genes; excluded to avoid capping non-specialist genes below 1.0.
-
-Output (labeled-genes-c1-tool-coverage.tsv): identity columns, c1_score,
-c1_informative_tool_count, c1_total_tools_considered, c1_informative_tools
-(which specific sources counted, for traceability -- not just the bare
-number), and c1_formula (the literal arithmetic as text, e.g.
-"6/7 = 0.8571", so the score is auditable from this column alone).
+C1 = informative sources / 7, over RAST, KEGG, EGGNOG, COG, PFAM, UNIPROT and
+one TIGRFAM cluster slot (PGAP/TIGRFAM/NCBIfam share models). A hit counts only
+if its description is informative. HAMAP, PIRSF, CDD and GENEPROP overlap the
+counted tools, and MEROPS/TCDB/DBCAN cover few genes, so none are counted.
+Writes the score, count, contributing tools and a "k/7 = x" formula per gene.
 """
 import argparse
 import csv
@@ -48,8 +15,7 @@ from pathlib import Path
 
 csv.field_size_limit(10_000_000)
 
-# Standalone, mutually-independent decision tools -- everything except
-# the TIGRFAM/PGAP/NCBIfam cluster, which collapses to one slot below.
+# Independent decision tools; TIGRFAM/PGAP/NCBIfam count as one slot.
 STANDALONE_DECISION_TOOLS = ["RAST", "COG", "PFAM", "KEGG", "EGGNOG", "UNIPROT"]
 TIGRFAM_CLUSTER_SLOT = "TIGRFAM_CLUSTER"
 DECISION_TOOLS = STANDALONE_DECISION_TOOLS + [TIGRFAM_CLUSTER_SLOT]
@@ -62,32 +28,11 @@ _IDENTITY_COLUMNS = [
     "product_descriptor_source_id",
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UNINFORMATIVE HIT CATEGORY  (the single, reproducible exclusion list)
-# ─────────────────────────────────────────────────────────────────────────────
-# A tool's best hit counts toward C1 ONLY if it names a real function. The rule
-# groups below are the *complete, deterministic* category of hit descriptions
-# that convey NO function and are therefore EXCLUDED: a tool whose only hit
-# matches any group here contributes 0 to the /7, not 1. Every exclusion is
-# reproducible from source -- no external list, no ordering dependence.
-#
-# Kept identical to the gate in labeling/assign-canonical-label.py; if you edit
-# one, edit both (assign-canonical-label uses it to pick the best-informative
-# hit per tool, this file uses it to count). Groups 4-7 were added after an
-# audit found ~205 hits per genome-set leaking in as "informative" -- almost all
-# eggNOG "Belongs to the UPF#### family" (UPF = Uncharacterized Protein Family),
-# bare DUF tags, and mid-string "of unknown function" phrasings that the
-# start-anchored Groups 1-2/8 alone could not catch.
-#
-# NOTE on the "no function word" guard (Groups 3 & 7): only a molecular/cellular
-# ACTIVITY word (…ase, transport, kinase, regulator, hydrolase, …) rescues a hit
-# that otherwise carries an unknown-function marker. Pure localization words
-# (membrane, secreted, periplasmic) are NOT function words -- so "secreted repeat
-# of unknown function" stays excluded while "alpha/beta hydrolase of unknown
-# function" is kept. Per project decision, topology-only ("predicted membrane
-# protein (DUF2238)") and fold-only ("cupin superfamily") hits carry no
-# unknown-function marker at all, so they are NOT in this category and still
-# count toward the /7.
+# ─── Uninformative hit category ──────────────────────────────────────────────
+# Descriptions matching these groups name no function and count 0 toward C1.
+# Kept identical to labeling/assign-canonical-label.py. Only an activity word
+# (…ase, transport, regulator, …) rescues an unknown-function phrase; location
+# words do not.
 
 # Group 1 — exact null / boilerplate tokens.
 _UNINFORMATIVE = frozenset({
@@ -119,9 +64,7 @@ _DB_ID_HYPOTHETICAL_RE = re.compile(
 )
 # Group 4 — eggNOG "Belongs to the UPF#### family" (Uncharacterized Protein Family).
 _UPF_ONLY_RE = re.compile(r'^\s*belongs to the upf\d+', re.IGNORECASE)
-# eggNOG describes orthologous groups of no known function with a PSORT
-# localisation guess ("Psort location Cytoplasmic, score 8.87"): where the
-# protein may sit, not what it does -- never a product name.
+# eggNOG "Psort location ..." descriptions give localisation only, not a product.
 _PSORT_ONLY_RE = re.compile(r'^\s*psort location\b', re.IGNORECASE)
 # Group 5 — a description that is nothing but a DUF tag ("Pfam:DUF955", "DUF955 family").
 _BARE_DUF_RE = re.compile(r'^\s*(?:pfam:)?\(?duf\d+\)?(?:\s+(?:family|domain))?\s*$', re.IGNORECASE)
@@ -130,9 +73,7 @@ _PROTEIN_DOMAINS_DUF_RE = re.compile(r'^\s*protein containing domains?\s+duf', r
 _HYPOTHETICAL_ANYWHERE_RE = re.compile(r'\bhypothetical\b', re.IGNORECASE)
 _PROTEIN_CONSERVED_IN_BACTERIA_RE = re.compile(r'\bprotein\s+conserved\s+in\s+bacteria\b', re.IGNORECASE)
 _INTEGRAL_MEMBRANE_PROTEIN_RE = re.compile(r'^\s*integral\s+membrane\s+protein\s*$', re.IGNORECASE)
-# Function-word guard for Groups 3 & 7: presence of a molecular/cellular ACTIVITY
-# word means the annotation is informative despite an "unknown/uncharacterized"
-# qualifier. Localization-only words are deliberately absent.
+# Function-word guard for Groups 3 & 7 (activity words only, no location words).
 _FUNCTION_SIGNAL_RE = re.compile(
     r'(ase\b|transport|permease|pump|export|import|channel|carrier|symport|antiport|'
     r'bind|synth|kinas|reductas|hydrolas|transferas|isomeras|ligas|lyas|mutas|oxidas|'
@@ -144,14 +85,12 @@ _FUNCTION_SIGNAL_RE = re.compile(
     r'degradation|tolerance|translation|utilization)', re.IGNORECASE,
 )
 _UNCHARACTERIZED_RE = re.compile(r'\buncharacteri[sz]ed\b', re.IGNORECASE)
-# Group 7 helper: what may follow "conserved protein" and still be uninformative
-# -- a bare locus tag (e.g. "YqhG", "CreA") or a DUF/UPF tag. Anything more (a
-# named domain/fold or a functional clause) keeps the hit.
+# Group 7 helper: a bare locus tag or DUF/UPF tag after "conserved protein".
 _LOCUS_OR_TAG_RE = re.compile(r'^\(?(?:duf\d+|upf\d+|[a-z]{1,5}\d{0,4}[a-z]?\d{0,4})\)?$', re.IGNORECASE)
 
 
 def is_uninformative(val: str) -> bool:
-    """True iff ``val`` falls in the UNINFORMATIVE HIT CATEGORY above."""
+    """Returns True when the description matches the uninformative groups above (regex and word lists)."""
     v = val.strip().lower()
     # Group 1
     if not v or v in _UNINFORMATIVE:
@@ -168,8 +107,7 @@ def is_uninformative(val: str) -> bool:
             or _INTEGRAL_MEMBRANE_PROTEIN_RE.match(v)
             or _PROTEIN_DOMAINS_DUF_RE.match(v)):
         return True
-    # Groups 3 & 7 — an "unknown-function" / "uncharacterized" marker anywhere,
-    # only when no molecular-function word rescues it.
+    # Groups 3 & 7 — unknown-function markers without a function word.
     if not _FUNCTION_SIGNAL_RE.search(v):
         if "of unknown function" in v:
             return True
@@ -183,6 +121,7 @@ def is_uninformative(val: str) -> bool:
 
 
 def compute_c1(labeled_row, cluster_row):
+    """Returns (C1 score, contributing tools) from best-hit descriptions and the TIGRFAM cluster status."""
     informative_tools = []
     for tool in STANDALONE_DECISION_TOOLS:
         desc = labeled_row.get("RAST_description", "") if tool == "RAST" \
@@ -195,6 +134,7 @@ def compute_c1(labeled_row, cluster_row):
 
 
 def main() -> None:
+    """Joins labeled genes to cluster agreement with csv and writes the C1 table."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--labeled-input", required=True, help="labeled-genes.tsv")

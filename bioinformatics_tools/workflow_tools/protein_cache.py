@@ -1,37 +1,10 @@
 """
-Per-protein annotation cache: a protein annotated once is never annotated
-again, in any genome, while the tool, its database and its settings stay
-the same.
+Per-protein annotation cache in the job's SQLite database, keyed by the protein's
+sequence hash and a tool_key (container, database and settings).
 
-output_cache.py keeps each tool's outputs per GENOME, so it is all or
-nothing: one changed base anywhere and every tool reruns on every protein.
-Here each tool's results are kept per PROTEIN, keyed by the hash of its amino
-acid sequence (genome_identity.protein_hash). After gene calling, before a
-genome's annotation stage:
-
-  split()  For each tool, the genome's proteins already in the cache and the
-           rest. The rest go to <prefix><tool>/protein-cache/novel.faa, which
-           the tool's rule then reads instead of rast.faa (margie_sb.smk's
-           pc_faa); the cached ones' rows are written, under this genome's
-           feature ids and name, to protein-cache/cached/<file>.
-  merge    Inside the rule, once the tool has run on novel.faa (or not at all,
-           when it is empty), MERGE_SH puts the tool's own rows and the
-           cached rows into the one results file everything downstream reads.
-  store()  Once the tool's results are loaded (its db token exists), every
-           protein of the genome not yet cached is added -- with no rows when
-           the tool found nothing, which is an answer too.
-
-A protein's rows depend only on its sequence for the tools in TOOL_FILES.
-Not here, because their answer depends on more than one protein: the
-envelope-dependent ones (DeepSig, PSORTb, SignalP 4 take the genome's
-envelope type), GeneProp, operons, envelope inference, GTDB-Tk, QUAST and
-everything after phase 8. Those keep output_cache's per-genome cache.
-
-The key (tool_key) is the tool, its container file (name, size, time), its
-database folder (path, time), and the settings that change its answer. Any
-of them changing starts that tool's cache afresh; nothing is deleted.
-
-Kept in the job database beside output_cache, so it travels with the file.
+split() writes novel.faa plus the cached rows before a tool runs, MERGE_SH joins
+both into the tool's results file, and store() adds the genome's new proteins.
+Only tools whose rows depend on the protein alone are listed in TOOLS.
 """
 from __future__ import annotations
 
@@ -87,19 +60,18 @@ INTERPRO_ALL_ANALYSES = {
 }
 INTERPRO_DEFAULT_ANALYSES = ["Hamap", "NCBIfam", "CDD", "PIRSF"]
 
-# Tools whose rows depend on nothing but the protein. The first file is the
-# one whose entries say "this protein is cached".
+# Tools whose rows depend only on the protein; each tool's first file marks a protein as cached.
 _SIMPLE = ['cog', 'kegg', 'eggnog', 'uniprot', 'pfam', 'merops', 'tcdb', 'dbcan', 'pgap', 'tmbed', 'signalp6']
 TOOLS = _SIMPLE + ['tigrfam', 'phobius', 'interpro']
 
-# The settings in each rule's params: that change its answer (defaults as in margie_sb.smk).
+# Rule params that change a tool's answer, with margie_sb.smk's defaults.
 TOOL_PARAMS = {
     'cog': [('cog.evalue', '1e-2')],
     'merops': [('merops.evalue', '1e-5')],
     'tcdb': [('tcdb.evalue', '1e-5'), ('tcdb.pct_id', '30')],
     'uniprot': [('uniprot.evalue', '1e-5'), ('uniprot.pct_id', '30')],
 }
-# Run from the cluster's modules, not a container of ours.
+# Tools run from cluster modules rather than a container.
 MODULE_TOOLS = {'signalp6': 'biocontainers/default + signalp6/6.0-fast --organism other --mode fast'}
 NO_DATABASE = {'phobius', 'signalp6'}
 
@@ -109,11 +81,9 @@ def interpro_analyses(cfg: dict) -> list[str]:
 
 
 def tool_files(tool: str, cfg: dict) -> list[tuple[str, str]]:
-    """(file name, kind) the tool's rule leaves in <prefix><tool>/, first the one that marks a protein cached.
+    """Returns (file name, kind) for each results file of the tool, marker file first.
 
-    kind: tsv (a header line, a feature_id column), tsv? (the same, and the
-    file may be missing or empty), domtbl (HMMER's --domtblout: '#' lines,
-    the protein id the fourth field)."""
+    kind is tsv, tsv? (may be missing or empty) or domtbl (HMMER --domtblout)."""
     if tool in _SIMPLE:
         return [(f'{tool}_results.tsv', 'tsv')]
     if tool == 'tigrfam':
@@ -136,7 +106,7 @@ def _stat(path: str) -> list:
 
 
 def tool_key(tool: str, cfg: dict) -> str:
-    """What the tool's answer depends on, besides the protein."""
+    """Hashes what the tool's answer depends on besides the protein: container, database, settings."""
     parts: dict = {'schema': SCHEMA, 'tool': tool}
     parts['runs'] = MODULE_TOOLS.get(tool) or _stat(sif_path(f'{tool}.sif', config=cfg, workflow_id=WORKFLOW))
     if tool not in NO_DATABASE:
@@ -160,13 +130,11 @@ def pc_dir(prefix: str, tool: str) -> str:
 
 
 def clear(prefix: str, tool: str) -> None:
-    """Take away a split, so the tool's rule reads rast.faa again (its own working files only)."""
+    """Removes a split so the tool's rule reads rast.faa again."""
     shutil.rmtree(pc_dir(prefix, tool), ignore_errors=True)
 
 
-# ---------------------------------------------------------------------------
-# The database
-# ---------------------------------------------------------------------------
+# ---- database ----
 
 def _connect(db: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db, timeout=120)
@@ -189,9 +157,7 @@ def _cached_hashes(conn, tool: str, key: str, filename: str, hashes: list[str]) 
     return found
 
 
-# ---------------------------------------------------------------------------
-# Rows: this genome's feature id and name in place of the ones they were stored under
-# ---------------------------------------------------------------------------
+# ---- rows: remapped to this genome's feature ids and name ----
 
 _DOMTBL_ID = re.compile(r'^(\S+\s+\S+\s+\S+\s+)(\S+)')
 
@@ -227,7 +193,7 @@ def _remap(line: str, kind: str, cols: tuple[int | None, int | None], fid: str, 
 
 
 def _read_rows(path: Path, kind: str) -> tuple[str | None, dict[str, list[str]]]:
-    """(header, {feature id: its lines}) of one results file."""
+    """Returns (header, {feature id: lines}) for one results file."""
     if not path.exists() or path.stat().st_size == 0:
         return None, {}
     lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
@@ -254,17 +220,15 @@ def _read_rows(path: Path, kind: str) -> tuple[str | None, dict[str, list[str]]]
     return header, rows
 
 
-# ---------------------------------------------------------------------------
-# Before the annotation stage
-# ---------------------------------------------------------------------------
+# ---- before the annotation stage ----
 
 def _proteins(faa: str) -> list[tuple[str, str, str, str]]:
-    """(feature id, hash, header, sequence) for each protein of the genome."""
+    """Returns (feature id, hash, header, sequence) for each protein of the genome."""
     return [(fid, protein_hash(seq), header, seq) for fid, header, seq in read_fasta(faa) if fid and seq]
 
 
 def split(db: str, faa: str, prefix: str, genome: str, tools: list[str], cfg: dict) -> dict[str, tuple[int, int]]:
-    """For each tool, write novel.faa and the cached proteins' rows. Returns {tool: (cached, to run)}."""
+    """Writes novel.faa and the cached proteins' rows per tool; returns {tool: (cached, to run)}."""
     proteins = _proteins(faa)
     hashes = sorted({h for _, h, _, _ in proteins})
     now = {}
@@ -276,7 +240,7 @@ def split(db: str, faa: str, prefix: str, genome: str, tools: list[str], cfg: di
             cached = _cached_hashes(conn, tool, key, files[0][0], hashes)
             out = Path(pc_dir(prefix, tool))
             if out.exists():
-                shutil.rmtree(out)  # this run's own working files, from an earlier attempt
+                shutil.rmtree(out)  # working files from an earlier attempt
             (out / 'cached').mkdir(parents=True)
             with open(out / 'novel.faa', 'w') as fh:
                 for fid, h, header, seq in proteins:
@@ -312,13 +276,10 @@ def split(db: str, faa: str, prefix: str, genome: str, tools: list[str], cfg: di
     return now
 
 
-# ---------------------------------------------------------------------------
-# After a tool's results are in
-# ---------------------------------------------------------------------------
+# ---- after a tool's results are in ----
 
 def store(db: str, faa: str, prefix: str, tool: str, cfg: dict) -> int:
-    """Add every protein of the genome the cache does not have yet, from the
-    tool's final results. Returns how many were added."""
+    """Adds the genome's uncached proteins from the tool's final results; returns the count."""
     key = tool_key(tool, cfg)
     files = tool_files(tool, cfg)
     folder = Path(f'{prefix}{tool}')
@@ -340,8 +301,7 @@ def store(db: str, faa: str, prefix: str, tool: str, cfg: dict) -> int:
                 LOGGER.warning('protein cache: %s has no header; not caching %s', folder / filename, tool)
                 return 0
             tables[filename] = (header, rows)
-        # Rows under ids that are not this genome's proteins (another RASTtk
-        # submission's, say) would store every protein as "nothing found".
+        # Skips caching when the results' ids are not this genome's proteins.
         ids = {fid for fid, _, _, _ in proteins}
         rows = tables[files[0][0]][1]
         strangers = sum(1 for fid in rows if fid not in ids)
@@ -363,12 +323,9 @@ def store(db: str, faa: str, prefix: str, tool: str, cfg: dict) -> int:
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Inside the rule: the tool's rows and the cached ones, in one file
-# ---------------------------------------------------------------------------
+# ---- inside the rule: merging tool rows with cached rows ----
 
-# POSIX sh only: it runs inside each tool's container.
-#   merge.sh PRODUCED DEST PC_DIR FILENAME KIND
+# POSIX sh, since it runs inside each tool's container. Usage: merge.sh PRODUCED DEST PC_DIR FILENAME KIND
 MERGE_SH = r'''#!/bin/sh
 # Written by protein_cache.py. The tool's own rows (it ran on the proteins
 # not in the cache), then the cached proteins' rows.
@@ -392,7 +349,7 @@ fi
 
 
 def install_merge_script(folder: str) -> str:
-    """Put MERGE_SH where every container can read it (the run's output folder)."""
+    """Writes MERGE_SH into the run's output folder, where every container can read it."""
     path = Path(folder) / '.protein-cache' / 'merge.sh'
     try:
         if not path.exists() or path.read_text() != MERGE_SH:

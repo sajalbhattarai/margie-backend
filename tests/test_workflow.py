@@ -148,8 +148,7 @@ class TestBuildExecutable:
         assert '--default-resources' not in cmd
 
     def test_no_target_leaves_command_unchanged(self, wf):
-        """No target (the default) must not add --nolock or any target token --
-        every existing caller's command stays byte-for-byte the same."""
+        """Checks that no target adds neither --nolock nor a target token."""
         key = WORKFLOWS['selftest']
         cmd = wf.build_executable(key, mode='dev')
         assert '--nolock' not in cmd
@@ -157,10 +156,8 @@ class TestBuildExecutable:
         assert 'phase4_8_one_genome' not in cmd
 
     def test_target_appears_before_config(self, wf):
-        """--config greedily consumes every following token as a key=value
-        pair (confirmed directly against a real snakemake invocation) --
-        the target must come before it or snakemake crashes on a bare
-        rule name."""
+        """Checks that the target precedes --config, which consumes every
+        following token as key=value."""
         key = WORKFLOWS['selftest']
         cmd = wf.build_executable(key, config_overrides={'foo': 'bar'}, mode='dev', target='rasttk_all')
         assert 'rasttk_all' in cmd
@@ -173,9 +170,7 @@ class TestBuildExecutable:
         assert cmd.index('--nolock') < cmd.index('phase4_8_one_genome')
 
 
-# ---------------------------------------------------------------------------
-# _start_background_subprocess
-# ---------------------------------------------------------------------------
+# ---- _start_background_subprocess ----
 
 class TestStartBackgroundSubprocess:
 
@@ -325,22 +320,13 @@ class TestRunPipeline:
         assert mock_log.call_args.kwargs['status'] == 'success'
 
 
-# ---------------------------------------------------------------------------
-# _run_pipeline_batch_sequential
-#
-# margie_sb's sequential per-organism orchestrator: Stage 1 (rasttk_all,
-# all genomes, backgrounded) + Stage 2 (phase4_8_one_genome, one genome at
-# a time, in the order each genome's RASTtk token actually appears).
-# Path and time.sleep are patched at module level (not real-filesystem /
-# real-wait) so these run instantly and deterministically; _run_subprocess
-# and _start_background_subprocess are the same seams TestRunSubprocess/
-# TestStartBackgroundSubprocess exercise directly, mocked here instead so
-# the orchestration loop itself is what's under test.
-# ---------------------------------------------------------------------------
+# ---- _run_pipeline_batch_sequential ----
+# Stage 1 (rasttk_all, backgrounded) and Stage 2 (one genome at a time, in
+# RASTtk-token order). Path, time.sleep and the subprocess helpers are mocked
+# so the orchestration loop runs instantly.
 
 def _target_genome_of(cmd: list[str]) -> str | None:
-    """Pull target_genome=<x> out of a built snakemake command's --config
-    section, the same shape build_executable() produces."""
+    """Returns target_genome=<x> from a built snakemake command's --config section."""
     for tok in cmd:
         if tok.startswith('target_genome='):
             return tok.split('=', 1)[1]
@@ -362,10 +348,7 @@ class TestRunPipelineBatchSequential:
     @patch('bioinformatics_tools.workflow_tools.workflow.locate_local_sif_files')
     @patch('bioinformatics_tools.workflow_tools.workflow.time.sleep')
     def test_stage1_targets_rasttk_all_stage2_targets_phase4_8_one_genome(self, mock_sleep, mock_locate, mock_cache, wf):
-        """Smoke test for the actual rule names threaded through -- the
-        ordering/failure tests below mock these calls away entirely, so
-        this is the one place that checks Stage 1/Stage 2 ask for the
-        right margie_sb.smk targets."""
+        """Checks that Stage 1 and Stage 2 request the right margie_sb.smk targets."""
         genome_files = {'genome1': '/g1.fa'}
         smk_config = {'output_dir': '/tmp/seqtest', 'main_database': ''}
 
@@ -401,11 +384,8 @@ class TestRunPipelineBatchSequential:
     @patch('bioinformatics_tools.workflow_tools.workflow.locate_local_sif_files')
     @patch('bioinformatics_tools.workflow_tools.workflow.time.sleep')
     def test_genomes_processed_in_token_detection_order(self, mock_sleep, mock_locate, mock_cache, wf):
-        """Genomes must enter Stage 2 in the order their RASTtk token
-        actually appears -- not genome_files' dict order, not alphabetical.
-        genome2 is made "ready" immediately; genome1 and genome3 only
-        become ready on later poll rounds (simulated via time.sleep's
-        side_effect, since it's the only thing separating poll rounds)."""
+        """Checks that genomes enter Stage 2 in the order their RASTtk token
+        appears; time.sleep's side_effect separates poll rounds."""
         genome_files = {'genome1': '/g1.fa', 'genome2': '/g2.fa', 'genome3': '/g3.fa'}
         smk_config = {'output_dir': '/tmp/seqtest', 'main_database': ''}
 
@@ -445,12 +425,7 @@ class TestRunPipelineBatchSequential:
     @patch('bioinformatics_tools.workflow_tools.workflow.locate_local_sif_files')
     @patch('bioinformatics_tools.workflow_tools.workflow.time.sleep')
     def test_failure_halts_before_next_genome(self, mock_sleep, mock_locate, mock_cache, wf):
-        """A real Stage 2 failure must halt the queue -- later genomes,
-        even ones already RASTtk-ready, must never be attempted. All three
-        genomes are made "ready" immediately (set iteration order across
-        pending decides which two of the three get processed before the
-        failure on the 2nd call -- doesn't matter which two; what matters
-        is there's never a 3rd call)."""
+        """Checks that a Stage 2 failure halts the queue: there is never a third call."""
         genome_files = {'genome1': '/g1.fa', 'genome2': '/g2.fa', 'genome3': '/g3.fa'}
         smk_config = {'output_dir': '/tmp/seqtest', 'main_database': ''}
 
@@ -478,10 +453,8 @@ class TestRunPipelineBatchSequential:
     @patch('bioinformatics_tools.workflow_tools.workflow.locate_local_sif_files')
     @patch('bioinformatics_tools.workflow_tools.workflow.time.sleep')
     def test_genome_that_never_becomes_ready_is_skipped_not_blocking(self, mock_sleep, mock_locate, mock_cache, wf):
-        """If Stage 1 exits without ever producing genome1's RASTtk token
-        (a real phase1-3 failure for that genome specifically -- --keep-going
-        already let Stage 1 continue past it), genome1 must be skipped, not
-        block genome2 from being processed, and not fail the whole run."""
+        """Checks that a genome whose RASTtk token never appears is skipped
+        without blocking the others or failing the run."""
         genome_files = {'genome1': '/g1.fa', 'genome2': '/g2.fa'}
         smk_config = {'output_dir': '/tmp/seqtest', 'main_database': ''}
 
@@ -516,17 +489,13 @@ class TestRunPipelineBatchSequential:
         assert wf.report.status.indicates_success
 
 
-# ---------------------------------------------------------------------------
-# do_margie_sb
-# ---------------------------------------------------------------------------
+# ---- do_margie_sb ----
 
 class TestDoMargieSb:
 
     def test_genome_cache_map_covers_every_phase4_8_tool(self, wf):
-        """do_margie_sb should build a real per-tool cache map (not the old
-        2-file whole-genome marker) and pass it through as cache_map_fn --
-        every phase4-8 tool present, with the known multi-file tools
-        (tigrfam, phobius, envelope, interpro) carrying their full file set."""
+        """Checks that do_margie_sb passes a per-tool cache map covering every
+        phase4-8 tool, with the full file set for multi-file tools."""
         wf.conf.get = MagicMock(side_effect=lambda key, default=None: {
             'input': '/genomes/genome1.fa',
             'main_database': '/tmp/test-margie.db',
@@ -550,7 +519,7 @@ class TestDoMargieSb:
             'signalp4', 'tigrfam', 'phobius', 'envelope', 'interpro',
         }
         assert set(cache_map.keys()) == expected_tools
-        # quast/gtdbtk/rasttk deliberately excluded -- see _genome_cache_map's docstring.
+        # quast/gtdbtk/rasttk are excluded (see _genome_cache_map).
         assert 'quast' not in cache_map
         assert 'gtdbtk' not in cache_map
         assert 'rasttk' not in cache_map

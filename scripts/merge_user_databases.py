@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
-"""Admin utility scaffold for merging per-user SQLite databases into a new
-shared versioned database.
+"""Plans and validates merging per-user SQLite databases into a new shared version.
 
-This intentionally starts as a safe planner/validator and does not mutate any
-inputs by default. It prints a deterministic merge plan and required checks.
+Opens every input read-only and prints a JSON merge plan; the merge itself is not implemented.
 
 Example:
-  python scripts/merge_user_databases.py \
-    --base-shared /depot/lindems/data/margie/sqlite/shared-v2.db \
-    --output-shared /depot/lindems/data/margie/sqlite/shared-v3.db \
-    --source-db /depot/lindems/data/margie/sqlite/bhattar3-shared-v2-v1.db \
-    --source-db /depot/lindems/data/margie/sqlite/rraghun-shared-v2-v1.db \
-    --dedupe-key fasta_hash
+  python scripts/merge_user_databases.py --base-shared shared-v2.db \
+    --output-shared shared-v3.db --source-db <user>-shared-v2-v1.db --dedupe-key fasta_hash
 """
 
 from __future__ import annotations
@@ -33,7 +27,7 @@ def _must_exist_file(path_text: str, label: str) -> Path:
 
 
 def _open_readonly(path: Path) -> sqlite3.Connection:
-    # URI mode keeps this planner read-only for source/base checks.
+    # URI mode=ro keeps the inputs read-only.
     return sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
 
 

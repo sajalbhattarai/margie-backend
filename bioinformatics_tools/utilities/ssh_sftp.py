@@ -52,11 +52,9 @@ def list_remote_dir_checked(
     remote_path: str,
     connection: SSHConnection,
 ) -> list[dict]:
-    """list_remote_dir, with the check that the path is a directory made in
-    the same SFTP session (one session per listing, not two: each one is a
-    round trip and a new sftp-server on the login node). Raises
-    FileNotFoundError when the path is not there and NotADirectoryError when
-    it is a file."""
+    """Lists a remote directory, checking it is a directory in the same SFTP session.
+
+    Raises FileNotFoundError when the path is missing and NotADirectoryError when it is a file."""
     ssh = connection.connect()
     sftp = ssh.open_sftp()
     try:
@@ -80,13 +78,10 @@ def stream_remote_file(
     remote_path: str,
     connection: SSHConnection,
 ):
-    """Open a remote file eagerly and return a generator that streams it in 8KB chunks.
+    """Opens a remote file eagerly and returns a generator that streams it in 8KB chunks.
 
-    The SFTP open happens at call time (not during iteration), so callers can
-    catch FileNotFoundError / IOError before wrapping the result in
-    StreamingResponse.  Without this, all SFTP errors happen inside the
-    StreamingResponse generator after headers are sent, which drops the
-    connection and causes "fetch failed" in the browser.
+    The open happens at call time, so callers can catch FileNotFoundError /
+    IOError before the StreamingResponse sends its headers.
     """
     ssh = connection.connect()
     sftp = ssh.open_sftp()
@@ -152,12 +147,7 @@ def check_remote_file(
 
 
 def stat_remote_file(path: str, connection: SSHConnection) -> tuple[float, int]:
-    """Return (mtime, size) for a remote file via a single SFTP stat call.
-
-    Used to key a cache entry against a remote file's identity, cheaply
-    (metadata only, no content read) -- output files don't change once a
-    job completes, so (mtime, size) staying the same means a cached
-    result (e.g. a line count) is still valid.
+    """Returns (mtime, size) for a remote file from one SFTP stat, used as a cache key.
 
     Raises FileNotFoundError if the path does not exist on the cluster.
     """
@@ -174,10 +164,9 @@ def stat_remote_file(path: str, connection: SSHConnection) -> tuple[float, int]:
 
 
 def check_remote_path_kind(path: str, connection: SSHConnection) -> str:
-    """Check whether a remote path exists and whether it's a file or directory.
+    """Returns 'file' or 'directory' for a remote path.
 
-    Returns 'file' or 'directory'. Raises FileNotFoundError if the path
-    does not exist on the cluster.
+    Raises FileNotFoundError if the path does not exist on the cluster.
     """
     ssh = connection.connect()
     sftp = ssh.open_sftp()
@@ -221,10 +210,8 @@ def write_remote_text_file(
     content: str,
     connection: SSHConnection,
 ) -> None:
-    """Write raw text to a remote path via SFTP, creating parent directories
-    if needed. Unlike write_remote_yaml, writes the content verbatim -- for
-    the file explorer's Save action on arbitrary text files (config.yaml,
-    scripts, etc.), not just structured config.
+    """Writes raw text to a remote path via SFTP, creating parent directories.
+    Used by the file explorer's Save action.
     """
     ssh = connection.connect()
 
@@ -247,22 +234,11 @@ def copy_remote_directory(
     dest_path: str,
     connection: SSHConnection,
 ) -> None:
-    """Copy a remote directory tree into a new path entirely on the cluster
-    filesystem via a single SSH exec_command -- the API process never reads
-    or writes the file bytes itself, so this scales to however large a
-    job's output_dir is without taxing dane-api's own memory/bandwidth.
+    """Copies a remote directory tree to a new path with one rsync on the cluster.
 
-    Excludes .snakemake/ (Snakemake's own bookkeeping -- its metadata
-    filenames and JSON content embed the OLD absolute output_dir path,
-    which would be wrong after the copy; Snakemake regenerates this fully
-    fresh on the next invocation against dest_path) and any tool's
-    original_container_outputs/*/stage/ subdirectory (pure rule-local
-    scratch space, re-staged fresh by the rule itself every run -- copying
-    it just wastes bytes on genome FASTA copies that get blown away
-    immediately).
-
-    Creates dest_path if needed. Raises RuntimeError if the remote rsync
-    command exits non-zero.
+    Excludes .snakemake/ (it embeds the old absolute path and is regenerated)
+    and original_container_outputs/*/stage/ (per-run scratch). Creates dest_path
+    if needed; raises RuntimeError if rsync exits non-zero.
     """
     ssh = connection.connect()
     try:
@@ -291,22 +267,10 @@ def stage_selected_genomes(
     connection: SSHConnection,
     label: str = '',
 ) -> str:
-    """Build a folder on the cluster holding only the chosen genomes, and
-    return its absolute path.
+    """Builds a folder of symlinks to the chosen genomes and returns its absolute path.
 
-    A workflow is pointed at a folder and annotates everything in it; there is
-    no "run only these" flag anywhere in the chain. So to run a subset, the
-    subset is given a folder of its own.
-
-    The entries are symlinks, not copies: a genome is tens of megabytes, the
-    run only ever reads them, and hundreds of them would otherwise be
-    duplicated on scratch for no reason. Creating them is a single
-    exec_command, so the API process never touches the bytes.
-
-    The folder lives under the user's home, which is always writable and
-    always present -- unlike scratch, whose path differs between clusters.
-    Old selections are left where they are: they are a handful of symlinks
-    each, and they record what a finished job was actually given.
+    A workflow annotates everything in its input folder, so a subset gets its
+    own folder under the user's home; old selections are kept as a record.
 
     Raises ValueError for a name that is not a plain file name, and
     RuntimeError if the remote command fails.
@@ -314,8 +278,7 @@ def stage_selected_genomes(
     if not names:
         raise ValueError('No genomes were selected.')
     for name in names:
-        # These come from a browser, so they are checked rather than trusted:
-        # anything with a slash in it could reach outside source_dir.
+        # Names come from the browser; anything with a slash could escape source_dir.
         if not name or '/' in name or name in ('.', '..'):
             raise ValueError(f'Not a genome file name: {name!r}')
 
@@ -327,8 +290,7 @@ def stage_selected_genomes(
     links = ' && '.join(
         f'ln -sfn {src}/{shlex.quote(n)} "$d"/{shlex.quote(n)}' for n in names
     )
-    # printf at the end so the absolute path comes back without a trailing
-    # newline to strip off guesswork later.
+    # printf returns the absolute path without a trailing newline.
     cmd = f'd="$HOME"/{shlex.quote(rel)} && mkdir -p "$d" && {links} && printf %s "$d"'
 
     ssh = connection.connect()
@@ -345,16 +307,10 @@ def stage_selected_genomes(
 
 
 def _build_path_rewrite_script(directory: str, old_path: str, new_path: str) -> str:
-    """Buildsd the embedded Python source run remotely by
-    rewrite_path_references(). Separated out so tests can run this exact
-    script locally against a real temp directory, proving the
-    find-and-replace logic itself works, not just that some command got
-    sent over SSH.
+    """Builds the Python source that rewrite_path_references() runs remotely.
 
-    Values are embedded via repr() (not f-string interpolation of the raw
-    string) so paths containing quotes/backslashes/etc. round-trip as
-    correct Python source -- the script itself then does a pure literal
-    str.replace(), so the path values never need regex/sed escaping at all.
+    Paths are embedded via repr() and replaced with a literal str.replace(), so
+    no escaping is needed. Kept separate so tests can run the script locally.
     """
     return (
         "import os\n"
@@ -387,24 +343,11 @@ def rewrite_path_references(
     new_path: str,
     connection: SSHConnection,
 ) -> int:
-    """Find-and-replace every literal occurrence of old_path with new_path
-    across every text file under directory, in place.
+    """Replaces every literal old_path with new_path in text files under directory.
 
-    Used after copy_remote_directory() during Resume to fix up provenance
-    metadata that some tools (GTDB-Tk, KEGG, ...) stamp their own
-    invocation path into their results.tsv content -- confirmed cosmetic
-    only (nothing downstream reads those columns), but cheap to correct so
-    a resumed run's output doesn't carry stale path strings pointing at a
-    directory that no longer matches where the file actually lives.
-
-    Runs as a small embedded Python script over SSH exec rather than shell
-    grep/sed specifically to avoid escaping headaches -- paths can contain
-    '.', '-', and other characters that are regex/sed metacharacters;
-    Python's str.replace() is a pure literal substitution with no such
-    concerns. Binary files (anything that fails UTF-8 decoding) are
-    skipped, not corrupted. Best-effort: a single file's read/write error
-    is skipped, not fatal to the whole pass -- this is a cosmetic cleanup,
-    not something that should ever block a resumed job from launching.
+    Used after copy_remote_directory() on Resume to fix provenance paths some
+    tools write into their outputs. Runs as an embedded Python script over SSH
+    to avoid sed escaping; binary files and per-file errors are skipped.
 
     Returns the number of files modified.
     """
@@ -432,24 +375,11 @@ def read_remote_file_page(
     connection: SSHConnection,
     known_total_lines: int | None = None,
 ) -> dict:
-    """Reads a 1-indexed inclusive line range [start_row, end_row] from a
-    remote text file, plus its header line (line 1) and total line count,
-    in a single SSH exec_command.
+    """Reads lines [start_row, end_row] (1-indexed, inclusive) of a remote text
+    file, plus its header line and total line count, in one SSH exec_command.
 
-    There is no connection pooling in this codebase (connect() opens a
-    fresh SSH session every call), so this combines the wc -l / header /
-    range reads into one remote shell invocation instead of three, to
-    avoid paying the handshake cost more than once per page request.
-
-    Uses SSH exec (sed/wc) rather than SFTP byte-seeking: paramiko's SFTP
-    has no line-counting primitive, and remote sed/wc scan a file far
-    faster than reading it chunk-by-chunk over SFTP to count newlines
-    ourselves would. The range read quits as soon as it passes end_row
-    (sed's `q` command), so cost scales with how far into the file a page
-    is, not with total file size.
-
-    If known_total_lines is given, skips the wc -l pass entirely (caller
-    already has a cached, still-valid count for this file).
+    sed quits after end_row, so cost scales with page position, not file size.
+    known_total_lines skips the wc -l pass.
 
     Returns {"total_lines": int, "header": str, "lines": list[str]}.
     Raises FileNotFoundError if remote_path does not exist, or
@@ -461,11 +391,9 @@ def read_remote_file_page(
     parts = []
     if known_total_lines is None:
         parts.append(f'wc -l < {quoted}')
-    # `1{p;q}` prints line 1 then quits immediately, regardless of file size.
+    # `1{p;q}` prints line 1 and quits.
     parts.append(f"sed -n '1{{p;q}}' {quoted}")
-    # Print MUST come before quit: sed's `q` exits immediately (skipping any
-    # later command in that cycle), so `end_row p` before `end_row q` is
-    # required or the last row of the page would be silently dropped.
+    # `p` must precede `q` on end_row, or the page's last row is dropped.
     parts.append(f"sed -n '{start_row},{end_row}p;{end_row}q' {quoted}")
     script = f'; echo {_PAGE_SENTINEL}; '.join(parts)
 

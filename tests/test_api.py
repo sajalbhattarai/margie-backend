@@ -162,11 +162,8 @@ class TestJobStore:
         assert slurm_jobs[0]["status"] == "SUBMITTED"
 
     def test_add_slurm_job_ignores_a_duplicate_submission(self):
-        """The workflow log carries every line twice (two handlers on the
-        workflow_tools logger), so each submission is parsed twice. A SLURM
-        job id is unique per submission, so the second sighting is never a
-        second job -- without this the table showed a run's 759 jobs as 1518
-        rows, every organism listed twice under every rule."""
+        """Ignores a second sighting of the same SLURM id; the workflow log
+        carries every line twice."""
         job_store.create("j4b", "/g")
         for _ in range(2):
             job_store.add_slurm_job("j4b", slurm_id="12345", rule="rasttk", genome="Ecoli")
@@ -179,9 +176,7 @@ class TestJobStore:
         assert len(job_store.get_slurm_jobs("j4c")) == 2
 
     def test_add_slurm_job_dedupes_cache_hits_by_rule_and_genome(self):
-        """Cache hits never hit SLURM, so they all share the "—" placeholder
-        id -- dedupe on it alone would collapse every cached rule in the run
-        into a single row."""
+        """Deduplicates cache hits by rule and genome, since they all share the "—" id."""
         job_store.create("j4d", "/g")
         for _ in range(2):
             job_store.add_slurm_job("j4d", "—", "gtdbtk", genome="Ecoli", source="from cache")
@@ -215,11 +210,8 @@ class TestJobStore:
 
         job_store.finalize("j6", status="completed", phase="Done")
 
-        # Not assert_called_once any more: add_slurm_job now checkpoints
-        # provenance as it is discovered (see JobStore.checkpoint), so by the
-        # time finalize runs there has already been a write. What matters is
-        # that finalize's own write is the complete snapshot, so that is the
-        # call inspected -- the last one.
+        # add_slurm_job checkpoints provenance as it goes, so the last write is
+        # finalize's full snapshot.
         _, kwargs = mock_history.record_job_updated.call_args
         assert kwargs["status"] == "completed"
         assert kwargs["phase"] == "Done"
@@ -228,8 +220,7 @@ class TestJobStore:
         assert kwargs["containers"][0]["name"] == "quast"
 
     def test_add_container_ignores_a_duplicate(self):
-        """The workflow logs every line twice, so each __CONTAINER__ line is
-        parsed twice. The Containers box listed every image twice over."""
+        """Ignores a repeated __CONTAINER__ line; the workflow logs every line twice."""
         job_store.create("j-cont", "/g")
         c = {"name": "rasttk", "version": "1.3.0",
              "path": "/depot/containers/rasttk.sif", "source": "cached"}
@@ -246,21 +237,14 @@ class TestJobStore:
 
     @patch("bioinformatics_tools.api.services.job_store.job_history_client")
     def test_provenance_persists_without_finalize(self, mock_history):
-        """The regression this whole mechanism exists for.
-
-        A run whose log stream drops never reaches finalize(). It used to take
-        the entire SLURM Jobs table with it: the history row kept the empty
-        list finalize() had snapshotted (or nothing at all), and the job page
-        showed an empty table forever for a run that really did submit
-        hundreds of jobs.
-        """
+        """Keeps SLURM provenance in history even when finalize() is never reached."""
         mock_conn = MagicMock()
         job_store.create("j-nofinal", "/g",
                          persist_db_path="~/my-db.db", persist_connection=mock_conn)
         job_store.add_slurm_job("j-nofinal", slurm_id="777", rule="run_scoring",
                                 genome="Afipia_carboxidovorans_OM5")
 
-        # No finalize() call at all -- this is the crash/dropped-stream case.
+        # No finalize() call: the crash or dropped-stream case.
         assert mock_history.record_job_updated.called
         _, kwargs = mock_history.record_job_updated.call_args
         assert kwargs["slurm_jobs"][0]["job_id"] == "777"
@@ -268,16 +252,14 @@ class TestJobStore:
 
     @patch("bioinformatics_tools.api.services.job_store.job_history_client")
     def test_checkpoint_is_throttled(self, mock_history):
-        """Every write is an SSH round-trip, so a run submitting hundreds of
-        jobs in a burst must not mean hundreds of round-trips."""
+        """Checks that a burst of submissions does not mean one SSH round-trip each."""
         mock_conn = MagicMock()
         job_store.create("j-throttle", "/g",
                          persist_db_path="~/my-db.db", persist_connection=mock_conn)
         for i in range(50):
             job_store.add_slurm_job("j-throttle", slurm_id=str(9000 + i), rule="run_scoring")
 
-        # One immediate write for the first submission, then the throttle holds
-        # the rest until the interval elapses.
+        # One immediate write, then the throttle holds the rest until the interval elapses.
         assert mock_history.record_job_updated.call_count == 1
 
         job_store.checkpoint("j-throttle", force=True)
@@ -287,8 +269,7 @@ class TestJobStore:
 
     @patch("bioinformatics_tools.api.services.job_store.job_history_client")
     def test_checkpoint_never_raises_into_the_hot_path(self, mock_history):
-        """It is called from log parsing; a failing history write must not
-        take the run's log stream down with it."""
+        """Checks that a failing history write never breaks log parsing."""
         mock_history.record_job_updated.side_effect = RuntimeError("ssh gone")
         mock_conn = MagicMock()
         job_store.create("j-boom", "/g",
@@ -305,13 +286,7 @@ class TestJobStore:
 
 
 class TestGenomeFromLogPath:
-    """The Organism column's source.
-
-    Paths below are verbatim from a real 27,500-line run log. That run
-    contained 612 SLURM submissions and zero "wildcards:" lines, which is why
-    WILDCARDS_GENOME_RE alone left the column blank -- the path was carrying
-    the organism the whole time.
-    """
+    """Organism extraction from SLURM log paths (taken from a real run log)."""
 
     def test_extracts_organism_from_a_per_genome_rule(self):
         from bioinformatics_tools.api.services.job_runner import GENOME_FROM_LOG_PATH_RE
@@ -330,9 +305,7 @@ class TestGenomeFromLogPath:
         assert m and m.group(1) == "Haloferax_volcanii_DS2_GCF_000025685.1"
 
     def test_batch_rules_have_no_organism_and_must_not_invent_one(self):
-        """quast_batch and friends have no genome wildcard, so their path has
-        no organism directory. Matching here would put a SLURM job id in the
-        Organism column."""
+        """Checks that batch rules, with no organism directory, get no organism."""
         from bioinformatics_tools.api.services.job_runner import GENOME_FROM_LOG_PATH_RE
         for path in (
             "/scratch/x/.snakemake/slurm_logs/rule_queue_sqlite_backup_snapshot/41475339.log",
@@ -369,14 +342,9 @@ class TestJobStatusEndpoint:
 
 
 class TestJobStatusHistoryReconciliation:
-    """get_job_status's history-fallback branch (job not in job_store, e.g.
-    after a dane-api restart).
+    """get_job_status's history fallback when the job is not in job_store.
 
-    A non-terminal row has two possible outcomes. Preferred: the run is
-    replayable, so it is REATTACHED -- taken back over and streamed again
-    (TestJobStatusReattach below). Otherwise a squeue snapshot decides
-    still_active, which is what these tests cover -- _unreplayable() forces
-    that path.
+    _unreplayable() forces the squeue path (reattach is covered by TestJobStatusReattach).
     """
 
     @staticmethod
@@ -389,7 +357,7 @@ class TestJobStatusHistoryReconciliation:
 
     @staticmethod
     def _unreplayable(mock_slurm):
-        """No log on the cluster -- nothing to replay, so no reattach."""
+        """No log on the cluster, so nothing to replay."""
         mock_slurm.probe_run.return_value = {
             "has_log": False, "exit_code": None, "log_idle": float("inf"),
         }
@@ -397,8 +365,7 @@ class TestJobStatusHistoryReconciliation:
 
     @pytest.fixture(autouse=True)
     def _drop_rehydrated_job(self):
-        """A reattach leaves a live job_store entry behind, which would send
-        the next test down the in-memory branch instead of the fallback."""
+        """Removes the live entry a reattach leaves, so the next test uses the fallback."""
         yield
         job_store._jobs.pop("resumed-job", None)
         job_store._persistence.pop("resumed-job", None)
@@ -432,10 +399,7 @@ class TestJobStatusHistoryReconciliation:
     def test_completing_jobs_still_count_as_active(
         self, mock_build_conn, mock_sftp, mock_history, mock_slurm, authed_client,
     ):
-        """A job tearing down is not a finished workflow. Filtering to
-        RUNNING/PENDING alone blanked the SLURM table whenever a poll landed
-        while the whole current batch happened to be COMPLETING -- which for
-        the short rules in margie_sb is much of the time."""
+        """Checks that COMPLETING jobs still count as active."""
         mock_sftp.read_remote_yaml.return_value = {"main_database": "~/my-db.db"}
         mock_history.get_job.return_value = self._history_row()
         self._unreplayable(mock_slurm)
@@ -489,8 +453,7 @@ class TestJobStatusHistoryReconciliation:
     def test_squeue_failure_does_not_break_endpoint(
         self, mock_build_conn, mock_sftp, mock_history, mock_slurm, authed_client,
     ):
-        """A transient SSH/squeue failure during reconciliation must not
-        turn an otherwise-200 history-fallback response into a 500."""
+        """Checks that an SSH/squeue failure during reconciliation still returns 200."""
         mock_sftp.read_remote_yaml.return_value = {"main_database": "~/my-db.db"}
         mock_history.get_job.return_value = self._history_row()
         self._unreplayable(mock_slurm)
@@ -502,12 +465,8 @@ class TestJobStatusHistoryReconciliation:
 
 
 class TestJobStatusReattach:
-    """A workflow run is detached (setsid + nohup), so it outlives the
-    dane-api that started it; its in-memory job_store entry does not. Without
-    a reattach, restarting the API left a live run's job page permanently
-    blank -- no logs, no SLURM jobs, phase frozen where the old API died.
-    get_job_status now takes such a run back over by replaying the log it is
-    still writing on the cluster."""
+    """get_job_status reattaches a detached run after a dane-api restart by
+    replaying the log it is still writing on the cluster."""
 
     _row = staticmethod(TestJobStatusHistoryReconciliation._history_row)
 
@@ -519,8 +478,7 @@ class TestJobStatusReattach:
 
     @staticmethod
     def _probe(mock_slurm, has_log=True, exit_code=None, log_idle=5.0):
-        """Wire up a probe_run result AND let the real is_replayable() decide
-        from it -- so these tests exercise the actual rule, not a stub of it."""
+        """Sets a probe_run result and lets the real is_replayable() decide."""
         mock_slurm.probe_run.return_value = {
             "has_log": has_log, "exit_code": exit_code, "log_idle": log_idle,
         }
@@ -546,7 +504,7 @@ class TestJobStatusReattach:
         assert job_store.exists("resumed-job")           # tracked live again
         assert body["status"] == "running"               # not reset to "pending"
         assert body["work_dir"] == "/scratch/x/2026-06-21-1118"
-        # No squeue guesswork needed -- the replay is the source of truth now.
+        # No squeue check needed; the replay is the source of truth.
         mock_slurm.find_active_jobs_in_workdir.assert_not_called()
 
     @patch("bioinformatics_tools.api.routers.ssh.job_runner")
@@ -558,9 +516,8 @@ class TestJobStatusReattach:
         self, mock_build_conn, mock_sftp, mock_history, mock_slurm, mock_runner,
         authed_client,
     ):
-        """The exit sentinel is there but the row still says running. Replay
-        recovers the full log, its SLURM jobs and the real exit code, instead
-        of leaving a finished job stuck at 'running' for good."""
+        """Replays a run that finished while the API was down, recovering its
+        log, SLURM jobs and exit code."""
         mock_sftp.read_remote_yaml.return_value = {"main_database": "~/my-db.db"}
         mock_history.get_job.return_value = self._row()
         self._probe(mock_slurm, exit_code="0", log_idle=40000.0)
@@ -577,9 +534,8 @@ class TestJobStatusReattach:
         self, mock_build_conn, mock_sftp, mock_history, mock_slurm, mock_runner,
         authed_client,
     ):
-        """No sentinel and no driver: the run died. Tailing its log would
-        block one of the runner's four workers for the life of the process,
-        so this must fall through to the squeue path instead."""
+        """Checks that a run with no sentinel and no driver takes the squeue path,
+        since tailing its log would block a worker."""
         mock_sftp.read_remote_yaml.return_value = {"main_database": "~/my-db.db"}
         mock_history.get_job.return_value = self._row()
         self._probe(mock_slurm, exit_code=None, log_idle=40000.0)
@@ -600,8 +556,7 @@ class TestJobStatusReattach:
         self, mock_build_conn, mock_sftp, mock_history, mock_slurm, mock_runner,
         authed_client,
     ):
-        """Same worker-starvation risk: `tail -F` on a file that does not
-        exist waits for it forever."""
+        """Checks that a missing log is not tailed, since `tail -F` would wait forever."""
         mock_sftp.read_remote_yaml.return_value = {"main_database": "~/my-db.db"}
         mock_history.get_job.return_value = self._row()
         self._probe(mock_slurm, has_log=False)
@@ -619,8 +574,7 @@ class TestJobStatusReattach:
         self, mock_build_conn, mock_sftp, mock_history, mock_slurm, mock_runner,
         authed_client,
     ):
-        """The job page polls every 10s, and FastAPI runs sync endpoints in a
-        threadpool. Each poll must not spawn another tail of the same run."""
+        """Checks that overlapping polls start only one watcher for a run."""
         mock_sftp.read_remote_yaml.return_value = {"main_database": "~/my-db.db"}
         mock_history.get_job.return_value = self._row()
         self._probe(mock_slurm, log_idle=5.0)
@@ -638,21 +592,18 @@ class TestJobStatusReattach:
         self, mock_build_conn, mock_sftp, mock_history, mock_slurm, mock_runner,
         authed_client,
     ):
-        """This job has been in api_jobs since it was first launched, so
-        job_store.create()'s usual INSERT would add a second row for it."""
+        """Checks that a reattach does not insert a second api_jobs row."""
         mock_sftp.read_remote_yaml.return_value = {"main_database": "~/my-db.db"}
         mock_history.get_job.return_value = self._row()
         self._probe(mock_slurm, log_idle=5.0)
 
         authed_client.get("/v1/ssh/job_status/resumed-job")
         mock_history.record_job_created.assert_not_called()
-        # ...but later status/phase changes must still reach history.
+        # Later status/phase changes still reach history.
         assert "resumed-job" in job_store._persistence
 
     def test_live_job_in_job_store_unaffected(self, authed_client):
-        """Confirms the in-memory branch (job_store hit) never reaches the
-        new SLURM-reconciliation code at all -- no still_active/status_note
-        key should appear on a normal in-memory job response."""
+        """Checks that the in-memory branch adds no still_active/status_note keys."""
         job_store.create("live-job-1", "/genomes/test.fasta", user_id=1)
         job_store.update("live-job-1", status="running")
         resp = authed_client.get("/v1/ssh/job_status/live-job-1")
@@ -663,11 +614,8 @@ class TestJobStatusReattach:
 
 
 class TestFileEndpointsHistoryFallback:
-    """job_files/download_file/view_file must work for a job resumed from
-    history (not in job_store), not just live in-memory jobs -- previously
-    all three 404'd unconditionally for any job dane-api wasn't actively
-    tracking, even though job_status already resolved a valid work_dir for
-    the same job via history fallback."""
+    """job_files/download_file/view_file resolve work_dir via history for jobs
+    not in job_store."""
 
     @staticmethod
     def _history_row(work_dir="/scratch/x/2026-06-21-1118"):
@@ -728,10 +676,7 @@ class TestFileEndpointsHistoryFallback:
         assert resp.status_code == 404
 
     def test_path_traversal_still_checked_before_any_lookup(self, authed_client):
-        """Reordering validation ahead of the job/connection resolution
-        (needed so history fallback can build a connection) must not weaken
-        the traversal guard -- it should still reject before touching SSH
-        at all, with no mocks needed since nothing real should be called."""
+        """Checks that the traversal guard rejects before any job lookup or SSH."""
         resp = authed_client.get(
             "/v1/ssh/job_files/any-job", params={"subdir": "../../etc"},
         )
@@ -909,8 +854,7 @@ class TestResumeAndRestartJob:
     def test_resume_job_allows_stale_non_terminal_when_not_active(
         self, mock_sftp, mock_runner, mock_slurm, mock_build_conn, authed_client,
     ):
-        """A job stuck showing 'running' from before a dane-api restart
-        should still be resumable once confirmed not actually active."""
+        """Checks that a stale 'running' job is resumable once confirmed inactive."""
         jid = self._create_job(status="running")
         mock_sftp.read_remote_yaml.return_value = {"main_database": "~/my-db.db"}
         mock_slurm.find_active_jobs_in_workdir.return_value = []
@@ -1009,9 +953,7 @@ class TestPathTraversalSecurity:
         mock_sftp.stat_remote_file.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# Tier 4b — Paginated file viewer (view_file)
-# ---------------------------------------------------------------------------
+# ---- Tier 4b: paginated file viewer (view_file) ----
 
 class TestViewFile:
     """/v1/ssh/view_file -- paginated read of a job's output file."""
@@ -1053,9 +995,7 @@ class TestViewFile:
     @patch("bioinformatics_tools.api.routers.ssh._build_connection")
     @patch("bioinformatics_tools.api.routers.ssh.ssh_sftp")
     def test_view_file_reuses_cached_total_lines(self, mock_sftp, mock_build_conn, authed_client):
-        """Second page request for the same unchanged file should skip the
-        wc -l pass entirely -- this is what keeps paging through a huge
-        file from re-paying a full scan on every click."""
+        """Checks that a second page of an unchanged file skips the wc -l pass."""
         jid = self._create_job_with_workdir()
         mock_sftp.stat_remote_file.return_value = (1700000000.0, 1234)
         mock_sftp.read_remote_file_page.return_value = {
@@ -1079,9 +1019,7 @@ class TestViewFile:
         assert mock_sftp.read_remote_file_page.call_args.kwargs["known_total_lines"] == 5
 
     def test_view_file_page_size_bounds(self, authed_client):
-        # FastAPI's Query(..., le=500) must reject this before the handler
-        # body (and therefore any SSH call) ever runs -- this is what
-        # actually prevents a client from forcing a full-file sed range.
+        # Query(..., le=500) rejects this before the handler or any SSH call runs.
         resp = authed_client.get(
             "/v1/ssh/view_file/any-job-id",
             params={"path": "results.tsv", "page_size": 99999},

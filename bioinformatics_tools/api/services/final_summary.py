@@ -1,13 +1,8 @@
 """
-A genome's report numbers, counted from its FINAL confidence table on the
-cluster: how many genes, in how many operons, with what support, in which
-confidence tiers, and the ring the Map draws of them.
-
-The same counting as margie-fe's lib/workspace/final-summary.ts (FinalTally),
-line for line, so the page shows the same numbers whichever side counted.
-It is done here because a FINAL table is 10-30 MB: the Results page used to
-download every finished genome's whole table to count it in the browser,
-and hung while it did (95 MB for 5 genomes, 2026-09-24).
+Counts a genome's report numbers from its FINAL confidence table: genes,
+operons, support, confidence tiers and the Map's ring glyph.
+Mirrors margie-fe's lib/workspace/final-summary.ts (FinalTally) so both sides
+give the same numbers; counting here avoids sending 10-30 MB tables to the browser.
 """
 from __future__ import annotations
 
@@ -25,12 +20,12 @@ _NO_HITS = re.compile(r'^no db hits$', re.I)
 
 
 def plain_name(c: str) -> str:
-    """FINAL table columns are named "Column-A: organism_name"; this gives "organism_name"."""
+    """Strips the "Column-A: " prefix from a FINAL table column name."""
     return _PLAIN.sub('', c)
 
 
 def _number(text: str) -> float | None:
-    """JavaScript's Number() for what these columns hold: '' is 0, junk is NaN (None)."""
+    """Parses a cell like JavaScript's Number(): '' is 0, unparsable text is None."""
     text = text.strip()
     if not text:
         return 0.0
@@ -41,6 +36,7 @@ def _number(text: str) -> float | None:
 
 
 def tally(lines: Iterable[str]) -> dict:
+    """Counts genes, operons, support and tiers from FINAL table lines and builds the ring glyph."""
     columns: list[str] = []
     idx: dict[str, int] = {}
     genes = in_operons = with_support = 0

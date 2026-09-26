@@ -1,41 +1,11 @@
 #!/usr/bin/env python3
-"""update-fingerprint-database.py — margie_sb, incremental cross-genome
-fingerprint-database update.
+"""update-fingerprint-database.py — merges one genome's gene fingerprints into the shared database.
 
-Takes ONE genome's labeled-genes-fingerprint-hash-label.tsv (phase12,
-"pattern hash: <hash> || label: <canonical_label>" per gene) and merges it
-into the SHARED, persistent fingerprint-database.tsv at
-/depot/lindems/data/margie/fingerprint-database/ -- atomically, under an
-exclusive file lock, so every genome's own phase12 run can update the same
-shared file safely even if several genomes finish around the same time.
-
-Mirrors build-here/.../phase10-fingerprinting/fingerprint/scripts/
-process_fingerprint.py's own update_pangenome()/_do_update() pattern
-exactly (fcntl.LOCK_EX on a sibling .lock file, write to .tmp, then
-os.replace -- never partially-written, never two writers racing) -- that
-script updates per-ORGANISM (one hash per organism, the set of its unique
-canonical_labels); this one updates per-GENE (one hash per gene, the much
-richer 15-tool evidence pattern from add-gene-fingerprint.py), but the
-concurrency-safety shape is identical.
-
-WHY incremental, not a full rebuild every time: re-reading every genome
-processed so far just to add one more would get slower and slower as the
-collection grows past dozens, then eventually hundreds of genomes. This
-script only ever reads the existing pool once, merges in the one new
-genome's contribution, and rewrites -- O(pool size + new genome's gene
-count), not O(every genome ever processed).
-
-Schema (fingerprint-database.tsv, one row per (pattern_id, label) pair,
-same shape as the existing pangenome_fingerprints.tsv):
-  pattern_id | fingerprint_hash | fingerprint_label
-  | fingerprint_frequency | fingerprint_label_frequency | organisms
-
-  fingerprint_frequency       : # genes (across every genome processed so
-                                 far) that share this exact pattern
-  fingerprint_label_frequency : # genes (across every pattern that decides
-                                 on it) carrying this label
-  organisms                   : pipe-separated organism names with at
-                                 least one gene matching this pattern
+Adds the genome's labeled-genes-fingerprint-hash-label.tsv counts to
+fingerprint-database.tsv incrementally, under an fcntl lock with a .tmp write
+and rename. Columns: pattern_id, fingerprint_hash, fingerprint_label,
+fingerprint_frequency (genes with this pattern), fingerprint_label_frequency
+(genes with this label), organisms ("|"-joined).
 """
 from __future__ import annotations
 
@@ -54,6 +24,7 @@ _HASH_LABEL_RE = re.compile(r"^pattern hash: (?P<hash>\S+) \|\| label: (?P<label
 
 
 def parse_hash_label(fingerprint_value: str) -> tuple[str, str] | None:
+    """Extracts (hash, label) from "pattern hash: ... || label: ..." by regex, or None."""
     m = _HASH_LABEL_RE.match(fingerprint_value)
     if not m:
         return None
@@ -61,11 +32,7 @@ def parse_hash_label(fingerprint_value: str) -> tuple[str, str] | None:
 
 
 def read_new_genome(hash_label_tsv: Path, organism: str) -> dict[str, int]:
-    """Returns {hash: gene_count} for this one genome, plus stamps each
-    hash's label as a side channel the caller merges separately (a single
-    hash's label is assumed identical across every gene that has it,
-    enforced by assign-canonical-label.py being a pure function of the
-    same id/description fields the hash is computed from)."""
+    """Counts genes per fingerprint hash in one genome with csv and returns ({hash: count}, {hash: label})."""
     counts: dict[str, int] = {}
     labels: dict[str, str] = {}
     n_unparsed = 0
@@ -86,6 +53,7 @@ def read_new_genome(hash_label_tsv: Path, organism: str) -> dict[str, int]:
 
 def update_database(counts: dict[str, int], labels: dict[str, str], organism: str,
                      db_tsv: Path) -> None:
+    """Runs _do_update while holding an exclusive fcntl lock on a sibling .lock file."""
     db_tsv.parent.mkdir(parents=True, exist_ok=True)
     lock_path = db_tsv.with_suffix(".lock")
     with open(lock_path, "w") as lock_fh:
@@ -98,10 +66,9 @@ def update_database(counts: dict[str, int], labels: dict[str, str], organism: st
 
 def _do_update(new_counts: dict[str, int], new_labels: dict[str, str], organism: str,
                 db_tsv: Path) -> None:
-    """Inner update logic -- must be called under the exclusive lock above.
+    """Merges new counts into the database TSV, rewrites it via .tmp and rename, and writes metadata JSON.
 
-    patterns dict structure:
-      hash -> {"pattern_id": str, "label": str, "gene_count": int, "organisms": set[str]}
+    Runs under the lock taken by update_database().
     """
     patterns: dict[str, dict] = {}
     if db_tsv.exists() and db_tsv.stat().st_size > 0:
@@ -119,7 +86,7 @@ def _do_update(new_counts: dict[str, int], new_labels: dict[str, str], organism:
         if h in patterns:
             patterns[h]["gene_count"] += count
             patterns[h]["organisms"].add(organism)
-            # Defensive: identical hash should always mean identical label.
+            # An identical hash is expected to carry the identical label.
             if patterns[h]["label"] != new_labels[h]:
                 print(f"[update-fingerprint-database] WARNING: hash {h} previously mapped to "
                       f"label '{patterns[h]['label']}', now seeing '{new_labels[h]}' from {organism} "
@@ -162,6 +129,7 @@ def _do_update(new_counts: dict[str, int], new_labels: dict[str, str], organism:
 
 
 def main() -> None:
+    """Reads the genome's hash-label table and merges it into the shared database."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--hash-label-input", required=True,

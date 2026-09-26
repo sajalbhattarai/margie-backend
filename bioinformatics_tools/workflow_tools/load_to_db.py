@@ -16,12 +16,10 @@ Subcommands:
 All subcommands write to the same .db file so all results live together.
 """
 
-# ─────────────────────────── Pipeline version ────────────────────────── #
-# Bump this string whenever any scoring/labeling/consolidation script
-# changes its output in a way that makes existing DB rows stale.
-# Existing rows with a different version are deleted and reloaded.
-# is_already_processed() in workflow.py uses this to skip Stage 2
-# entirely for organisms that are already complete at the current version.
+# ---- Pipeline version ----
+# Bumped whenever a scoring/labeling/consolidation change makes DB rows stale;
+# rows at another version are reloaded, and is_already_processed() skips Stage 2
+# for genomes already at this version.
 PIPELINE_VERSION = "1.7.2027"
 import argparse
 import csv
@@ -38,16 +36,13 @@ try:
 except ImportError:  # run as a script, or imported from margie_sb.smk
     from genome_identity import genome_hash, genome_hashes
 
-# consolidated-merged-all-columns.tsv carries columns like na_seq/aa_seq and
-# concatenated multi-tool command_used strings well past Python's csv
-# module's 131072-byte default field limit -- without raising it, loading
-# that table raises _csv.Error: field larger than field limit.
+# consolidated-merged-all-columns.tsv has fields (sequences, joined command_used)
+# beyond csv's 131072-byte default limit.
 csv.field_size_limit(10_000_000)
 
 
-# Hardened connections, same as output_cache.py's _get_connection/
-# _retry_operation: bare sqlite3.connect() doesn't retry on lock contention,
-# and InterPro's 18-way concurrent load burst needs it.
+# Hardened connections as in output_cache.py: retries on lock contention, which
+# InterPro's 18-way concurrent load needs.
 
 def _get_connection(db_path: str, timeout: float = 120.0) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=timeout)
@@ -56,11 +51,9 @@ def _get_connection(db_path: str, timeout: float = 120.0) -> sqlite3.Connection:
 
 
 def _retry_operation(func, max_retries: int = 12, initial_delay: float = 2.0):
-    """Retry func() on transient lock/IO errors with exponential backoff.
+    """Retries func() on transient lock/IO errors with exponential backoff.
 
-    func is expected to open its own connection and close it on every call
-    (including retries) rather than reuse one across attempts, since a
-    connection that errored mid-transaction shouldn't be trusted afterward."""
+    func opens and closes its own connection on every attempt."""
     delay = initial_delay
     last_error: sqlite3.OperationalError | None = None
     for attempt in range(max_retries):
@@ -100,17 +93,13 @@ CREATE TABLE IF NOT EXISTS run_log (
 """
 
 _RUN_LOG_NEW_COLS = [("fasta_hash", "TEXT"), ("pipeline_version", "TEXT"),
-                     # organism_name is what the DATA tables are keyed by, but a
-                     # genome's identity is its fasta_hash -- the same sequence can
-                     # be submitted under a new display name. Recording the name
-                     # alongside the hash is what lets a reload find and clear the
-                     # rows it wrote under any EARLIER name for the same genome
-                     # (see _organism_names_for_fasta).
+                     # organism_name lets a reload clear rows written under an
+                     # earlier name for the same genome (see _organism_names_for_fasta).
                      ("organism_name", "TEXT")]
 
 
 def _compute_file_hash(file_path: str) -> str:
-    """Compute full SHA-256 hash of a file's contents."""
+    """Computes the full SHA-256 hash of a file's contents."""
     sha256 = hashlib.sha256()
     with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
@@ -118,23 +107,21 @@ def _compute_file_hash(file_path: str) -> str:
     return sha256.hexdigest()
 
 
-# A genome's identity in run_log: its sequence hash (genome_identity), so the
-# same genome in a differently formatted file is still "already processed".
-# Records written before it carry the file's byte hash (_compute_file_hash);
-# every lookup below takes both (fasta_hashes), and new records are written
-# under the first.
+# A genome's identity in run_log is its sequence hash (genome_identity); older
+# records carry the file's byte hash, so lookups take both (fasta_hashes) and
+# new records use the first.
 compute_fasta_hash = genome_hash
 fasta_hashes = genome_hashes
 
 
 def _hash_list(fasta_hash) -> list[str]:
-    """One hash or several (fasta_hashes()) as a list, empty ones dropped."""
+    """Returns one hash or several (fasta_hashes()) as a list, empty ones dropped."""
     hashes = [fasta_hash] if isinstance(fasta_hash, str) else list(fasta_hash or [])
     return [h for h in hashes if h]
 
 
 def _ensure_run_log(conn: sqlite3.Connection) -> None:
-    """Create run_log if absent; add new columns if the table predates them."""
+    """Creates run_log if absent and adds columns missing from older tables."""
     conn.execute(CREATE_RUN_LOG_SQL)
     existing = {row[1] for row in conn.execute("PRAGMA table_info(run_log)")}
     for col, col_type in _RUN_LOG_NEW_COLS:
@@ -144,11 +131,10 @@ def _ensure_run_log(conn: sqlite3.Connection) -> None:
 
 def _already_loaded(db_path: str, input_hash: str, tool: str,
                     fasta_hash=None) -> bool:
-    """Return True if this tool's data is already current in the DB.
+    """Returns True if this tool's data is already current in the DB.
 
-    When fasta_hash is provided, the check is (fasta_hash, PIPELINE_VERSION,
-    tool) — version-aware.  Without it, falls back to (input_hash, tool)
-    for backward-compat with non-genome tables (e.g. prodigal GFF).
+    With fasta_hash the check is (fasta_hash, PIPELINE_VERSION, tool); without
+    it, (input_hash, tool), for non-genome tables such as prodigal GFF.
     """
     if not Path(db_path).exists():
         return False
@@ -180,11 +166,9 @@ def _already_loaded(db_path: str, input_hash: str, tool: str,
 def is_already_processed(db_path: str, fasta_hash,
                          pipeline_version: str = PIPELINE_VERSION,
                          tool: str = "scoring_confidence_final") -> bool:
-    """Return True when this genome FASTA was fully processed at pipeline_version.
+    """Returns True when this genome FASTA was fully processed at pipeline_version.
 
-    workflow.py calls this before launching Stage 2 so it can skip the
-    entire Snakemake run for organisms already at the current version.
-    fasta_hash: one hash, or fasta_hashes() to match records under either.
+    fasta_hash is one hash, or fasta_hashes() to match records under either.
     """
     if not Path(db_path).exists():
         return False
@@ -210,12 +194,10 @@ def is_already_processed(db_path: str, fasta_hash,
 
 
 def _organism_names_for_fasta(db_path: str, fasta_hash) -> set[str]:
-    """Every organism_name this FASTA has ever been loaded under.
+    """Returns every organism_name this FASTA has been loaded under.
 
-    A genome's identity is its sequence, not its label. When the same FASTA is
-    re-run under a new name, the data tables still hold the rows written under
-    the OLD name -- and those rows are keyed only by organism_name, so a delete
-    scoped to the new name cannot see them.
+    Data tables are keyed only by organism_name, so a rerun under a new name
+    needs the old names to clear its earlier rows.
     """
     hashes = _hash_list(fasta_hash)
     if not hashes:
@@ -246,17 +228,9 @@ def _delete_stale_organism_rows(db_path: str, table_name: str,
                                 fasta_hash=None) -> int:
     """Delete existing rows for THIS GENOME from table_name before reloading.
 
-    Called only when _already_loaded() returned False, so this is always safe:
-    either the organism is new (0 rows deleted) or it exists at a stale/unversioned
-    version (old rows cleared before fresh insert).  Handles pre-versioning data
-    in margie.db that has no fasta_hash in run_log.
-
-    Scoped by genome IDENTITY, not display name. Deleting only *organism_name*
-    silently leaves a full duplicate copy of the same genome behind whenever it
-    is re-run under a different label: the delete matches nothing, the insert
-    adds a second set, and the DB ends up holding one genome twice under two
-    names. That is reachable on every --force load (scoring does one each run),
-    so the alias sweep below is what actually keeps the tables unique.
+    Called only when _already_loaded() returned False. Rows are matched by every
+    name the genome has been loaded under, so a rerun under a new label never
+    leaves a duplicate copy.
     """
     targets = {organism_name} | _organism_names_for_fasta(db_path, fasta_hash)
     targets = {t for t in targets if t}
@@ -298,7 +272,7 @@ def _record_load(db_path: str, input_hash: str, tool: str,
                  input_path: str, row_count: int,
                  fasta_hash: str | None = None,
                  organism_name: str | None = None) -> None:
-    """Record a successful annotation load in the run_log table."""
+    """Records a successful annotation load in the run_log table."""
     def _insert() -> None:
         conn = _get_connection(db_path)
         try:
@@ -498,9 +472,8 @@ def load_csv_to_db(csv_path: str, db_path: str, table_name: str,
     placeholders = ", ".join("?" for _ in headers)
     insert_sql = f"INSERT INTO {table_name} ({', '.join(quoted_headers)}) VALUES ({placeholders});"
 
-    # Cast values to match inferred types. Falls back to a looser type (or
-    # the raw string) if a later row doesn't fit the sampled type -- e.g.
-    # quast's report.tsv mixes integer and float metric rows.
+    # Casts values to the inferred types, falling back to a looser type or the
+    # raw string when a later row does not fit (e.g. quast's report.tsv).
     def cast_row(row):
         result = []
         for val, typ in zip(row, col_types):
@@ -530,8 +503,7 @@ def load_csv_to_db(csv_path: str, db_path: str, table_name: str,
         conn = _get_connection(db_path)
         try:
             conn.execute(create_sql)
-            # Add any columns that are in the TSV but missing from the table
-            # (handles schema evolution when new columns are added to output files)
+            # Adds columns present in the TSV but missing from the table.
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
             for h, t in zip(headers, col_types):
                 if h not in existing:
@@ -596,10 +568,8 @@ def main():
     fasta_hash = hashes[0] if hashes else None
     organism_name = getattr(args, "delete_organism", None)
 
-    # Version-aware skip: if this FASTA was already loaded at PIPELINE_VERSION, skip.
-    # --force bypasses this so scoring reloads (overwrites) on every run -- its OCC
-    # operon reference grows over time, so the same genome must be re-scored and the
-    # DB refreshed each run (see rule load_scoring_to_db in margie_sb.smk).
+    # Skips a FASTA already loaded at PIPELINE_VERSION. --force reloads anyway;
+    # scoring uses it every run since its OCC reference grows (see load_scoring_to_db).
     input_hash = _compute_file_hash(args.input_file)
     if not getattr(args, "force", False) and _already_loaded(args.db_path, input_hash, label, fasta_hash=hashes):
         print(f"Skipped {label}: already at pipeline version {PIPELINE_VERSION}")
@@ -608,9 +578,7 @@ def main():
             Path(args.token).write_text(f"0 rows loaded from {label} (already current)\n")
         return
 
-    # Pre-delete any existing rows for this organism before loading fresh data.
-    # Safe because _already_loaded() above would have returned True and exited
-    # if current-version rows were already present.
+    # Clears this organism's existing rows first; current-version rows would have exited above.
     if organism_name:
         deleted = _delete_stale_organism_rows(args.db_path, label, organism_name,
                                               fasta_hash=hashes)

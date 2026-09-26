@@ -1,42 +1,10 @@
 #!/usr/bin/env python3
-"""Figure 58 - Higher-order fragmentation: does a growing module stay whole?
+"""Figure 58 - higher-order fragmentation: whether a growing module stays whole.
 
-THE QUESTION (scaling the operon-boundary / partner-switching analysis up)
---------------------------------------------------------------------------
-fig 02 asked, for a PAIR, whether a member is separated into another operon or
-left a singleton.  Here we ask the same for k-gene modules: when all k members
-of a conserved module are present in a genome, how often is the WHOLE set really
-one operon - and when it is not, does a member separate into a DIFFERENT operon
-or drop out to a SINGLETON?  This is the fragmentation side of the trust question:
-how much can we trust that a counted k-gene partnership is a real, intact operon?
-
-DEFINITIONS  (gene identity = clean_descriptor; consistent with figs 01-03)
----------------------------------------------------------------------------
-For a k-module S (k consecutive informative operon members in >=1 genome) and a
-genome where ALL k descriptors are present, classify the instance:
-    intact       the whole set is one consecutive operon run
-    rearranged   all k share a single operon but are not a consecutive run
-    split        all k are operonic but occupy >=2 DIFFERENT operons
-    >=1 singleton  at least one member has NO operonic copy (dropped out)
-(priority when ambiguous: a singleton dropout is the most severe, then split,
-then rearranged.)  "separated" = split OR singleton (a member truly leaves the
-module's operon); rearranged stays inside one operon.
-
-Panels
-------
-(a) Fate of every co-present instance, per module size k: intact vs rearranged
-    vs split vs >=1-singleton (stacked).  Full assembly is the exception.
-(b) THE FRAGMENTATION CURVE: fraction of instances where >=1 member separates
-    into another operon (split) or drops to a singleton, vs k - with the intact
-    fraction for reference.
-(c) Recurrent modules are far more trustable: fate breakdown for modules seen
-    together in >=5 genomes vs all modules - the count IS reliable for real
-    modules, not for the incidental long tail.
-(d) A worked example: one conserved multi-gene module drawn across all 21
-    genomes, each cell coloured by its fate - intact in some, split or
-    singleton-fragmented in others (partner switching at higher order).
-
-Read-only analysis; does NOT modify the scoring pipeline.
+For each k-module and genome with all members present, classifies the instance
+as intact, rearranged (same operon, not consecutive), split (>=2 operons) or
+singleton (a member not in any operon), most severe first. Panels: (a) fates per
+k, (b) fragmentation curve, (c) recurrent vs all modules, (d) worked example.
 """
 import csv
 import re
@@ -66,10 +34,12 @@ FATE_LABEL = {"intact": "intact\n(one operon run)",
 
 
 def _norm(d):
+    """Returns the lower-cased, stripped descriptor."""
     return (d or "").strip().lower()
 
 
 def _build_contig_map(run_root, organisms):
+    """Returns {(organism, feature_id): contig id}, parsed from gene_id in labeled-genes.tsv."""
     rx = re.compile(r"^(.*)_(\d+)([+-])(\d+)$")
     m = {}
     for org in organisms:
@@ -88,6 +58,7 @@ def _build_contig_map(run_root, organisms):
 
 
 def compute(genes, run_root):
+    """Returns (organisms, present, desc_ops, mods): presence, operon ids per descriptor and k-runs."""
     g = genes.copy()
     organisms = sorted(g["organism"].unique())
     contig = _build_contig_map(run_root, organisms)
@@ -131,6 +102,7 @@ def compute(genes, run_root):
 
 
 def _fate(key, org, present, desc_ops, together):
+    """Returns the module's fate in one genome: absent, intact, singleton, rearranged or split."""
     members = set(key)
     if not all(org in present[d] for d in members):
         return "absent"
@@ -143,10 +115,11 @@ def _fate(key, org, present, desc_ops, together):
 
 
 def make(genes, operons, outdir):
+    """Tallies fates per k for all and recurrent modules and draws the four panels and TSVs."""
     run_root = outdir.parents[3]
     organisms, present, desc_ops, mods = compute(genes, run_root)
 
-    # ---- fate tallies per k (all co-present instances) --------------------
+    # ---- fate tallies per k (all co-present instances) ----
     tally = {k: defaultdict(int) for k in KS}
     tally_recur = {k: defaultdict(int) for k in KS}   # modules together in >=5 genomes
     for k in KS:
@@ -163,6 +136,7 @@ def make(genes, operons, outdir):
                     tally_recur[k][fate] += 1
 
     def fractions(t):
+        """Returns ({fate: percent}, total) for a tally."""
         tot = sum(t[f] for f in FATE_ORDER)
         return {f: (100 * t[f] / tot if tot else 0.0) for f in FATE_ORDER}, tot
 
@@ -171,7 +145,7 @@ def make(genes, operons, outdir):
     fig, axes = plt.subplots(2, 2, figsize=(15.8, 12.8))
     axA, axB, axC, axD = axes.ravel()
 
-    # ---- (a) stacked fates per k ------------------------------------------
+    # ---- (a) stacked fates per k ----
     x = np.arange(len(KS))
     bottom = np.zeros(len(KS))
     for fate in FATE_ORDER:
@@ -196,7 +170,7 @@ def make(genes, operons, outdir):
     L.boldticks(axA)
     axA.grid(False)
 
-    # ---- (b) fragmentation curve ------------------------------------------
+    # ---- (b) fragmentation curve ----
     kx = np.array(KS)
     intact = np.array([fr[k][0]["intact"] for k in KS])
     split = np.array([fr[k][0]["split"] for k in KS])
@@ -225,7 +199,7 @@ def make(genes, operons, outdir):
     L.boldticks(axB)
     axB.grid(False)
 
-    # ---- (c) recurrent modules vs all -------------------------------------
+    # ---- (c) recurrent modules vs all ----
     fr_rec = {k: fractions(tally_recur[k]) for k in KS}
     all_intact = np.array([fr[k][0]["intact"] for k in KS])
     rec_intact = np.array([fr_rec[k][0]["intact"] for k in KS])
@@ -251,7 +225,7 @@ def make(genes, operons, outdir):
     L.boldticks(axC)
     axC.grid(False)
 
-    # ---- (d) worked example across all genomes ----------------------------
+    # ---- (d) worked example across all genomes ----
     _draw_example(axD, organisms, present, desc_ops, mods)
 
     fig.suptitle("Higher-order fragmentation: a counted k-gene partnership is a "
@@ -259,7 +233,7 @@ def make(genes, operons, outdir):
                  fontsize=13, fontweight="bold", y=1.005)
     fig.tight_layout(h_pad=3.1, w_pad=3.0)
 
-    # ---- TSVs --------------------------------------------------------------
+    # ---- TSVs ----
     rows = []
     for k in KS:
         fs, tot = fr[k]
@@ -280,7 +254,7 @@ def make(genes, operons, outdir):
 
 
 def _pick_example(present, desc_ops, mods):
-    """A conserved size-4/5 module whose genomes show the most fate variety."""
+    """Returns (key, genomes together) for the size-5 or 4 module with the most fate variety."""
     best = None
     for k in (5, 4):
         for key, (inst, together, gaps) in mods[k].items():
@@ -302,6 +276,7 @@ def _pick_example(present, desc_ops, mods):
 
 
 def _draw_example(ax, organisms, present, desc_ops, mods):
+    """Draws the example module as a grid of genomes coloured by fate."""
     key, together = _pick_example(present, desc_ops, mods)
     if key is None:
         ax.axis("off")

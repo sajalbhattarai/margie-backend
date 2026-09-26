@@ -1,34 +1,8 @@
 """
-The tools' containers and reference databases a margie_sb run reads: whether
-each is where the account's config points, whether a run can start without
-the missing ones, and setting up those that are not there.
-
-Where a run looks (workflow_helpers.sif_path / db_path):
-  * containers: <margie_sb.sif_path>/<tool>.sif
-  * databases:  db.<tool> when the config names one, else <margie_sb.db_root>/<tool>
-Both default to the lab's shared folders on depot (WORKFLOW_PATH_DEFAULTS).
-
-A missing one comes from the first of these that has it:
-  1. copy  -- the lab's shared folder, when the config points somewhere else
-              and the shared copy is there (and readable from this account);
-  2. pull  -- margie_sb.container_registry (e.g. docker://ghcr.io/<owner>),
-              containers only, tag margie_sb.container_tag (default latest);
-  3. build -- margie-build's recipes (build.sh), run on the cluster from
-              wherever they already are (build_recipes: margie_sb.build_repo,
-              else the lab's copy on depot, else the user's own clone). Only
-              where there is none does the user clone one, from Install
-              (clone_recipes). Phases 1-8's containers, and the 15 reference
-              databases. Its five
-              licence-gated tools build only with the licence accepted, in
-              words, for that run.
-Nothing already there is replaced or deleted, and nothing is written under
-the lab's depot folder. When the configured folder is there, or cannot be
-written to, what is set up goes under the user's scratch root instead and
-the config is pointed there: the containers folder as a whole (the ones
-already there are linked into it), a database one db.<tool> at a time.
-
-The work runs as the same SLURM copy job as the user's databases
-(user_stores), with its progress bar: one copy at a time.
+Checks the containers (<sif_path>/<tool>.sif) and reference databases (db.<tool> or <db_root>/<tool>)
+a margie_sb run reads, and sets up missing ones by copying from the lab folder, pulling from a
+registry, or building with margie-build. Never writes under the lab's depot folder; the work runs
+as the user_stores SLURM copy job.
 """
 
 from __future__ import annotations
@@ -49,20 +23,18 @@ SHARED_DB = WORKFLOW_PATH_DEFAULTS[WORKFLOW]['db_root']
 SIF_SUB = 'sif'
 DB_SUB = 'reference-databases'
 
-# Run only when chosen, and heavy: never what stops a run that did not choose them.
+# Heavy tools run only when chosen, so their absence never blocks other runs.
 OPTIONAL = {'gtdbtk', 'llm'}
 
-# Not a phase of its own: run_prodigal calls the genes of a genome without a
-# domain or genetic code while GTDB-Tk is off (workflow_helpers.genome_calls).
+# Gene caller for genomes without a domain or genetic code when GTDB-Tk is off (workflow_helpers.genome_calls).
 GENE_CALLER = {'key': 'prodigal', 'label': 'Prodigal', 'sif': 'prodigal.sif'}
 
-# What margie-build (build.sh) can make.
-# Where margie-build is looked for on the cluster, after margie_sb.build_repo:
-# the lab's copy on depot (lab accounts can read it), then the user's own clone.
+# margie-build locations tried after margie_sb.build_repo: the lab's depot copy, then the user's clone.
 BUILD_FOLDER = f'{user_stores.DEPOT}/margie-build'
 CLONE_NAME = 'margie-build'
-# What a clone is made from when neither is there.
+# Clone source when neither location has margie-build.
 BUILD_REPO = 'https://github.com/sajalbhattarai/margie-build.git'
+# What margie-build (build.sh) can make.
 BUILDABLE_IMAGES = {'quast', 'gtdbtk', 'prodigal', 'rasttk', 'cog', 'dbcan', 'eggnog', 'geneprop', 'interpro', 'kegg',
                     'merops', 'pfam', 'pgap', 'tcdb', 'tigrfam', 'uniprot', 'operon', 'phobius', 'tmbed', 'envelope',
                     'deepsig', 'psortb'}
@@ -73,12 +45,12 @@ GATED = {'interpro', 'merops', 'tcdb', 'tmbed', 'phobius'}
 LICENCE_STATEMENT = ('I accept that I am using these tools for non-commercial purposes '
                      'and have received all permissions from the upstream developers.')
 
-# Room kept free on scratch, as a backup keeps on depot.
+# Space kept free on scratch.
 MARGIN = 5 * 1024 ** 3
 
 
 def _expand(path: str, home: str) -> str:
-    """~ is the account's home on the cluster, not this server's."""
+    """Expands ~ against the cluster account's home and strips trailing slashes."""
     path = str(path).strip()
     if path == '~' or path.startswith('~/'):
         path = home.rstrip('/') + path[1:]
@@ -86,20 +58,19 @@ def _expand(path: str, home: str) -> str:
 
 
 def _in_lab(path: str) -> bool:
-    """Under the lab's depot folder: only ever read, even by an account that
-    could write there (depot is shared, and nearly full)."""
+    """Returns True for paths under the lab's depot folder, which setup only reads."""
     return path == user_stores.DEPOT or path.startswith(user_stores.DEPOT + '/')
 
 
 def folders(cfg: dict, home: str) -> tuple[str, str]:
-    """The containers folder and the databases root the run will use."""
+    """Returns the containers folder and databases root the run uses."""
     sif_dir = _cfg_get(cfg, f'{WORKFLOW}.sif_path') or SHARED_SIF
     db_root = _cfg_get(cfg, f'{WORKFLOW}.db_root') or SHARED_DB
     return _expand(sif_dir, home), _expand(db_root, home)
 
 
 def inventory(cfg: dict, home: str) -> list[dict]:
-    """Every container and reference database margie_sb can use, and where the run looks for it."""
+    """Lists every container and reference database margie_sb can use, with where the run looks for it."""
     sif_dir, db_root = folders(cfg, home)
     rows: list[dict] = []
 
@@ -123,9 +94,7 @@ def inventory(cfg: dict, home: str) -> list[dict]:
     return rows
 
 
-# One trip to the cluster: for each row, whether it is there (ok / missing /
-# unknown, when the folder cannot be read from this account), whether the
-# shared copy is, and whether the folder it belongs in can be written to.
+# Shell helpers for one cluster round-trip: has() prints ok/missing/unknown, writable() prints w/r.
 _PROBE = r'''
 near() { d="$1"; while [ ! -e "$d" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; printf '%s' "$d"; }
 has() {
@@ -139,7 +108,7 @@ writable() { d=$(near "$1"); [ -w "$d" ] && [ -x "$d" ] && echo w || echo r; }
 
 
 def build_recipes(conn, cfg: dict, home: str) -> dict:
-    """Where margie-build is on the cluster, if anywhere: {path, source, ...}."""
+    """Finds margie-build on the cluster; returns {path, source, clone_to, url}."""
     chosen = str(_cfg_get(cfg, f'{WORKFLOW}.build_repo') or '').strip()
     clone_to = f"{home.rstrip('/')}/{CLONE_NAME}"
     places = ([('settings', _expand(chosen, home))] if chosen and '://' not in chosen else []) + [
@@ -152,8 +121,8 @@ def build_recipes(conn, cfg: dict, home: str) -> dict:
 
 
 def clone_recipes(conn, cfg: dict, home: str, url: str | None = None) -> dict:
-    """Clone margie-build into the user's home (or update that clone), and
-    point margie_sb.build_repo at it. The caller saves the config."""
+    """Clones or updates margie-build in the user's home and points margie_sb.build_repo at it.
+    The caller saves the config."""
     url = (url or BUILD_REPO).strip()
     dest = f"{home.rstrip('/')}/{CLONE_NAME}"
     q = shlex.quote
@@ -170,6 +139,7 @@ def clone_recipes(conn, cfg: dict, home: str, url: str | None = None) -> dict:
 
 
 def status(conn, cfg: dict, home: str) -> dict:
+    """Probes every inventory row on the cluster and adds its status, writability and source."""
     rows = inventory(cfg, home)
     sif_dir, db_root = folders(cfg, home)
     q = shlex.quote
@@ -213,17 +183,11 @@ def status(conn, cfg: dict, home: str) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Before a run
-# ---------------------------------------------------------------------------
+# ---- Before a run ----
 
 def needed(rows: list[dict], cfg: dict, tools: set[str], genome_names: list[str] | None) -> set[str]:
-    """The ids of the rows a run of these tools reads.
-
-    RASTtk is always part of a run (phase 3's gate). Which gene caller a genome
-    gets is decided from the config (genome_calls): with GTDB-Tk on, RASTtk
-    calls them all; with it off, a genome without a domain or genetic code goes
-    to Prodigal. Without the genomes' names, only RASTtk is asked for.
+    """Returns the ids of the rows a run of these tools reads.
+    RASTtk is always included; Prodigal only for genomes genome_calls sends to it with GTDB-Tk off.
     """
     tools = set(tools) | {'rasttk'}
     if 'gtdbtk' in tools:
@@ -244,24 +208,23 @@ def needed(rows: list[dict], cfg: dict, tools: set[str], genome_names: list[str]
 
 
 def missing_for_run(conn, cfg: dict, home: str, tools: set[str], genome_names: list[str] | None) -> list[dict]:
-    """What this run needs and is not there. "Cannot tell" (a folder this
-    account cannot read) is not missing: the run is the judge of that."""
+    """Returns the rows this run needs that are missing; unreadable ("unknown") rows are not counted."""
     st = status(conn, cfg, home)
     want = needed(st['rows'], cfg, tools, genome_names)
     return [r for r in st['rows'] if r['id'] in want and r['status'] == 'missing']
 
 
 def describe_missing(rows: list[dict]) -> str:
+    """Builds the user-facing message listing missing rows."""
     what = '; '.join(f"{r['label']} {'container' if r['kind'] == 'image' else 'database'} ({r['path']})" for r in rows)
     return (f'Not where your config points, and this run needs them: {what}. '
             'Set them up on Install, under "Tools and reference data", or leave those tools out of this run.')
 
 
-# ---------------------------------------------------------------------------
-# Setting up
-# ---------------------------------------------------------------------------
+# ---- Setting up ----
 
 def _sizes(conn, paths: list[str]) -> dict[str, int]:
+    """Returns the byte size of each path via du on the cluster."""
     if not paths:
         return {}
     code, out = _run(conn, 'du -sbL ' + ' '.join(shlex.quote(p) for p in paths) + ' 2>/dev/null', timeout=600)
@@ -274,7 +237,7 @@ def _sizes(conn, paths: list[str]) -> dict[str, int]:
 
 
 def _target(conn, path: str, home: str) -> str:
-    """A folder the user chose for the set-up copies: theirs to write to, and not the lab's."""
+    """Validates a user-chosen target folder: absolute, outside the lab folder, and writable."""
     p = _expand(path, home)
     if not p.startswith('/'):
         raise StoreError(f'{path}: give the whole path, from /.', 400)
@@ -288,16 +251,9 @@ def _target(conn, path: str, home: str) -> str:
 
 def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[str] | None = None,
          include_optional: bool = False, sif_to: str | None = None, db_to: str | None = None) -> dict:
-    """What setting up would do, item by item, and what it cannot do and why.
-    GTDB-Tk and the LLM layer (hundreds of GB between them) only when asked.
-
-    Where things go: sif_to and db_to when the user chose them (the containers
-    folder becomes sif_to; each database goes to <db_to>/<tool>); otherwise
-    where the config points when that can be written to, else under the
-    user's scratch root. The config is pointed at wherever they end up.
-
-    The same answer the Yes / No question shows and the job then runs, so it
-    is worked out again when Yes is pressed."""
+    """Returns the setup plan: items to fetch, skipped rows with reasons, and config changes.
+    Targets are sif_to/db_to if given, else the configured folder if writable, else scratch.
+    Optional tools are included only with include_optional."""
     accept = accept or set()
     sif_choice = _target(conn, sif_to, home) if sif_to and sif_to.strip() else None
     db_choice = _target(conn, db_to, home) if db_to and db_to.strip() else None
@@ -331,7 +287,7 @@ def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[st
             return False
         return True
 
-    # Containers: one folder for all of them.
+    # Containers share one folder.
     images = [r for r in todo if r['kind'] == 'image' and usable(r)]
     sif_target = st['sif_dir']
     links: list[dict] = []
@@ -347,8 +303,7 @@ def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[st
         items.append({**_item(r), 'dst': f"{sif_target}/{r['name']}"})
     ready_images = {r['tool'] for r in rows if r['kind'] == 'image' and r['status'] == 'ok'} | {r['tool'] for r in images}
 
-    # Databases: each in the chosen folder, or where the config points, or
-    # under scratch -- with db.<tool> pointed there when that is not its place.
+    # Databases go to the chosen folder, the configured path, or scratch; db.<tool> follows them.
     db_home = db_choice or f'{root}/{DB_SUB}'
     for r in todo:
         if r['kind'] != 'database' or not usable(r):
@@ -374,7 +329,7 @@ def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[st
     return {
         'root': root,
         'sif_dir': sif_target,
-        # Where the databases set up here go (the page offers to change it).
+        # Where newly set-up databases go.
         'db_dir': db_choice or (db_home if any(k.startswith('db.') for k in config) else st['db_root']),
         'items': items,
         'links': [{'src': r['path'], 'dst': f"{sif_target}/{r['name']}"} for r in links],
@@ -391,13 +346,14 @@ def plan(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[st
 
 
 def _item(r: dict) -> dict:
+    """Builds a plan item from a status row."""
     return {'id': r['id'], 'label': r['label'], 'kind': r['kind'], 'tool': r['tool'], 'action': r['source'],
             'src': r['shared'] if r['source'] == 'copy' else r['url'], 'gated': r['gated']}
 
 
 def start(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[str] | None = None,
           include_optional: bool = False, sif_to: str | None = None, db_to: str | None = None) -> dict:
-    """Set up what the plan can: one SLURM job, the copy job's progress bar."""
+    """Runs the plan as one SLURM copy job and returns its progress and the plan."""
     op = user_stores.progress(conn, cfg)
     if op and op.get('state') in ('queued', 'running'):
         raise StoreError('A copy is already under way.', 409)
@@ -433,7 +389,7 @@ def start(conn, cfg: dict, home: str, include_builds: bool = True, accept: set[s
             steps.append(['build', f"Building the {i['label']} {what}", mode, tool, p['sif_dir'],
                           posixpath.dirname(i['dst']) if i['kind'] == 'database' else f"{p['root']}/{DB_SUB}",
                           LICENCE_STATEMENT if i['gated'] else ''])
-    # Downloading and indexing a database can take most of a day, and memory.
+    # Builds download and index databases, so they get more time and memory.
     heavy = p['builds'] > 0
     user_stores._start(conn, p['root'], 'assets', steps, {'kind': 'assets', 'config': p['config']}, cfg,
                        walltime=str(_cfg_get(cfg, f'{WORKFLOW}.setup_walltime') or ('24:00:00' if heavy else '12:00:00')),

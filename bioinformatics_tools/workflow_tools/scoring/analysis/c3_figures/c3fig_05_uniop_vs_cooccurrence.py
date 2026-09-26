@@ -1,45 +1,9 @@
-"""Figure 59 - Does UniOP's per-PAIR operonic probability reflect the empirical
-cross-genome co-occurrence?
+"""Figure 59 - compares UniOP's per-pair operon probability with cross-genome co-occurrence.
 
-THE QUESTION (operon-index thread)
-==================================
-figs 01-04 measured, per functional (descriptor) pair, an *empirical*
-cross-genome signal: the conditional co-occurrence
-        cond = (# genomes where A,B are operon-adjacent)
-               / (# genomes where both A,B are present as operon members)
-cond = 1.0 means "wherever both functions exist they are always operon
-partners" - a deterministic, conserved module.
-
-UniOP itself already emits a per-adjacency probability for every operonic pair
-(OPERON_upstream/downstream_pairwise_probability in operon/operon_results.tsv).
-So: does that model probability ALREADY contain the conservation signal, or is
-the empirical co-occurrence independent information the index must add?
-
-METHOD
-======
-* Gene identity = clean_descriptor (lower-cased), exactly as fig 01.  A pair is
-  a sorted descriptor pair; a within-operon adjacency = two informative genes
-  consecutive by start in the SAME operon on the SAME contig.
-* For every such adjacency we look up UniOP's pairwise probability from that
-  organism's operon_results.tsv (keyed by the unordered feature-id pair) and
-  aggregate per descriptor pair (mean / median across genome instances).
-* We then compare that UniOP probability to the empirical conditional
-  co-occurrence, and - as a mechanism control - to the intergenic gap.
-
-FINDING (panels)
-================
-(a) UniOP pairwise prob is nearly FLAT across conditional-co-occurrence bins
-    (Spearman ~ 0.06): it is ~0.9 whether a pair always co-occurs or rarely does.
-(b) It cannot separate deterministic modules (cond=1) from flimsy pairs
-    (cond<0.5): the two UniOP distributions overlap (Mann-Whitney n.s.).
-(c) What UniOP DOES encode is the intergenic gap (Spearman ~ -0.76) - a
-    single-genome, distance-driven signal, blind to conservation.
-(d) Concretely, a flimsy pair that co-occurs in ~6% of genomes can get a HIGHER
-    UniOP probability than the perfectly conserved ribosomal super-operon.
-
-=> UniOP probability and empirical co-occurrence are orthogonal.  The pan-genome
-co-occurrence metric is NOT redundant with UniOP - it is independent evidence
-the operon index should add.  (Read-only prototype; scorer untouched.)
+Looks up UniOP's pairwise probability (operon/operon_results.tsv) for every
+within-operon informative adjacency and relates it, per descriptor pair, to the
+conditional co-occurrence and to the intergenic gap (scipy.stats).
+Panels: (a) by co-occurrence bin, (b) always-together vs flimsy, (c) by gap, (d) examples.
 """
 import csv
 import re
@@ -58,18 +22,19 @@ csv.field_size_limit(10_000_000)
 
 SUB = "01-operon-context-confidence"
 
-# conditional-co-occurrence bins for panel (a)
+# Conditional co-occurrence bins for panel (a).
 COND_BINS = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 0.999), (0.999, 1.01)]
 COND_LAB = ["0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-<1", "=1.0"]
 COND_COL = [L.RED, L.ORANGE, L.AMBER, L.YELLOW, L.TEAL, L.GREEN]
 
-# intergenic-distance bins for panel (c)
+# Intergenic-distance bins for panel (c).
 GAP_BINS = [(-10**9, -1), (0, 0), (1, 100), (100, 10**9)]
 GAP_LAB = ["<0", "=0", "1-100", ">100"]
 GAP_COL = [L.GREEN, L.TEAL, L.LIME, L.RED]
 
 
 def _build_contig_map(run_root, organisms):
+    """Returns {(organism, feature_id): contig id}, parsed from gene_id in labeled-genes.tsv."""
     rx = re.compile(r"^(.*)_(\d+)([+-])(\d+)$")
     m = {}
     for org in organisms:
@@ -89,7 +54,7 @@ def _build_contig_map(run_root, organisms):
 
 
 def _uniop_pair_probs(run_root, organisms):
-    """(organism, frozenset{fidA,fidB}) -> UniOP pairwise operonic probability."""
+    """Returns {(organism, frozenset{fidA, fidB}): UniOP pairwise operon probability}."""
     pp = {}
     for org in organisms:
         path = run_root / org / "operon" / "operon_results.tsv"
@@ -111,6 +76,7 @@ def _uniop_pair_probs(run_root, organisms):
 
 
 def _gap_bin_idx(gap):
+    """Returns the index of the GAP_BINS entry containing gap."""
     for i, (lo, hi) in enumerate(GAP_BINS):
         if lo <= gap <= hi:
             return i
@@ -118,6 +84,7 @@ def _gap_bin_idx(gap):
 
 
 def make(genes, operons, outdir):
+    """Joins UniOP pair probabilities to per-pair co-occurrence and draws the panels and TSVs."""
     run_root = outdir.parents[3]
     g = genes.copy()
     organisms = sorted(g["organism"].unique())
@@ -125,6 +92,7 @@ def make(genes, operons, outdir):
     g["contig"] = [contig.get((o, f)) for o, f in zip(g["organism"], g["feature_id"])]
 
     def norm(d):
+        """Returns the lower-cased, stripped descriptor."""
         return (d or "").strip().lower()
 
     uninf = {(o, f): bool(u) for o, f, u in
@@ -134,7 +102,7 @@ def make(genes, operons, outdir):
 
     pairprob = _uniop_pair_probs(run_root, organisms)
 
-    # ---- within-operon adjacencies (identical rule to fig 01) --------------
+    # ---- within-operon adjacencies (same rule as fig 01) ----
     pair_orgs = defaultdict(set)
     present = defaultdict(set)
     pair_probs = defaultdict(list)
@@ -167,7 +135,7 @@ def make(genes, operons, outdir):
                 inst_prob.append(pp)
                 inst_gap.append(gap)
 
-    # ---- per-pair joined table ---------------------------------------------
+    # ---- per-pair joined table ----
     rows = []
     for key, orgs in pair_orgs.items():
         a, b = key
@@ -195,20 +163,20 @@ def make(genes, operons, outdir):
     rho_cond, p_cond = spearmanr(cond_w, prob_w)
     rho_gap, p_gap = spearmanr(inst_prob, inst_gap)
 
-    # always-together vs flimsy (both well-sampled)
+    # Always-together vs flimsy pairs, both well sampled.
     strong = pairs[pairs["n_genomes_copresent"] >= 5]
     alw = strong[strong["conditional_cooccurrence"] >= 0.999]["mean_uniop_prob"].to_numpy()
     flm = strong[strong["conditional_cooccurrence"] < 0.5]["mean_uniop_prob"].to_numpy()
     mw_p = mannwhitneyu(alw, flm, alternative="two-sided").pvalue if len(alw) > 5 and len(flm) > 5 else float("nan")
 
-    # ======================= FIGURE =========================================
+    # ---- figure ----
     fig, axes = plt.subplots(2, 2, figsize=(15.6, 12.6))
     axA, axB, axC, axD = axes.ravel()
     fig.suptitle("Does UniOP's per-pair operonic probability reflect the empirical co-occurrence?  "
                  "No - it encodes the intergenic gap, not conservation",
                  fontsize=15, fontweight="bold", y=0.985)
 
-    # ---- (a) UniOP prob across conditional-co-occurrence bins --------------
+    # ---- (a) UniOP prob across conditional-co-occurrence bins ----
     data_a, meds_a, ns_a = [], [], []
     for lo, hi in COND_BINS:
         sel = (cond_w >= lo) & (cond_w < hi)
@@ -239,7 +207,7 @@ def make(genes, operons, outdir):
     axA.grid(False)
     L.boldticks(axA)
 
-    # ---- (b) always-together vs flimsy overlap -----------------------------
+    # ---- (b) always-together vs flimsy overlap ----
     edges = np.linspace(0.5, 1.0, 26)
     axB.hist(flm, bins=edges, density=True, color=L.RED, alpha=0.55,
              label="flimsy  (cond < 0.5,  n = %d)" % len(flm))
@@ -258,7 +226,7 @@ def make(genes, operons, outdir):
     axB.grid(False)
     L.boldticks(axB)
 
-    # ---- (c) mechanism: UniOP prob across intergenic-distance bins ---------
+    # ---- (c) mechanism: UniOP prob across intergenic-distance bins ----
     data_c, meds_c, ns_c = [], [], []
     idx = np.array([_gap_bin_idx(x) for x in inst_gap])
     for i in range(len(GAP_BINS)):
@@ -288,8 +256,9 @@ def make(genes, operons, outdir):
     axC.grid(False)
     L.boldticks(axC)
 
-    # ---- (d) concrete contrast --------------------------------------------
+    # ---- (d) concrete contrast ----
     def _dedup(df):
+        """Returns (row, label) pairs with duplicate short labels dropped."""
         seen, keep = set(), []
         for _, r in df.iterrows():
             lab = "%s + %s" % (L.short_desc(r["function_1"], 30),
@@ -338,7 +307,7 @@ def make(genes, operons, outdir):
     fig.tight_layout(rect=[0, 0, 1, 0.965])
     L.savefig(fig, outdir / "fig05_uniop_vs_cooccurrence.png")
 
-    # ---- TSVs --------------------------------------------------------------
+    # ---- TSVs ----
     pairs_sorted = pairs.sort_values(["n_genomes_copresent", "conditional_cooccurrence"],
                                      ascending=[False, False])
     L.write_tsv(pairs_sorted, outdir / "fig05_pair_uniop_vs_cooccurrence.tsv")

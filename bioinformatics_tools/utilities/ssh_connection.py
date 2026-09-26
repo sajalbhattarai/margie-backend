@@ -24,45 +24,23 @@ import paramiko
 
 LOGGER = logging.getLogger(__name__)
 
-# The same repository margie-frontend's hpc-connect.sh clones for the API
-# (BACKEND_REPO_URL, ~/margie-backend), so a first-time account's workflow
-# checkout and the API's are one codebase.
+# The repository margie-frontend's hpc-connect.sh clones for the API
+# (BACKEND_REPO_URL), so the workflow checkout and the API share one codebase.
 _DANE_WF_REPO_URL = 'https://github.com/sajalbhattarai/margie-backend.git'
-# Branch margie_sb's remote checkouts should track once wintermutant has this
-# team's work -- for now this branch IS that work, still ahead of master.
-# margie itself is wintermutant's and is deliberately never auto-synced (see
-# sync_remote_dane_wf's callers), so this only ever matters for margie_sb.
-# Override with BSP_MARGIE_SB_REF once this branch is merged upstream.
+# Branch that margie_sb remote checkouts track (override with BSP_MARGIE_SB_REF).
+# The margie workflow is never auto-synced, so this applies only to margie_sb.
 _MARGIE_SB_REF = os.getenv('BSP_MARGIE_SB_REF', 'for-website-deployment')
 
-# ---------------------------------------------------------------------------
-# Connection pool.
-#
-# connect() used to build a fresh paramiko.SSHClient and complete a full TCP +
-# SSH + public-key handshake on EVERY call. Every file listing, history load
-# and status poll in the GUI paid that -- typically several hundred ms to well
-# over a second against an HPC login node -- before doing any actual work. That
-# is why the file and history lists felt slow: almost all of the wait was
-# reconnecting, not listing.
-#
-# Clients are now reused per (host, username, key). A pooled client is handed
-# back only if its transport is still active; a dead one is discarded and
-# replaced, so a dropped VPN or a bounced login node self-heals on the next
-# request rather than raising.
+# ---- Connection pool ----
+# Clients are reused per (host, username, key) to avoid a full SSH handshake per
+# request; a dead client is discarded and replaced on the next request.
 _POOL: dict = {}
 _POOL_LOCK = threading.Lock()
-# A pooled client is kept for as long as it works. It used to be replaced
-# every 10 minutes, and the replaced one was never closed: a paramiko
-# transport is a running thread, which keeps it alive whoever else lets go,
-# so a server up for hours held dozens of connections to the cluster (36
-# after 5.5 hours, 2026-09-24) and answered ever more slowly. Keepalives let
-# a connection the network dropped be noticed and replaced instead.
+# A pooled client is kept for as long as it works (an unclosed paramiko
+# transport keeps its thread alive); keepalives let a dropped one be replaced.
 _KEEPALIVE_SECONDS = 30
-# Connections per user, used in turn. One is not enough: sshd allows 10
-# sessions per connection (MaxSessions), and a page opening several folders
-# while runs are polled went past that ("ChannelException(2, 'Connect
-# failed')", 2026-09-24). A few, each kept for good, spread the sessions
-# without the leak coming back.
+# Connections per user, used in turn: sshd allows 10 sessions per connection
+# (MaxSessions), which one busy page can exceed.
 _POOL_SIZE = 4
 
 
@@ -75,8 +53,7 @@ def _alive(client) -> bool:
 
 
 def _pool_key(host, username, pkey, key_filename):
-    # Keys are objects; their fingerprint identifies the credential without
-    # holding the material in the dict key.
+    # Keys are identified by fingerprint, so the key material is not held in the dict key.
     fp = None
     if pkey is not None:
         try:
@@ -87,7 +64,7 @@ def _pool_key(host, username, pkey, key_filename):
 
 
 def close_pooled_connections():
-    """Drop every pooled client. For shutdown and tests."""
+    """Closes every pooled client, for shutdown and tests."""
     with _POOL_LOCK:
         for entry in _POOL.values():
             for client in entry['slots']:
@@ -136,7 +113,7 @@ class SSHConnection:
         self.key_filename = key_filename   # file path (CLI fallback)
 
     def _handshake(self) -> paramiko.SSHClient:
-        """Build and authenticate a brand-new client. No pool involvement."""
+        """Builds and authenticates a new client, outside the pool."""
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         connect_kwargs: dict = {'username': self.username}
@@ -144,7 +121,7 @@ class SSHConnection:
             connect_kwargs['pkey'] = self.pkey
         elif self.key_filename:
             connect_kwargs['key_filename'] = self.key_filename
-        # If neither is set, paramiko falls back to the system SSH agent (CLI default)
+        # With neither set, paramiko falls back to the system SSH agent.
         ssh.connect(self.host, **connect_kwargs)
         transport = ssh.get_transport()
         if transport is not None:
@@ -153,15 +130,10 @@ class SSHConnection:
         return ssh
 
     def connect(self, pooled: bool = True) -> paramiko.SSHClient:
-        """Return a live SSH connection, reusing a pooled one when possible.
+        """Returns a live SSH connection, reusing a pooled one when possible.
 
-        pooled=False returns a client of the caller's own, never entered into
-        the pool and never handed to anyone else. Use it for anything that
-        holds its client for longer than a single request -- see
-        ssh_slurm.submit_ssh_job, which keeps one for the hours a workflow run
-        lasts. A pooled client is the wrong tool there: it is shared with every
-        concurrent status poll and file listing, so its session budget and its
-        lifetime are not the holder's to rely on.
+        pooled=False returns a private client outside the pool, for callers that
+        hold it beyond one request (e.g. ssh_slurm.submit_ssh_job for a whole run).
         """
         if not self.host or not self.username:
             raise ValueError(
@@ -179,22 +151,19 @@ class SSHConnection:
             slot = entry['next']
             entry['next'] = (slot + 1) % _POOL_SIZE
             client = entry['slots'][slot]
-        # is_active() alone is not enough: anything not verifiably usable is
-        # replaced rather than handed out (a closed client has _transport None,
-        # which surfaces as "'NoneType' object has no attribute 'open_session'").
+        # is_active() alone is not enough: a closed client has _transport None,
+        # so anything not verifiably usable is replaced.
         if client is not None and _alive(client):
             LOGGER.debug('Reusing pooled SSH connection %d to %s', slot, self.host)
             return client
-        # One handshake per slot at a time: requests arriving together wait
-        # for it rather than each making a connection only to close it.
+        # One handshake per slot at a time; concurrent requests wait for it.
         with entry['making'][slot]:
             with _POOL_LOCK:
                 current = entry['slots'][slot]
             if current is not None and _alive(current):
                 return current
             if current is not None:
-                # Dead: nothing is left to take from anyone by closing it. A
-                # live one is never closed -- a request or a run may use it.
+                # Only dead clients are closed; a live one may still be in use.
                 try:
                     current.close()
                 except Exception:
@@ -206,10 +175,8 @@ class SSHConnection:
 
 
 def runs_here(connection: 'SSHConnection') -> bool:
-    """Is this process on the cluster the connection goes to, as the same
-    user? (As the desktop app runs the API: on a login node, as the user.)
-    Then the user's files can be read directly, with the same permissions,
-    instead of over SSH. A server elsewhere (the web deployment) is not."""
+    """Returns True when this process runs on the connection's cluster as the same
+    user (the desktop app's API on a login node), so files can be read directly."""
     import getpass
     import socket
     if not connection.username or connection.username != getpass.getuser():
@@ -237,17 +204,11 @@ def make_user_connection(
 
 def ensure_remote_dane_wf(conn: SSHConnection, *, repo_url: str = _DANE_WF_REPO_URL, timeout: float = 300.0) -> None:
     """
-    Make sure this user's cluster account has a working `dane_wf` before their
-    first job is submitted. Clones bioinformatics-tools into
-    ~/bioinformatics-tools and runs `uv sync` only when a built dane_wf isn't
-    already there -- an existing checkout (including a single-developer setup
-    where it's a symlink into a live dev checkout, see main.py's
-    _ensure_remote_deployment_symlink) is never touched.
+    Ensures the user's cluster account has a working `dane_wf` before the first job.
 
-    Mirrors the same clone/uv-sync bootstrap margie.sh performs for a local
-    dev launch, so a hosted deployment's first-login path and a laptop's
-    `./margie.sh` provision the exact same thing. Raises RuntimeError with the
-    remote output on failure -- callers decide how to surface that to the user.
+    Clones into ~/bioinformatics-tools and runs `uv sync` only when no built
+    dane_wf exists; an existing checkout or symlink is never touched. Raises
+    RuntimeError with the remote output on failure.
     """
     command = f'''set -e
 if [ ! -x "$HOME/bioinformatics-tools/.venv/bin/dane_wf" ]; then
@@ -278,29 +239,15 @@ test -x "$HOME/bioinformatics-tools/.venv/bin/dane_wf"
 
 def sync_remote_dane_wf(conn: SSHConnection, *, ref: str = _MARGIE_SB_REF, timeout: float = 30.0) -> str:
     """
-    Best-effort check for whether this user's ~/bioinformatics-tools is behind
-    `ref` on origin, and if so (and only if the checkout has no local changes),
-    fast-forwards it with `git reset --hard` + `uv sync`.
+    Fast-forwards ~/bioinformatics-tools to `ref` on origin when it is behind and clean.
 
-    Deliberately cheap in the common case: a `git fetch` plus a SHA comparison,
-    not a full uv sync every call -- job launches must not pay the multi-second
-    (or worse) cost profiled for `uvx --from` (see ensure_remote_dane_wf's
-    docstring) on every single run. The heavier reset+sync only happens on the
-    rare call where a real deployment has actually landed since this user's
-    last job.
+    Cheap in the common case (a `git fetch` plus a SHA comparison); the
+    `git reset --hard` + `uv sync` runs only when a new deployment has landed.
+    Never raises. Returns 'unprovisioned', 'not-a-git-checkout', 'up-to-date',
+    'dirty-skipped', 'updated', 'disabled' or 'error: <detail>'.
 
-    Never raises: a missing checkout, a non-git install (e.g. one placed by
-    margie.sh's archive-download fallback), a dirty tree, or any SSH hiccup is
-    logged and skipped so a sync-check problem never blocks an actual job.
-    Returns a short status string for logging/telemetry: 'unprovisioned',
-    'not-a-git-checkout', 'up-to-date', 'dirty-skipped', 'updated',
-    'disabled', or 'error: <detail>'.
-
-    BSP_SKIP_DANE_WF_SYNC=1 on the API turns it off. That is for a developer
-    whose API and "cluster" are one machine: there ~/bioinformatics-tools is
-    their own working checkout (api/main.py links it), and once its tree is
-    clean this would check out `ref` and reset it to origin, discarding the
-    branch they are on (scripts/dev-local/start.sh sets it).
+    BSP_SKIP_DANE_WF_SYNC=1 disables it, for a developer whose API and cluster
+    are one machine (scripts/dev-local/start.sh sets it).
     """
     if os.environ.get('BSP_SKIP_DANE_WF_SYNC'):
         LOGGER.info('dane_wf version-sync check disabled by BSP_SKIP_DANE_WF_SYNC')

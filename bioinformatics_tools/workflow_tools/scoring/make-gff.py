@@ -1,5 +1,5 @@
 """
-Build a GFF3 file from the mechanical FINAL-scored-labeled-genes-annotated.tsv.
+Builds a GFF3 file from FINAL-scored-labeled-genes-annotated.tsv.
 
 Each CDS feature carries these attributes (GFF3 percent-encoded):
     ID               – feature_id  (fig|..peg.N)
@@ -9,8 +9,7 @@ Each CDS feature carries these attributes (GFF3 percent-encoded):
     confidence_score – final blended confidence score
     flagging         – confidence_flag; flag_reason (if any)
 
-seqname (column 1) is looked up from rast.gff via the ID= attribute,
-because rast.gff is the authoritative source for per-feature contig IDs.
+seqname (column 1) comes from rast.gff's CDS lines, matched by ID=.
 
 Usage:
     python make-gff.py \\
@@ -29,12 +28,12 @@ _GFF3_SAFE = " ,:/.-_@|#"  # chars kept as-is inside GFF3 attribute values
 
 
 def _encode(value: str) -> str:
-    """Percent-encode a GFF3 attribute value, preserving common safe chars."""
+    """Percent-encodes a GFF3 attribute value with urllib.parse.quote, keeping _GFF3_SAFE characters."""
     return quote(value, safe=_GFF3_SAFE)
 
 
 def _build_seqname_lookup(rast_gff_path):
-    """Return {feature_id: seqname} from rast.gff CDS lines."""
+    """Returns {feature_id: seqname} from rast.gff CDS lines."""
     lookup = {}
     with open(rast_gff_path) as fh:
         for line in fh:
@@ -56,6 +55,7 @@ def _build_seqname_lookup(rast_gff_path):
 
 
 def main() -> None:
+    """Reads the FINAL table with csv and writes one GFF3 CDS line per gene."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--final",    required=True, help="FINAL-scored-labeled-genes-annotated.tsv")
     ap.add_argument("--rast-gff", required=True, help="rasttk/rast.gff")

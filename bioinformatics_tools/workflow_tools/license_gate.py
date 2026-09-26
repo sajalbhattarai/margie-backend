@@ -1,23 +1,8 @@
 """Command-line licensing gate for the MARGIE pipeline.
 
-A run must not proceed until the operator has accepted the current licensing
-terms. There are two ways that acceptance can already be satisfied:
-
-  1. The web app (dane-api) verifies acceptance in its database before it SSHes
-     in and runs `dane_wf`. It passes the result down as environment variables
-     (see ENV_* below), so this gate never re-prompts a web-initiated run — it
-     just honours the entitlement the web side already recorded.
-
-  2. A previous interactive CLI acceptance, saved to
-     ~/.config/bioinformatics-tools/license-acceptance.json.
-
-If neither applies, an interactive run prompts the user to read and accept the
-terms (and record their usage type + which license-required tools they hold);
-a non-interactive run with no prior acceptance is refused with a clear message
-rather than hanging on input.
-
-The entitlement (usage type + self-licensed tools) then drives which tools are
-disabled for the run — see ``disabled_tool_ids`` in the licensing catalog.
+Accepts a web-app acceptance passed in ENV_* variables or a saved CLI acceptance;
+otherwise prompts interactively, or refuses a non-interactive run. The resulting
+entitlement decides which tools are disabled (catalog.disabled_tool_ids).
 """
 from __future__ import annotations
 
@@ -29,8 +14,7 @@ from pathlib import Path
 
 from bioinformatics_tools.api.licensing import catalog
 
-# Set by dane-api on the remote `dane_wf` command once it has confirmed the
-# user's acceptance in its own database.
+# Set by dane-api on the remote dane_wf command after it confirms acceptance.
 ENV_ACCEPTED = "MARGIE_LICENSE_ACCEPTED"   # terms version (or any truthy value)
 ENV_USAGE = "MARGIE_USAGE_TYPE"            # "academic" | "commercial"
 ENV_LICENSED = "MARGIE_LICENSED_TOOLS"     # comma-separated tool ids
@@ -58,12 +42,11 @@ def _load_local() -> dict | None:
 
 
 def ensure_cli_license() -> dict:
-    """Return the caller's entitlement ``{usage_type, licensed_tools, source}``.
+    """Returns the entitlement {usage_type, licensed_tools, source}, prompting if needed.
 
-    Prompts for first-time acceptance when run interactively. Raises
-    ``LicenseError`` if the terms have not been accepted and we cannot prompt.
+    Raises LicenseError when the terms are not accepted and no terminal is available.
     """
-    # 1) Web/API path — acceptance already verified; honour the passed entitlement.
+    # 1) Web/API run: acceptance already verified by dane-api.
     if os.environ.get(ENV_ACCEPTED):
         return {
             "usage_type": os.environ.get(ENV_USAGE) or None,
@@ -92,9 +75,7 @@ def ensure_cli_license() -> dict:
     return _interactive_accept(current)
 
 
-# --------------------------------------------------------------------------- #
-# Interactive acceptance
-# --------------------------------------------------------------------------- #
+# ---- interactive acceptance ----
 def _ask_required(prompt: str) -> str:
     while True:
         value = input(prompt).strip()
@@ -114,8 +95,7 @@ def _ask_yes_no(prompt: str) -> bool:
 
 
 def _print_license_disclosure(cat: dict) -> None:
-    """Print the license of every third-party tool / database, verbatim from the
-    catalog, so the user can review and accept them (and credit the authors)."""
+    """Prints each third-party tool's license details from the catalog."""
     tools = sorted(cat.get("tools", []), key=lambda t: (t.get("phase", 0), t.get("name", "")))
     print("\n" + "=" * 74)
     print("PER-TOOL / DATABASE LICENSE DETAILS")
@@ -219,25 +199,25 @@ def _interactive_accept(current_version: str) -> dict:
         "accepted_acknowledgments": [item["id"] for item in catalog.ACK_ITEMS],
         "usage_type": usage_type,
         "licensed_tools": sorted(set(licensed)),
-        # Exact snapshot of the per-tool license details shown, recorded to depot.
+        # Snapshot of the per-tool license details exactly as shown.
         "license_catalog": cat,
         "source": "cli",
     }
 
-    # Best-effort mirror to the shared depot record dir (legal record-keeping).
+    # Best-effort copy to the shared depot record dir.
     depot_path = catalog.save_depot_record(
         username=re_safe(name or os_user), record=record,
         terms_text=terms["text"], timestamp=timestamp_dir,
     )
     record["depot_record_path"] = depot_path
-    # Durable, timestamped copy under the user's own data dir (always kept).
+    # Timestamped copy under the user's own data dir.
     local_archive = catalog.save_local_record(
         username=re_safe(name or os_user), record=record,
         terms_text=terms["text"], timestamp=timestamp_dir,
     )
     record["local_archive_path"] = local_archive
 
-    # Local record (this is what future runs read to skip re-prompting).
+    # Local record that later runs read to skip the prompt.
     path = _config_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

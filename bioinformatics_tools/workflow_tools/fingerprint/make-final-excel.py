@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""make-final-excel.py — convert the FINAL annotation TSV to a coloured Excel workbook.
+"""make-final-excel.py — converts the FINAL annotation TSV to a coloured Excel workbook (openpyxl).
 
-Each data row is filled edge to edge with its CONFIDENCE_TIER_HYBRID tier colour
-(highest=blue, high=green, medium=yellow, fair=orange, low=red; non-coding=grey),
-so every row reads as a single tier band. Rows flagged NEEDS_REVIEW? = yes also
-get a box border around the whole row. A second "Legend" sheet explains both.
+Each row is tinted with its CONFIDENCE_TIER_HYBRID colour (non-coding rows grey),
+rows with NEEDS_REVIEW? = yes get a box border, and a "Legend" sheet explains both.
 """
 from __future__ import annotations
 
@@ -20,10 +18,8 @@ from openpyxl.utils import get_column_letter
 
 csv.field_size_limit(10_000_000)
 
-# ── FINAL-file coloring — MATCHES the operon-diagram figures
-#    (reportfig_lib.CONF_TIER_COLOR). Every row is tinted edge to edge with its
-#    CONFIDENCE_TIER_HYBRID tier colour; review rows also get a box border.
-#    Kept in sync with api/routers/ssh.py. ─────────────────────────────────────
+# ── Tier colours, kept in sync with reportfig_lib.CONF_TIER_COLOR and
+#    api/routers/ssh.py. ────────────────────────────────────────────────────────
 _TIER_BRIGHT = {
     "highest": "1F77FF",   # blue
     "high":    "00B84D",   # green
@@ -38,6 +34,7 @@ _REVIEW_SIDE = Side(style="medium", color="000000")  # box border on review rows
 
 
 def _tint_hex(h: str, toward_white: float = 0.86) -> str:
+    """Blends a hex colour toward white by the given fraction and returns the new hex."""
     h = h.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     r = round(r + (255 - r) * toward_white)
@@ -101,8 +98,7 @@ _FONT_CACHE: dict[tuple[str, bool], Font] = {}
 
 
 def _fill(hex_color: str) -> PatternFill:
-    # reuse one PatternFill object per colour -- openpyxl then dedups by identity,
-    # which turns ~200k per-cell style assignments from minutes into seconds.
+    """Returns a cached solid PatternFill per colour; openpyxl dedups styles by identity, which keeps large sheets fast."""
     f = _FILL_CACHE.get(hex_color)
     if f is None:
         f = PatternFill("solid", fgColor=hex_color)
@@ -111,6 +107,7 @@ def _fill(hex_color: str) -> PatternFill:
 
 
 def _font(hex_color: str, bold: bool = False) -> Font:
+    """Returns a cached openpyxl Font per (colour, bold)."""
     key = (hex_color, bold)
     f = _FONT_CACHE.get(key)
     if f is None:
@@ -120,13 +117,12 @@ def _font(hex_color: str, bold: bool = False) -> Font:
 
 
 def _norm_col(name: str) -> str:
-    # FINAL_ANNOTATION_WITH_CONFIDENCE supports prefixed headers like:
-    #   "[AN]-NEEDS_REVIEW?"  (legacy)
-    #   "Column-AN: NEEDS_REVIEW?"  (current)
+    """Lower-cases a header after stripping "[AN]-" or "Column-AN: " prefixes (regex)."""
     return re.sub(r"^(?:\[[A-Z]+\]-|Column-[A-Z]+:\s*)", "", str(name or "").strip(), flags=re.IGNORECASE).strip().lower()
 
 
 def _row_get(row: dict, *candidate_names: str) -> str:
+    """Returns the value of the first column whose normalised name matches any candidate."""
     normalized_targets = {_norm_col(n) for n in candidate_names}
     for k, v in row.items():
         if _norm_col(k) in normalized_targets:
@@ -135,11 +131,7 @@ def _row_get(row: dict, *candidate_names: str) -> str:
 
 
 def _row_tint(row: dict) -> tuple[str, str]:
-    """(bg, fg) whole-row colour = the row's CONFIDENCE_TIER_HYBRID tier colour,
-    tinted and applied across the ENTIRE row so each row reads as one tier band.
-    Rows with no scored tier -- empty or NOT_APPLICABLE_NON_CODING (rna /
-    prophage) -- get neutral grey. This is the only colouring; no per-cell
-    accents."""
+    """Returns the row's (background, font) colours from its CONFIDENCE_TIER_HYBRID tier, grey when unscored."""
     tier = str(_row_get(row, "confidence_tier_hybrid", "CONFIDENCE_TIER_hybrid")).strip().lower()
     if tier not in _TIER_BRIGHT:
         return _ROW_NONCODING_BG, _ROW_NONCODING_FG
@@ -147,6 +139,7 @@ def _row_tint(row: dict) -> tuple[str, str]:
 
 
 def main() -> None:
+    """Reads the TSV with csv and writes the tinted Annotation Results sheet and Legend sheet with openpyxl."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input",  required=True,
@@ -181,8 +174,7 @@ def main() -> None:
                                        wrap_text=True)
 
         # ── data rows ───────────────────────────────────────────────────────
-        # ONE shared alignment object for every data cell (creating a fresh
-        # Alignment per cell is what made a 4.6k-row sheet take minutes).
+        # One shared Alignment for all data cells keeps openpyxl fast.
         data_align = Alignment(wrap_text=False, vertical="top")
         ncol = len(headers)
         n = 0
@@ -230,6 +222,7 @@ def main() -> None:
     lg.column_dimensions["C"].width = 66
 
     def _legend_row(r: int, swatch_bg: str, label: str, meaning: str, boxed: bool = False) -> None:
+        """Writes one legend row: colour swatch, bold label and meaning."""
         sw = lg.cell(r, 1)
         sw.fill = _fill(swatch_bg)
         if boxed:

@@ -1,15 +1,8 @@
-"""License-gate endpoints.
+"""License-gate endpoints under /v1/license (auth required).
 
-The analyze page is gated: a user must accept the current licensing terms before
-running any workflow. Acceptance is recorded once per account per terms version
-(re-prompted when the terms change), stored in the app database, and an exact
-copy is written to the depot records directory with the user's IP (disclosed in
-the terms).
-
-Routes (all under /v1/license, auth required):
-  GET  /terms   → terms text + version/hash + tool catalog + acknowledgments
-  GET  /status  → whether the current user has accepted the current terms
-  POST /accept  → record acceptance (validates version/hash, captures IP), returns status
+A user accepts the current terms once per terms version before running a workflow;
+acceptance goes to the app database plus a copy with the client IP in the depot.
+Routes: GET /terms, GET /status, POST /accept, POST /revoke.
 """
 import logging
 
@@ -33,7 +26,7 @@ class LicenseAccept(BaseModel):
 
 
 def _client_ip(request: Request) -> str | None:
-    """Best-effort client IP. Honors X-Forwarded-For (first hop) behind a proxy."""
+    """Returns the client IP, preferring X-Forwarded-For (first hop) behind a proxy."""
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
         return fwd.split(",")[0].strip()
@@ -45,14 +38,14 @@ def _client_ip(request: Request) -> str | None:
 
 @router.get("/terms")
 def get_terms(current_user: dict = Depends(get_current_user)):
-    """Return everything the frontend needs to render the license gate."""
+    """Returns the terms, version, tool catalog and acknowledgments for the license gate."""
     return licensing.build_terms_payload()
 
 
 @router.get("/status")
 def get_status(current_user: dict = Depends(get_current_user)):
-    """Whether the current user has accepted the CURRENT terms version, plus the
-    entitlement that drives which tools the analyze page must disable."""
+    """Returns whether the user accepted the current terms, plus the entitlement
+    that decides which tools the analyze page disables."""
     terms = licensing.load_terms()
     accepted = licensing.has_accepted_current_terms(current_user["username"])
     entitlement = licensing.get_entitlement(current_user["username"])
@@ -72,13 +65,9 @@ def get_status(current_user: dict = Depends(get_current_user)):
 
 @router.post("/revoke")
 def revoke_terms(current_user: dict = Depends(get_current_user)):
-    """Revoke the current user's acceptance of the current terms, so the
-    license gate re-prompts them next time they open the analyze page.
+    """Revokes the user's acceptance of the current terms so the gate prompts again.
 
-    Self-service: a user can revoke their own acceptance at any time (e.g.
-    if their usage/eligibility status changes). The immutable depot record
-    of the original acceptance is preserved for legal history -- this only
-    clears the app-side gate state."""
+    Clears only the app-side state; the depot record of the acceptance is kept."""
     removed = licensing.revoke_current_acceptance(current_user["username"])
     terms = licensing.load_terms()
     LOGGER.info(
@@ -94,10 +83,10 @@ def accept_terms(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
-    """Record the current user's acceptance of the current terms."""
+    """Records the user's acceptance after checking the shown terms version and hash."""
     terms = licensing.load_terms()
 
-    # The user must be accepting the terms version we are actually serving.
+    # The accepted version must be the one currently served.
     if body.terms_version != terms["version"]:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

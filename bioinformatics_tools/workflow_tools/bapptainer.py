@@ -23,14 +23,14 @@ class CacheSifError(Exception):
 
 
 class ApptainerRunError(Exception):
-    """Raised when a container run (via its baked-in runscript) exits non-zero"""
+    """Raised when a container run (via its baked-in runscript) exits non-zero."""
     pass
 
 CACHE_DIR = Path.home() / ".cache" / "bioinformatics-tools"
 
 
 def _resolve_cache_dir(local_sif_dir: str | Path | None = None) -> Path:
-    """Return the configured cache directory or the default cache location."""
+    """Returns the configured cache directory or the default cache location."""
     if local_sif_dir:
         return Path(local_sif_dir).expanduser()
     return CACHE_DIR
@@ -206,9 +206,8 @@ def get_verified_sif_file(sif_name: str, sif_version: str,
 
 
 def locate_local_sif_files(sif_paths: list[tuple[str, str]], local_sif_dir: str | Path | None = None):
-    '''Resolve each SIF file against the local filesystem only — never contacts
-    the container registry. Emits container metadata for every file found so
-    the job's container table shows exactly where it was loaded from.'''
+    '''Resolves each SIF file on the local filesystem only, never the registry,
+    and emits container metadata for every file found.'''
     cache_dir = _resolve_cache_dir(local_sif_dir)
     for sif_name, sif_version in sif_paths:
         resolved = cache_dir / sif_name
@@ -275,9 +274,8 @@ def run_apptainer_container(app_obj: ApptainerKey, container_args: list[str]) ->
 
 def run_apptainer_run(sif_path: str | Path, args: list[str], binds: list[tuple[str, str, str]],
                        log_path: str | Path | None = None, env: dict[str, str] | None = None) -> None:
-    """Run a margie_sb container via its baked-in runscript (`apptainer run`, not
-    `exec`) — every margie_sb entrypoint.sh is installed as the container's
-    runscript and documents its own `apptainer run <sif> ...` usage.
+    """Runs a margie_sb container via its baked-in runscript (`apptainer run`, not
+    `exec`); each margie_sb entrypoint.sh is installed as the runscript.
 
     Args:
         sif_path: resolved, already-existing local .sif path.

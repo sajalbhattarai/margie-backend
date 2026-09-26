@@ -1,26 +1,8 @@
 """
-Persistent job history, backed by the user's own main_database SQLite file.
-
-job_store.py is deliberately in-memory only (fast, simple, good enough for
-actively-streaming logs) -- but that means every dane-api restart wipes all
-job records, and there's no way to list "my past jobs" at all. This module
-is the persistence layer underneath it: every job gets a row here at
-creation, kept in sync as job_store.update() reports status/work_dir
-changes, so job history survives restarts and can be listed/resumed.
-
-Deliberately a SEPARATE table from workflow_tools/output_cache.py's
-run_log -- run_log is written by the workflow process itself (even for
-direct CLI runs with no API involved at all) and keyed on its own run_id;
-this table is keyed on the API's job_id specifically, the identifier the
-front-end actually navigates with (/jobs/{job_id}).
-
-main_database is a path on the user's cluster account, not necessarily
-the machine dane-api itself runs on (each user has their own
-cluster_host/cluster_username) -- so the API never opens this file
-directly. It invokes this module's functions over SSH instead, as
-`python -m bioinformatics_tools.api.services.job_history <action>` with a
-JSON payload on stdin and a JSON result (if any) on stdout; see
-api/services/job_history_client.py for the calling side.
+Persistent job history in the user's main_database SQLite file (table api_jobs),
+keyed on the API's job_id and kept in sync with the in-memory job_store.
+Runs on the cluster account, called over SSH as `python -m ... job_history <action>`
+with JSON on stdin/stdout (see job_history_client.py).
 """
 import json
 import logging
@@ -53,9 +35,7 @@ CREATE TABLE IF NOT EXISTS api_jobs (
 );
 """
 
-# Columns added after the table's initial release -- CREATE TABLE IF NOT
-# EXISTS above only helps brand-new databases; existing deployed ones need
-# an explicit ALTER (SQLite has no ADD COLUMN IF NOT EXISTS).
+# Columns added after the first release; older databases get them by ALTER TABLE.
 _ADDED_COLUMNS = (
     "owner_username",
     "owner_cluster_username",
@@ -66,34 +46,23 @@ _ADDED_COLUMNS = (
     "containers",
 )
 
-# update() may be called with any subset of job_store's fields. status/
-# phase/work_dir are persisted on every change (job_store.update()'s own
-# change-detection decides when). logs/slurm_jobs/containers are NEVER
-# persisted incrementally (that would mean an SSH round-trip per log
-# line) -- they only ever arrive here via job_store.finalize()'s one-time
-# snapshot at job completion/failure. sub_jobs/report/steps_done/total/
-# progress remain pure live-session detail, never persisted at all.
+# job_store fields kept in history; logs/slurm_jobs/containers arrive only in the final snapshot.
 _PERSISTED_UPDATE_FIELDS = ("status", "phase", "work_dir", "logs", "slurm_jobs", "containers")
 
-# Fields whose value is a Python list/dict (slurm_jobs, containers) need
-# JSON-encoding before they can be bound as a SQLite TEXT column -- plain
-# strings (status/phase/work_dir/logs) pass through unchanged.
+# List/dict fields stored as JSON text.
 _JSON_ENCODED_FIELDS = ("slurm_jobs", "containers")
 
 
 def _get_connection(db_path: str, timeout: float = 30.0) -> sqlite3.Connection:
-    """SQLite connection configured for network filesystems (same pattern as
-    workflow_tools/output_cache.py's _get_connection). This module always
-    runs on the remote cluster account (invoked over SSH -- see the module
-    docstring), so os.path.expanduser resolves a leading ~ against the
-    right user every time, regardless of who dane-api itself runs as.
-    """
+    """Opens a SQLite connection with a busy timeout suited to network filesystems.
+    Runs as the cluster account, so ~ expands to that user's home."""
     conn = sqlite3.connect(os.path.expanduser(db_path), timeout=timeout)
     conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
     return conn
 
 
 def ensure_table(db_path: str) -> None:
+    """Creates api_jobs if needed and adds any missing later columns."""
     if not db_path:
         return
     try:
@@ -117,6 +86,7 @@ def record_job_created(db_path: str, job_id: str, workflow: str,
                        owner_cluster_username: str | None = None,
                        selected_tools: str | None = None,
                        relaunched_from: str | None = None) -> None:
+    """Inserts a new pending job row."""
     if not db_path:
         return
     ensure_table(db_path)
@@ -150,8 +120,7 @@ def record_job_created(db_path: str, job_id: str, workflow: str,
 
 
 def record_job_updated(db_path: str, job_id: str, **fields) -> None:
-    """Persist only the subset of fields that matter for history (see
-    _PERSISTED_UPDATE_FIELDS); a no-op if nothing relevant changed."""
+    """Writes the history fields among `fields`; does nothing if none are present."""
     if not db_path:
         return
     relevant = {k: v for k, v in fields.items() if k in _PERSISTED_UPDATE_FIELDS}
@@ -178,11 +147,7 @@ def record_job_updated(db_path: str, job_id: str, **fields) -> None:
 
 
 def _decode_row(row: dict) -> dict:
-    """Decode JSON-encoded list columns (see _JSON_ENCODED_FIELDS) back into
-    real Python lists before this dict crosses the SSH/JSON transport
-    boundary -- decoding here (not on the caller's side) means the outer
-    json.dumps() in _main() serializes them as proper nested arrays
-    instead of double-encoded strings."""
+    """Decodes the JSON text columns back into lists so the output is not double-encoded."""
     for field in _JSON_ENCODED_FIELDS:
         raw = row.get(field)
         if not raw:
@@ -197,12 +162,8 @@ def _decode_row(row: dict) -> dict:
 
 def _ownership_where(owner_username: str | None,
                      owner_cluster_username: str | None) -> tuple[str, list[str]]:
-    """Return SQL ownership guard + params.
-
-    New rows carry owner_username directly. Legacy rows may have no owner_* at
-    all, so allow a narrow fallback for those: match owner_cluster_username when
-    present, or infer by path segment '/<cluster_user>/' in work_dir/genome_path.
-    """
+    """Returns an SQL ownership condition and its params.
+    Rows without owner_username match on owner_cluster_username or a '/<cluster_user>/' path segment."""
     if not owner_username:
         return "", []
 
@@ -222,6 +183,7 @@ def _ownership_where(owner_username: str | None,
 def get_job(db_path: str, job_id: str,
             owner_username: str | None = None,
             owner_cluster_username: str | None = None) -> dict | None:
+    """Returns one job row the owner may see, or None."""
     if not db_path or not Path(os.path.expanduser(db_path)).exists():
         return None
     try:
@@ -243,18 +205,15 @@ def get_job(db_path: str, job_id: str,
         return None
 
 
-# How much of each run's log a list carries (its end).
+# Characters of each log's end included in list results.
 LIST_LOG_TAIL = 8000
 
 
 def list_jobs(db_path: str, workflow: str | None = None, limit: int = 100,
               offset: int = 0, owner_username: str | None = None,
               owner_cluster_username: str | None = None) -> list[dict]:
-    """Most recent jobs first, optionally filtered to one workflow, paginated
-    via limit/offset. Empty list (not an error) if the table doesn't exist
-    yet -- a brand new user with no history at all is the normal case, not
-    a failure. Pair with count_jobs() for the total matching the same
-    workflow filter, to compute page count."""
+    """Returns one page of jobs, newest first, optionally for one workflow.
+    Returns an empty list when the database or table does not exist yet."""
     if not db_path or not Path(os.path.expanduser(db_path)).exists():
         return []
     try:
@@ -272,11 +231,7 @@ def list_jobs(db_path: str, workflow: str | None = None, limit: int = 100,
                 params.extend(owner_params)
 
             where_clause = f"WHERE {' AND '.join(conditions)} " if conditions else ""
-            # A list needs each run's record, not its whole log: only the end of
-            # it (where a failure says why). Whole logs made a 50-row list 43 MB
-            # -- over a minute through SSH -- for 71 runs; get_job still has them.
-            # Nor its SLURM jobs and containers (2.8 MB more for 50 rows): a
-            # list shows neither.
+            # Lists carry only each log's tail and no SLURM jobs or containers; get_job has the full row.
             columns = [r[1] for r in conn.execute("PRAGMA table_info(api_jobs)")]
             select = ", ".join(
                 f"substr(logs, -{LIST_LOG_TAIL}) AS logs" if c == "logs"
@@ -298,8 +253,7 @@ def list_jobs_and_count(db_path: str, workflow: str | None = None,
                         limit: int = 100, offset: int = 0,
                         owner_username: str | None = None,
                         owner_cluster_username: str | None = None) -> dict:
-    """list_jobs + count_jobs in a single DB open — avoids two SSH round-trips
-    when the caller needs both (e.g. the paginated /jobs endpoint)."""
+    """Returns {"jobs", "total"} from list_jobs and count_jobs in one remote call."""
     return {
         "jobs": list_jobs(
             db_path,
@@ -321,9 +275,7 @@ def list_jobs_and_count(db_path: str, workflow: str | None = None,
 def count_jobs(db_path: str, workflow: str | None = None,
                owner_username: str | None = None,
                owner_cluster_username: str | None = None) -> int:
-    """Total number of history rows matching workflow (or all rows if
-    None) -- used alongside list_jobs's limit/offset to compute total
-    page count on the API side."""
+    """Returns the number of jobs matching the workflow filter and owner."""
     if not db_path or not Path(os.path.expanduser(db_path)).exists():
         return 0
     try:
@@ -348,18 +300,10 @@ def count_jobs(db_path: str, workflow: str | None = None,
         return 0
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point: `python -m bioinformatics_tools.api.services.job_history
-# <action>`, payload as JSON on stdin, result (if any) as JSON on stdout.
-# This is how the API process (which may run on a different machine than
-# the user's cluster account) reaches this module -- by running it
-# remotely over SSH rather than importing it in-process. See the module
-# docstring and api/services/job_history_client.py.
-# ---------------------------------------------------------------------------
+# ---- CLI entry point: `<action>` argument, JSON payload on stdin, JSON result on stdout ----
 
 def dispatch(action: str, payload: dict):
-    """One action, as the CLI below and job_history_client's in-process path
-    both run it. Returns the result (None for create/update)."""
+    """Runs one action for the CLI or the in-process client; returns None for create/update."""
     db_path = payload.get("db_path")
     if action == "create":
         record_job_created(
@@ -389,6 +333,7 @@ def dispatch(action: str, payload: dict):
 
 
 def _main() -> int:
+    """Reads the action and payload, runs it and prints the JSON result."""
     if len(sys.argv) != 2:
         print("usage: python -m bioinformatics_tools.api.services.job_history "
               "<create|update|get|list|list_and_count|count>", file=sys.stderr)

@@ -1,23 +1,9 @@
 #!/usr/bin/env python3
-"""c3fig_lib.py — shared helpers for the C3 comprehensive figure suite.
+"""c3fig_lib.py - shared helpers for the C3 comprehensive figure suite.
 
-Provides:
-  * is_uninformative()  — EXACT copy of the authoritative gate in
-    scoring/score-c1-tool-coverage.py + labeling/assign-canonical-label.py.
-    A gene is "uninformative" (hypothetical / unknown-function) iff the
-    functional text of its best_consensus_product_descriptor matches this
-    gate; otherwise it is "informative" (carries a real function name).
-  * clean_descriptor()  — strip the leading "SOURCE: " tag and the
-    "raw ## human" duplication so genes group by functional identity.
-  * data loading         — JOIN labeled-genes.tsv (coordinates, descriptor,
-    aa_seq) with labeled-genes-operon-info.tsv (operon_id, member_count,
-    position, probability) on feature_id, across all organisms.
-  * matplotlib styling    — Times-New-Roman-compatible serif, everything bold.
-  * pca()                — numpy-SVD PCA (sklearn is unavailable on py3.6).
-
-The cache built by c3fig_00_build_cache.py is a pickle of a pandas DataFrame
-(one row per protein-coding gene, all organisms) so every figure script loads
-the parsed data in <1 s instead of re-reading ~2 GB of TSV.
+Provides the uninformative-descriptor gate, descriptor cleaning, per-gene and
+per-operon table builders and caches, co-occurrence tables, numpy PCA, and the
+matplotlib style and palettes used by every c3fig_* script.
 """
 import csv
 import hashlib
@@ -35,11 +21,9 @@ import pandas as pd
 
 csv.field_size_limit(10_000_000)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UNINFORMATIVE HIT CATEGORY — kept byte-for-byte identical to the gate in
-# scoring/score-c1-tool-coverage.py (which mirrors labeling/assign-canonical-
-# label.py). If you edit one, edit all three.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- uninformative hit category ----
+# Identical to the gate in scoring/score-c1-tool-coverage.py and
+# labeling/assign-canonical-label.py; the three copies must stay in sync.
 _UNINFORMATIVE = frozenset({
     "", "-", ".", "na", "n/a", "none", "null",
     "unknown", "uncharacterized", "uncharacterised", "putative", "predicted",
@@ -66,9 +50,7 @@ _DB_ID_HYPOTHETICAL_RE = re.compile(
     r'^(?:fig\d+|tigr\d+)[:\s].*(?:hypothetical|conserved hypothetical)', re.IGNORECASE,
 )
 _UPF_ONLY_RE = re.compile(r'^\s*belongs to the upf\d+', re.IGNORECASE)
-# eggNOG describes orthologous groups of no known function with a PSORT
-# localisation guess ("Psort location Cytoplasmic, score 8.87"): where the
-# protein may sit, not what it does -- never a product name.
+# eggNOG's "Psort location ..." is a localisation guess, never a product name.
 _PSORT_ONLY_RE = re.compile(r'^\s*psort location\b', re.IGNORECASE)
 _BARE_DUF_RE = re.compile(r'^\s*(?:pfam:)?\(?duf\d+\)?(?:\s+(?:family|domain))?\s*$', re.IGNORECASE)
 _PROTEIN_DOMAINS_DUF_RE = re.compile(r'^\s*protein containing domains?\s+duf', re.IGNORECASE)
@@ -90,7 +72,7 @@ _LOCUS_OR_TAG_RE = re.compile(r'^\(?(?:duf\d+|upf\d+|[a-z]{1,5}\d{0,4}[a-z]?\d{0
 
 
 def is_uninformative(val: str) -> bool:
-    """True iff ``val`` falls in the UNINFORMATIVE HIT CATEGORY."""
+    """Returns True when val is a hypothetical / unknown-function descriptor."""
     v = (val or "").strip().lower()
     if not v or v in _UNINFORMATIVE:
         return True
@@ -116,12 +98,8 @@ def is_uninformative(val: str) -> bool:
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Descriptor cleaning
-# ─────────────────────────────────────────────────────────────────────────────
-# Leading "SOURCE: " tags that the labeling pipeline prepends to the functional
-# text.  We strip these so the SAME function annotated via different evidence
-# sources groups together, and so is_uninformative() sees the functional text.
+# ---- descriptor cleaning ----
+# Leading "SOURCE: " tags that the labeling pipeline prepends to the functional text.
 _SOURCE_PREFIX_RE = re.compile(
     r'^(?:'
     r'JCVI|NCBIFAM|NCBI Protein Cluster \(PRK\)|PRK|TIGR|TIGRFAM|PGAP|HAMAP|'
@@ -133,16 +111,15 @@ _SOURCE_PREFIX_RE = re.compile(
 
 
 def clean_descriptor(desc: str) -> str:
-    """Return the functional text: strip a leading SOURCE tag and collapse the
-    "raw ## human-readable" duplication (keep the human-readable side)."""
+    """Returns the functional text without SOURCE tags, keeping the right side of "raw ## human"."""
     d = (desc or "").strip()
     if not d:
         return ""
-    # "5S rRNA ## 5S ribosomal RNA" -> keep the more descriptive right side
+    # "5S rRNA ## 5S ribosomal RNA" keeps the more descriptive right side.
     if " ## " in d:
         left, right = d.split(" ## ", 1)
         d = right.strip() if right.strip() else left.strip()
-    # strip a single leading SOURCE: tag (may repeat, e.g. "JCVI: PRK: x")
+    # Strips repeated leading tags, e.g. "JCVI: PRK: x".
     prev = None
     while prev != d:
         prev = d
@@ -151,18 +128,16 @@ def clean_descriptor(desc: str) -> str:
 
 
 def sha256_hash(seq: str) -> str:
+    """Returns the SHA-256 hex digest of the upper-cased sequence."""
     return hashlib.sha256((seq or "").strip().upper().encode("utf-8")).hexdigest()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data loading
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- data loading ----
 NON_OPERON_TOKENS = {"NOT_IN_AN_OPERON", "NOT_APPLICABLE_NON_CODING", "UNKNOWN", ""}
 
 
 def discover_organisms(labeling_root: Path):
-    """Yield (organism, labeled_path, operon_path) for every organism that has
-    both a labeled-genes.tsv and its operon-info sibling."""
+    """Returns (organism, labeled_path, operon_path) for each organism with both labeling TSVs."""
     out = []
     for labeled_path in sorted(labeling_root.glob("**/labeling/labeled-genes.tsv")):
         operon_path = labeled_path.with_name("labeled-genes-operon-info.tsv")
@@ -173,6 +148,7 @@ def discover_organisms(labeling_root: Path):
 
 
 def _to_int(v, default=0):
+    """Returns v as an int, or default when it does not parse."""
     try:
         return int(float(str(v).strip()))
     except (ValueError, TypeError):
@@ -180,6 +156,7 @@ def _to_int(v, default=0):
 
 
 def _to_float(v, default=float("nan")):
+    """Returns v as a float, or default when it does not parse."""
     try:
         return float(str(v).strip())
     except (ValueError, TypeError):
@@ -188,8 +165,8 @@ def _to_float(v, default=float("nan")):
 
 def load_organism(organism: str, labeled_path: Path, operon_path: Path,
                   compute_hash: bool = True) -> pd.DataFrame:
-    """JOIN the two per-organism TSVs on feature_id -> one row per gene."""
-    # Pass 1: operon-info (small, authoritative for operon membership)
+    """Joins labeled-genes.tsv with its operon-info TSV on feature_id, one row per gene."""
+    # Operon membership comes from the operon-info file.
     operon = {}
     with open(operon_path, newline="") as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
@@ -203,7 +180,7 @@ def load_organism(organism: str, labeled_path: Path, operon_path: Path,
                 "operon_prob": _to_float(row.get("operon_probability_geometric_mean")),
             }
 
-    # Pass 2: labeled-genes (coordinates, descriptor, aa_seq)
+    # Coordinates, descriptor and sequence come from labeled-genes.tsv.
     records = []
     with open(labeled_path, newline="") as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
@@ -238,6 +215,7 @@ def load_organism(organism: str, labeled_path: Path, operon_path: Path,
 
 
 def build_gene_table(labeling_root: Path, compute_hash: bool = True) -> pd.DataFrame:
+    """Returns the gene table for every organism with C1/C2/C4 scores attached."""
     frames = []
     for organism, lp, op in discover_organisms(labeling_root):
         print(f"[c3fig_lib] loading {organism} ...", file=sys.stderr)
@@ -249,18 +227,9 @@ def build_gene_table(labeling_root: Path, compute_hash: bool = True) -> pd.DataF
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Deterministic confidence components joined per gene from
-# scored-labeled-genes-confidence-final.tsv:
-#   C1 = database/tool coverage (informative annotation sources / 7)
-#   C2 = operon geometric-mean probability (0.5 = neutral for non-operonic genes)
-#   C4 = EC-number agreement across tools
-# C3 (operonic co-occurrence context) is DELIBERATELY EXCLUDED from this join:
-# C3 is itself derived from the cross-organism co-occurrence signal that this
-# whole suite analyses, so relating C3 to our operon co-occurrence results would
-# be circular.  C1/C2/C4 are the deterministic components we compare against the
-# operon structure derived elsewhere in the suite.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- confidence components ----
+# C1 (tool coverage), C2 (operon probability) and C4 (EC agreement) per gene;
+# C3 is excluded because it derives from the co-occurrence this suite analyses.
 COMPONENT_COLS = ["c1_score", "c2_score", "c4_score"]
 COMPONENT_LABELS = {
     "c1_score": "C1 database coverage",
@@ -276,14 +245,13 @@ _COMPONENT_SRC = {
 
 
 def score_file_for(labeled_path: Path) -> Path:
-    """<run>/<organism>/labeling/labeled-genes.tsv ->
-       <run>/<organism>/scoring/scored-labeled-genes-confidence-final.tsv"""
+    """Returns the organism's scoring/scored-labeled-genes-confidence-final.tsv path."""
     return (labeled_path.parent.parent / "scoring" /
             "scored-labeled-genes-confidence-final.tsv")
 
 
 def load_component_scores(labeling_root: Path) -> pd.DataFrame:
-    """Per-gene C1/C2/C4 for every organism (lean by-index column read)."""
+    """Returns per-gene C1/C2/C4 for every organism, read by column index."""
     frames = []
     for organism, labeled_path, _ in discover_organisms(labeling_root):
         sp = score_file_for(labeled_path)
@@ -313,7 +281,7 @@ def load_component_scores(labeling_root: Path) -> pd.DataFrame:
 
 
 def attach_component_scores(genes: pd.DataFrame, labeling_root: Path) -> pd.DataFrame:
-    """LEFT-join C1/C2/C4 onto the gene table by (organism, feature_id)."""
+    """Left-joins C1/C2/C4 onto the gene table by (organism, feature_id)."""
     sc = load_component_scores(labeling_root)
     if sc.empty:
         for c in COMPONENT_COLS:
@@ -323,21 +291,21 @@ def attach_component_scores(genes: pd.DataFrame, labeling_root: Path) -> pd.Data
 
 
 def save_cache(df: pd.DataFrame, cache_path: Path):
+    """Pickles df to cache_path."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with open(cache_path, "wb") as fh:
         pickle.dump(df, fh, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def load_cache(cache_path: Path) -> pd.DataFrame:
+    """Returns the pickled object at cache_path."""
     with open(cache_path, "rb") as fh:
         return pickle.load(fh)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Operon-level table (derived from the gene table)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- operon-level table ----
 def build_operon_table(genes: pd.DataFrame) -> pd.DataFrame:
-    """One row per operon (organism + operon_id) with composition/geometry."""
+    """Returns one row per operon with composition, geometry, strand and mean scores."""
     op = genes[genes["in_operon"]].copy()
     rows = []
     for (organism, operon_id), g in op.groupby(["organism", "operon_id"]):
@@ -348,7 +316,7 @@ def build_operon_table(genes: pd.DataFrame) -> pd.DataFrame:
         starts = g["start"].to_numpy()
         ends = g["end"].to_numpy()
         strands = g["strand"].to_numpy()
-        # intergenic gaps between consecutive genes (bp); negative -> overlap
+        # Intergenic gaps in bp; negative means overlap.
         gaps = []
         for i in range(n - 1):
             gaps.append(int(starts[i + 1] - ends[i]))
@@ -387,7 +355,7 @@ def build_operon_table(genes: pd.DataFrame) -> pd.DataFrame:
             "mean_aa_length": float(g["aa_length"].mean()),
         })
     op_table = pd.DataFrame.from_records(rows)
-    # attach per-operon mean deterministic components (C1/C2/C4) if present
+    # Adds per-operon mean C1/C2/C4 when present.
     have = [c for c in COMPONENT_COLS if c in op.columns]
     if have and len(op_table):
         means = (op.groupby(["organism", "operon_id"])[have].mean()
@@ -398,14 +366,12 @@ def build_operon_table(genes: pd.DataFrame) -> pd.DataFrame:
 
 
 def genome_sizes(genes: pd.DataFrame) -> pd.Series:
-    """Approx genome size per organism = max gene end coordinate (bp)."""
+    """Returns approximate genome size per organism as the largest gene end (bp)."""
     return genes.groupby("organism")["end"].max()
 
 
 def build_adjacent_pairs(genes: pd.DataFrame) -> pd.DataFrame:
-    """One row per consecutive (adjacent) gene pair inside an operon, with the
-    intergenic gap, strand pattern and informativeness class. Used by the
-    intergenic-distance, strand and adjacency figures."""
+    """Returns one row per adjacent gene pair in an operon with gap, strand pattern and class."""
     op = genes[genes["in_operon"]]
     rows = []
     for (organism, operon_id), g in op.groupby(["organism", "operon_id"]):
@@ -438,26 +404,15 @@ def build_adjacent_pairs(genes: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame.from_records(rows)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Co-occurrence of genes (by product descriptor) inside operons.
-#
-# A "gene" here is identified by its clean_descriptor (functional name). Two
-# genes CO-OCCUR when they belong to the same operon (order / distance / adjacency
-# do NOT matter). Because hashes (exact aa sequences) essentially never recur
-# across organisms, co-occurrence is measured on functional descriptors so it can
-# be compared across the 21 organisms.
-#
-# Uninformative (hypothetical) descriptors are EXCLUDED from co-occurrence by
-# default: "hypothetical protein" is not a gene identity — thousands of unrelated
-# genes share it — so pairing on it is meaningless and would swamp real pairs.
-# (Uninformative genes are still kept and counted everywhere else in the suite.)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- descriptor co-occurrence inside operons ----
+# Genes are identified by clean_descriptor; uninformative descriptors are left
+# out by default because "hypothetical protein" is not a gene identity.
 from collections import defaultdict as _defaultdict
 from itertools import combinations as _combinations
 
 
 def _operon_descriptor_sets(genes, informative_only=True):
-    """Yield (organism, operon_id, sorted-unique-descriptors) for every operon."""
+    """Yields (organism, operon_id, sorted unique descriptors) for every operon."""
     op = genes[genes["in_operon"]]
     if informative_only:
         op = op[~op["uninformative"]]
@@ -467,12 +422,9 @@ def _operon_descriptor_sets(genes, informative_only=True):
 
 
 def build_cooccurrence_pairs(genes, informative_only=True):
-    """Unordered co-occurring descriptor pairs within operons (any position).
+    """Returns unordered descriptor pairs sharing an operon, with operon and organism counts.
 
-    Returns DataFrame [desc_a, desc_b, n_operons, n_organisms, organisms] sorted
-    by cross-organism spread then operon frequency. n_operons = number of operons
-    (across all organisms) containing BOTH genes; n_organisms = number of distinct
-    organisms in which the pair co-occurs in at least one operon."""
+    Sorted by n_organisms, then n_operons."""
     op_count = _defaultdict(int)
     org_sets = _defaultdict(set)
     for org, _oid, descs in _operon_descriptor_sets(genes, informative_only):
@@ -493,11 +445,9 @@ def build_cooccurrence_pairs(genes, informative_only=True):
 
 
 def build_adjacent_cooccurrence(genes, informative_only=True):
-    """Co-occurring descriptor pairs that are IMMEDIATELY ADJACENT in an operon.
+    """Returns descriptor pairs that are immediate operon neighbours, with gap and strand stats.
 
-    Returns DataFrame [desc_a, desc_b, n_adjacent, n_organisms, median_gap_bp,
-    mean_gap_bp, frac_plus_strand]. Identical-descriptor neighbours (tandem
-    duplicates) are skipped so each row is a pair of two distinct genes."""
+    Tandem duplicates (identical descriptors) are skipped."""
     op = genes[genes["in_operon"]]
     stats = {}
     for (_org, _oid), g in op.groupby(["organism", "operon_id"]):
@@ -534,13 +484,9 @@ def build_adjacent_cooccurrence(genes, informative_only=True):
 
 
 def build_kmember_sets(genes, kmax=4, informative_only=True):
-    """Recurring co-occurring gene SETS of size k (k=2..kmax) within operons.
+    """Returns descriptor k-subsets (k=2..kmax) of operons that recur in at least two operons.
 
-    For every operon we enumerate all k-subsets of its unique informative
-    descriptors and count how many operons / organisms contain each subset.
-    Returns DataFrame [k, members, n_operons, n_organisms] (members = ' + '
-    joined sorted descriptors), sorted by k then cross-organism spread. Only
-    subsets that recur (n_operons >= 2) are kept to bound the table size."""
+    members joins the sorted descriptors with ' + '; rows are sorted by k, then spread."""
     per_k_count = {k: _defaultdict(int) for k in range(2, kmax + 1)}
     per_k_orgs = {k: _defaultdict(set) for k in range(2, kmax + 1)}
     for org, _oid, descs in _operon_descriptor_sets(genes, informative_only):
@@ -564,7 +510,7 @@ def build_kmember_sets(genes, kmax=4, informative_only=True):
 
 
 def load_or_build(name, builder, cache_dir):
-    """Lazily load _cache/<name>.pkl, building + caching it on first use."""
+    """Loads <cache_dir>/<name>.pkl, building and caching it on first use."""
     p = Path(cache_dir) / f"{name}.pkl"
     if p.is_file():
         return load_cache(p)
@@ -573,14 +519,8 @@ def load_or_build(name, builder, cache_dir):
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Operon feature matrix for PCA / clustering (Theme 7). One row per operon with
-# the interpretable numeric features that could drive clustering: operon size,
-# span, intergenic spacing, composition (fraction hypothetical), gene length,
-# operon probability and host genome size. Strand homogeneity is dropped (every
-# operon is single-strand -> zero variance). Skewed positive features are
-# log-scaled; the signed intergenic gap uses a sign-preserving log.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- operon feature matrix for PCA ----
+# Strand is omitted (every operon is single-strand); skewed features are log-scaled.
 PCA_FEATURES = [
     ("size", "Operon size (genes)"),
     ("log_span_bp", "Operon span (log10 bp)"),
@@ -593,9 +533,7 @@ PCA_FEATURES = [
 
 
 def operon_feature_matrix(operons, genes):
-    """Return (F, feature_cols, feature_labels). F is a per-operon DataFrame with
-    the transformed PCA features plus metadata columns (organism, size,
-    frac_uninformative, composition) for colouring."""
+    """Returns (F, feature_cols, feature_labels), F being operons with transformed PCA features."""
     gsize = genome_sizes(genes)
     F = operons.copy()
     F["genome_size"] = F["organism"].map(gsize)
@@ -608,11 +546,10 @@ def operon_feature_matrix(operons, genes):
     return F, cols, labels
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Numpy-SVD PCA (sklearn unavailable on this py3.6)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- PCA (numpy SVD; sklearn is unavailable on the cluster's Python 3.6) ----
 def pca(X: np.ndarray, n_components: int = 2):
-    """Standardise columns, run SVD PCA.
+    """Standardises columns and runs SVD PCA.
+
     Returns (scores[n,k], loadings[features,k], explained_variance_ratio[k])."""
     X = np.asarray(X, dtype=float)
     mu = np.nanmean(X, axis=0)
@@ -630,14 +567,10 @@ def pca(X: np.ndarray, n_components: int = 2):
 
 def response_surface(x, y, z, c=None, nbin=14, nx=44, ny=44,
                      min_count=10, smooth=1.0):
-    """Build a smooth 3-D response surface z = f(x, y) from scattered data.
+    """Returns a smoothed mesh z = f(x, y) from binned means (scipy griddata + gaussian_filter).
 
-    Bins (x, y) into nbin*nbin cells and takes the MEAN z (and mean c) per cell.
-    Cells with fewer than `min_count` samples are discarded so sparse cells cannot
-    create spurious spikes; the surviving cell means are interpolated onto an
-    nx*ny mesh and lightly Gaussian-smoothed (`smooth` = sigma in mesh cells).
-    Optional 4th dimension `c` is returned as a matching mesh for colour mapping.
-    Returns (Xi, Yi, Zi) or (Xi, Yi, Zi, Ci)."""
+    Cells with fewer than min_count points are dropped; optional c gives a matching
+    colour mesh. Returns (Xi, Yi, Zi) or (Xi, Yi, Zi, Ci)."""
     from scipy.stats import binned_statistic_2d
     from scipy.interpolate import griddata
     from scipy.ndimage import gaussian_filter
@@ -650,6 +583,7 @@ def response_surface(x, y, z, c=None, nbin=14, nx=44, ny=44,
         c = c[m]
 
     def _fill(vals_valid, pts, Xi, Yi):
+        """Interpolates cell means onto the mesh, filling gaps with nearest values."""
         Vi = griddata(pts, vals_valid, (Xi, Yi), method="linear")
         if np.isnan(Vi).any():
             Vn = griddata(pts, vals_valid, (Xi, Yi), method="nearest")
@@ -675,10 +609,9 @@ def response_surface(x, y, z, c=None, nbin=14, nx=44, ny=44,
     return Xi, Yi, Zi, Ci
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Plot styling — Times-New-Roman-compatible serif, everything bold
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- plot styling ----
 def _pick_serif():
+    """Returns the first installed Times-like serif font."""
     import matplotlib.font_manager as fm
     names = {f.name for f in fm.fontManager.ttflist}
     for want in ("Times New Roman", "Nimbus Roman", "Liberation Serif",
@@ -691,10 +624,7 @@ def _pick_serif():
 SERIF = _pick_serif()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bright primary colour palette (replaces the earlier muted / dark scheme).
-# Drives the default cycle and is referenced by the semantic constants below.
-# ─────────────────────────────────────────────────────────────────────────────
+# Bright palette used for the default colour cycle and the semantic colours below.
 BLUE = "#1f77ff"
 ORANGE = "#ff8c00"
 GREEN = "#00b84d"
@@ -708,18 +638,13 @@ LIME = "#8ce65a"
 AMBER = "#ffb200"
 BRIGHT = [BLUE, ORANGE, GREEN, RED, PURPLE, CYAN, YELLOW, PINK, TEAL, LIME]
 
-# Stable colours for the three deterministic confidence components, reused
-# across every component-relationship figure (theme 09). C1 = blue, C2 = orange,
-# C4 = purple (green/red are reserved for informative/uninformative semantics).
+# Fixed component colours; green and red are reserved for informative/uninformative.
 COMPONENT_COLOR = {
     "c1_score": BLUE, "c2_score": ORANGE, "c4_score": PURPLE,
     "mean_c1": BLUE, "mean_c2": ORANGE, "mean_c4": PURPLE,
 }
 
-# 21 maximally-distinct bright colours giving every organism a stable identity.
-# Deterministic by sorted organism name (see organism_color_map) so the same
-# organism keeps the same colour across every figure. Kept vivid so each point
-# is separable on white at 300 dpi; a few earthy hues are unavoidable at 21.
+# 21 distinct colours, assigned to organisms by sorted name in organism_color_map.
 ORG_PALETTE = [
     "#e6194b",  # red
     "#f58231",  # orange
@@ -746,6 +671,7 @@ ORG_PALETTE = [
 
 
 def apply_style():
+    """Sets matplotlib rcParams: bold serif text, 300 dpi, bright colour cycle."""
     plt.rcParams.update({
         "font.family": "serif",
         "font.serif": [SERIF],
@@ -767,11 +693,12 @@ def apply_style():
 
 
 def boldticks(ax):
+    """Makes the axis tick labels bold."""
     for lab in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
         lab.set_fontweight("bold")
 
 
-# Consistent colours for the two gene classes / composition categories
+# Colours for the gene classes and operon composition categories.
 COL_INFO = GREEN          # green = informative
 COL_UNINFO = RED          # red = uninformative / hypothetical
 COL_OPERON = BLUE         # blue = operonic
@@ -788,16 +715,15 @@ COMP_ORDER = ["all_informative", "majority_informative", "equal",
 
 
 def organism_color_map(organisms):
-    """Deterministic {organism: bright colour}, ordered by sorted full name so
-    the same organism keeps the same colour in every figure of the suite."""
+    """Returns {organism: colour}, assigned by sorted name so colours match across figures."""
     orgs = sorted(set(organisms))
     return {o: ORG_PALETTE[i % len(ORG_PALETTE)] for i, o in enumerate(orgs)}
 
 
 def add_organism_index(fig, color_map, ncol=7, y=0.94, fontsize=9):
-    """Draw a global organism colour index OUTSIDE the axes, centred across the
-    top of the figure (below the suptitle). The caller must reserve top margin
-    (e.g. fig.subplots_adjust(top=...)) so nothing overlaps. Returns the Legend."""
+    """Draws an organism colour legend across the top of the figure and returns it.
+
+    The caller reserves top margin (fig.subplots_adjust(top=...)) so nothing overlaps."""
     from matplotlib.lines import Line2D
     orgs = sorted(color_map)
     handles = [Line2D([0], [0], marker="o", linestyle="none", markersize=8,
@@ -815,6 +741,7 @@ def add_organism_index(fig, color_map, ncol=7, y=0.94, fontsize=9):
 
 
 def savefig(fig, path: Path, dpi=300):
+    """Saves and closes the figure, creating the parent directory."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, bbox_inches="tight", dpi=dpi)
     plt.close(fig)
@@ -822,20 +749,18 @@ def savefig(fig, path: Path, dpi=300):
 
 
 def write_tsv(df: pd.DataFrame, path: Path):
+    """Writes df as a TSV, creating the parent directory."""
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, sep="\t", index=False)
     print(f"[c3fig] wrote {path}", file=sys.stderr)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-figure runner — keeps each figure script tiny.
-# Each figure script defines make(genes, operons, outdir) and calls
-# figure_main(make).  Genes/operons come from the pickle caches.
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- per-figure runner ----
 import argparse as _argparse
 
 
 def figure_main(make_fn, subdir=""):
+    """Parses --stats-dir, loads the caches and calls make_fn(genes, operons, outdir[, pairs])."""
     import inspect
     ap = _argparse.ArgumentParser()
     ap.add_argument("--stats-dir", required=True,
@@ -850,7 +775,7 @@ def figure_main(make_fn, subdir=""):
         outdir = outdir / subdir
     outdir.mkdir(parents=True, exist_ok=True)
     apply_style()
-    # Pass adjacent-pairs as a 4th arg only if the figure asks for it.
+    # Passes adjacent pairs only when make_fn takes a fourth parameter.
     nparams = len(inspect.signature(make_fn).parameters)
     if nparams >= 4:
         pairs_path = cache / "adjacent_pairs.pkl"
@@ -860,15 +785,15 @@ def figure_main(make_fn, subdir=""):
         make_fn(genes, operons, outdir)
 
 
-# Human genus label for compact organism ticks: "Escherichia coli …" -> "E. coli"
 def short_label(organism: str) -> str:
+    """Returns an abbreviated binomial, e.g. "Escherichia coli ..." -> "E. coli"."""
     parts = organism.replace("_", " ").split()
     if len(parts) >= 2:
         return f"{parts[0][0]}. {parts[1]}"
     return organism[:16]
 
 
-# Compact a long product descriptor for plot labels without losing meaning.
+# Abbreviations applied by short_desc for plot labels.
 _DESC_SHORTEN = [
     (re.compile(r"\b50S ribosomal protein\b", re.I), "50S-rp"),
     (re.compile(r"\b30S ribosomal protein\b", re.I), "30S-rp"),
@@ -881,6 +806,7 @@ _DESC_SHORTEN = [
 
 
 def short_desc(desc: str, maxlen: int = 42) -> str:
+    """Returns the descriptor abbreviated and truncated to maxlen for plot labels."""
     s = str(desc)
     for rx, repl in _DESC_SHORTEN:
         s = rx.sub(repl, s)

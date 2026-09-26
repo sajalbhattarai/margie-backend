@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""Parse SignalP 6.0's --format none prediction_results.txt into the
-project's standard per-protein results.tsv shape (margie_sb phase6).
+"""Parses SignalP 6.0 `--format none` prediction_results.txt into the standard results.tsv.
 
-signalp6 has no build-here container/entrypoint (HPC envmodule wrapping
-a pre-built image we don't own) -- this script is the missing
-"processing" step that phobius/tmbed get for free from their own
-containers' /usr/local/bin/run. Invoked directly from margie_sb.smk's
-run_signalp6 rule; writes into signalp6's own processed/ dir first, then
-run_signalp6 cp's the result into the final Snakemake output, same as
-every other tool.
+Called by margie_sb.smk's run_signalp6 rule, since the SignalP 6.0 module has no
+processing entrypoint of its own.
 
 Usage:
     python process_signalp6.py --input prediction_results.txt \
@@ -19,9 +13,7 @@ Usage:
 import argparse
 import csv
 
-# --format none's two header lines start with "#"; data rows are tab-
-# separated: ID  Prediction  OTHER  SP(Sec/SPI)  LIPO(Sec/SPII)
-# TAT(Tat/SPI)  TATLIPO(Sec/SPII)  PILIN(Sec/SPIII)  CS Position
+# Tab-separated data columns after ID: Prediction, OTHER, SP, LIPO, TAT, TATLIPO, PILIN, CS Position.
 _DATA_COLUMNS = (
     "signalp6_prediction", "signalp6_prob_other", "signalp6_prob_sp_sec_spi",
     "signalp6_prob_lipo_sec_spii", "signalp6_prob_tat_spi",
@@ -39,8 +31,7 @@ def _parse_predictions(path: str) -> list[dict]:
                 continue
             fields = line.split("\t")
             fields += [""] * (1 + len(_DATA_COLUMNS) - len(fields))
-            # RASTtk FAA headers are "fig|...peg.N description [...]" --
-            # feature_id is just the first whitespace-delimited token.
+            # feature_id is the first word of the RASTtk FAA header.
             feature_id = fields[0].split()[0] if fields[0].strip() else ""
             row = dict(zip(_DATA_COLUMNS, (v.strip() for v in fields[1:])))
             row["feature_id"] = feature_id

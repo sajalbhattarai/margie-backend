@@ -1,67 +1,12 @@
 #!/usr/bin/env python3
-"""score-c4-ec-agreement.py — margie_sb phase11 (scoring), metric C4: EC
-conflict.
+"""score-c4-ec-agreement.py — scoring stage, metric C4: EC conflict.
 
-Reads labeled-genes-ec-consensus.tsv (phase10, add-ec-consensus.py's
-output, READ-ONLY) and turns the per-tool EC evidence into a DIRECT,
-GRADED MEASURE OF EC CONFLICT that discounts C1 (tool coverage). Also joins
-in labeled-genes-confidence-tier.tsv (this same scoring phase,
-score-confidence-tier.py's output, also READ-ONLY) purely for PROVENANCE,
-so a reviewer looking at this one file can see the FULL step-by-step chain
-that led here (hierarchy tier -> ec agreement -> combined score ->
-confidence tier), not just C4's own number in isolation.
-
-WHAT C4 MEASURES
-  C4's only genuinely independent signal is CONFLICT — EC-capable tools that
-  disagree on the EC number. It is a graded conflict penalty on C1, not a
-  co-equal average term: silence and single-source agreement carry no
-  independent information and never penalise C1.
-
-DEFINITION  (conflict fraction R, then a participation-weighted clearance)
-  Each database tool contributes ONE EC *set* (a tool reporting several EC
-  numbers is still ONE node — its ECs are its set). Among the m tools that
-  reported >=1 EC, form all C(m,2) tool-pairs:
-
-      R = (# conflicting tool-pairs) / (m*(m-1)/2)          # 0 if m < 2
-
-  A tool-pair (A,B) CONFLICTS iff, after matching the ECs they share, BOTH
-  tools keep a private EC the other lacks — i.e. NEITHER EC set is a subset
-  of the other under EC-hierarchy compatibility ('-' and missing trailing
-  levels are wildcards, so 1.2.3.4 vs 1.2.3.- is compatible while 1.2.3.4
-  vs 1.2.3.5 conflicts). m < 2 -> R = 0: silence and single-source are NOT
-  conflict (nothing independent to disagree).
-
-  The penalty applied to C1 is weighted by how much of the EC-capable panel
-  actually reported an EC (participation), so there is NO tuned constant:
-
-      c4_score = 1 - (m / 5) * R          # 5 = EC-capable databases
-                                          #     (EGGNOG, RAST, KEGG,
-                                          #      dbCAN, TCDB)
-
-  and the final scorer (score-confidence-final.py) applies it
-  multiplicatively:  base = C1 * c4_score. c4_score is thus the fraction of
-  C1's coverage-confidence that SURVIVES the EC-conflict check: 1.0 = no
-  conflict (base = C1), lower = more of the panel disagrees. The weight
-  m/5 answers "why this penalty size?" with the fraction of EC-capable
-  tools that weighed in — a conflict corroborated by more tools weighs
-  more. A fully-contradicted gene seen by all 5 EC tools reaches
-  c4_score = 0; in the current data m tops out at 4, so the largest weight
-  applied is 4/5.
-
-confidence_flag: ec_agreement_status == "conflicting" (the UPSTREAM
-categorical call from add-ec-consensus.py) sets confidence_flag =
-"needs_review" — the review TRIGGER, so it stays coherent with
-score-confidence-tier.py and make-final-excel.py's row colouring. The
-graded conflict fraction R drives the SCORE; the categorical status drives
-the FLAG.
-
-Output (labeled-genes-c4-ec-agreement.tsv): identity columns,
-c4_ec_agreement_status, c4_ec_conflict_fraction (R), c4_n_conflict_pairs,
-c4_n_total_pairs, c4_n_ec_tools (m), c4_score, c4_reasoning, c4_formula
-(literal text, e.g. "c4_score = 1 - (m/5)*R = 1 - (3/5)*0.5000 = 0.7000"),
-confidence_flag, then the joined provenance columns: hierarchy_tier_name,
-hierarchy_tier_score, combined_score, confidence_tier, and
-combined_score_formula.
+Each tool's EC numbers form one set; among the m tools reporting an EC, R is
+the fraction of tool pairs where both sets keep an EC incompatible with the
+other ("-" levels are wildcards). c4_score = 1 - (m/5)*R over the 5 EC-capable
+databases, and the final scorer uses base = C1 * c4_score. The review flag comes
+from add-ec-consensus.py's categorical "conflicting" status. Hierarchy-tier
+columns are joined in for provenance.
 """
 import argparse
 import csv
@@ -71,10 +16,7 @@ from pathlib import Path
 
 csv.field_size_limit(10_000_000)
 
-# Number of databases capable of assigning an EC number (EGGNOG, RAST,
-# KEGG, dbCAN, TCDB). The conflict penalty is weighted by how many of
-# these actually reported an EC for a gene (m/5), so there is no tuned
-# constant a reviewer could challenge.
+# EC-capable databases (EGGNOG, RAST, KEGG, dbCAN, TCDB); the penalty weight is m/5.
 N_EC_CAPABLE_TOOLS = 5
 
 _EC_BLANK = {"", "-", "--", "n/a", "na", "none", "null", "*"}
@@ -89,10 +31,7 @@ _IDENTITY_COLUMNS = [
 
 
 def parse_ec_evidence(ec_all_evidence: str) -> dict:
-    """'EGGNOG: 3.6.3.14; KEGG: 7.4.2.8,1.1.1.1' -> {tool: frozenset(ec)}.
-
-    A tool with several ECs becomes ONE node whose value is the set of its ECs.
-    """
+    """Parses 'EGGNOG: 3.6.3.14; KEGG: 7.4.2.8,1.1.1.1' into {tool: frozenset(ec)}."""
     out = {}
     if not ec_all_evidence:
         return out
@@ -109,15 +48,13 @@ def parse_ec_evidence(ec_all_evidence: str) -> dict:
 
 
 def ec_tuple(ec: str) -> tuple:
-    """'1.2.3.-' -> ('1','2','3',None); trailing '-'/blank levels become wildcards."""
+    """Splits an EC into levels, '1.2.3.-' -> ('1','2','3',None), with blank levels as None."""
     return tuple(None if p.strip().lower() in _EC_BLANK else p.strip()
                  for p in ec.split("."))
 
 
 def ec_compatible(ec1: str, ec2: str) -> bool:
-    """True iff ec1, ec2 do NOT contradict: equal on every mutually-specified
-    level ('-' and missing trailing levels are wildcards -> EC hierarchy
-    respected)."""
+    """Returns True when two ECs agree on every level both specify."""
     for a, b in zip(ec_tuple(ec1), ec_tuple(ec2)):
         if a is None or b is None:
             continue
@@ -127,8 +64,7 @@ def ec_compatible(ec1: str, ec2: str) -> bool:
 
 
 def pair_conflicts(set_a, set_b) -> bool:
-    """A tool-pair conflicts iff BOTH sides keep a private (incompatible) EC —
-    i.e. neither EC set is a subset of the other under EC-compatibility."""
+    """Returns True when each EC set has an EC incompatible with every EC of the other."""
     a_left = [a for a in set_a if not any(ec_compatible(a, b) for b in set_b)]
     if not a_left:
         return False
@@ -136,11 +72,7 @@ def pair_conflicts(set_a, set_b) -> bool:
 
 
 def c4_conflict_fraction(evmap: dict):
-    """Return (R, n_conflict_pairs, n_total_pairs, n_ec_tools).
-
-    R = conflicting tool-pairs / total EC-reporting tool-pairs; 0 when < 2
-    tools reported an EC (no conflict is measurable).
-    """
+    """Returns (R, n_conflict_pairs, n_total_pairs, n_ec_tools) over itertools tool pairs; R is 0 below two tools."""
     tools = [t for t, s in evmap.items() if s]
     m = len(tools)
     if m < 2:
@@ -152,10 +84,7 @@ def c4_conflict_fraction(evmap: dict):
 
 
 def c4_clearance(conflict_fraction: float, n_ec_tools: int) -> float:
-    """c4_score = 1 - (m/5)*R, clamped to [0,1].
-
-    Weight m/5 = participation of the EC-capable panel; the final scorer
-    applies base = C1 * c4_score."""
+    """Returns c4_score = 1 - (m/5)*R, floored at 0."""
     weight = min(n_ec_tools, N_EC_CAPABLE_TOOLS) / float(N_EC_CAPABLE_TOOLS)
     return max(0.0, 1.0 - weight * conflict_fraction)
 
@@ -163,6 +92,7 @@ def c4_clearance(conflict_fraction: float, n_ec_tools: int) -> float:
 def _build_c4_reasoning(status: str, evidence: str, conflict_fraction: float,
                         n_conflict_pairs: int, n_total_pairs: int,
                         n_ec_tools: int, c4_score: float) -> str:
+    """Builds the human-readable explanation of a gene's C4 score."""
     ev = evidence or "(no evidence)"
     if n_ec_tools == 0:
         return ("no EC number assigned by any tool — no conflict measurable — "
@@ -184,6 +114,7 @@ def _build_c4_reasoning(status: str, evidence: str, conflict_fraction: float,
 
 
 def main() -> None:
+    """Streams the EC consensus table with csv, scores C4 per gene and writes it with tier provenance."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ec-consensus-input", required=True, help="labeled-genes-ec-consensus.tsv")
@@ -243,9 +174,7 @@ def main() -> None:
             conflict_fraction, n_conf, n_total, m = c4_conflict_fraction(evmap)
             c4 = c4_clearance(conflict_fraction, m)
 
-            # Review FLAG stays on the upstream categorical call (keeps
-            # score-confidence-tier.py / make-final-excel.py coherent); the
-            # graded conflict fraction drives the SCORE.
+            # The flag follows the categorical status; R drives the score.
             flag = "needs_review" if status == "conflicting" else "ok"
 
             prov = provenance_by_gene.get(fid, {

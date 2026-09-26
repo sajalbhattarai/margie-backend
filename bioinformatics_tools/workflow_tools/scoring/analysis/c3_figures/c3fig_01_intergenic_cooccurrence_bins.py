@@ -1,52 +1,10 @@
 #!/usr/bin/env python3
-"""Figure 55 - Intergenic-distance bins of operon co-occurrence + by-chance test.
+"""Figure 55 - intergenic-distance bins of within-operon co-occurrence and a by-chance test.
 
-THE QUESTION (from the operon-index thread)
---------------------------------------------
-For two genes that sit together INSIDE the same operon, how far apart are they,
-and given that spacing, do they ALWAYS co-occur - or could that partnership be a
-coincidence?  A model predicting two adjacent genes are "in an operon" is only
-useful if their two FUNCTIONS genuinely belong together, recurrently, across
-genomes.  This figure measures exactly that, binned by intergenic distance.
-
-DEFINITIONS
------------
-* Gene identity  = clean_descriptor (the functional name).  The SAME descriptor
-  in different genomes is the SAME gene - co-occurrence is counted over
-  descriptor pairs, never feature_ids.
-* Within-operon adjacency = two genes that are consecutive (sorted by start) in
-  the SAME operon on the SAME contig.
-* Intergenic distance = downstream.start - upstream.end - 1
-        < 0  overlapping ORFs      = 0  abutting      > 0  a real gap (bp)
-  Bins: <0, 0, 1-100, 100-200, 200-300, 300-400, 400-500, >500.
-
-BY-CHANCE MODEL (informative-informative pairs only; a hypothetical partner has
-no function to co-occur)
------------------------------------------------------------------------------
-Treat every within-operon informative adjacency as an edge of a multigraph on
-functions.  M = total edges; deg(A) = edges touching function A.  For a pair
-(A,B) observed k_inst times, the configuration-model expectation is
-        E = deg(A) * deg(B) / (2M)
-        lift    = k_inst / E                     (>1 = enriched over chance)
-        p_chance = P(X >= k_inst | Poisson(E))   (the "by chance" probability)
-"Do they always co-occur?" = conditional co-occurrence
-        cond = (# genomes where A,B are operon-adjacent)
-               / (# genomes where both A,B are present as operon members)
-cond = 1.0 means: wherever both functions exist, they are always operon partners.
-
-Panels
-------
-(a) how many within-operon adjacencies fall in each intergenic bin (the spacing
-    of operon partners) - operon-internal genes are overwhelmingly overlapping
-    or <100 bp apart.
-(b) "do they always co-occur?" - distribution of conditional co-occurrence for
-    informative descriptor pairs; a large mode at 1.0 = deterministic partners.
-(c) by-chance probability per bin - distribution of -log10 p_chance; even the
-    least-conserved partners beat chance, conserved modules reach ~1e-50.
-(d) the strongest conserved modules (most genomes co-adjacent), annotated with
-    their spacing and by-chance probability.
-
-Read-only analysis; does NOT modify the scoring pipeline.
+Bins adjacent operon partners by gap, measures conditional co-occurrence across
+genomes, and scores each descriptor pair against a configuration-model Poisson
+null (scipy.stats.poisson). Panels: (a) bin counts, (b) co-occurrence, (c)
+by-chance probability per bin, (d) strongest conserved modules.
 """
 import csv
 import math
@@ -65,16 +23,17 @@ csv.field_size_limit(10_000_000)
 
 SUB = "01-operon-context-confidence"
 
-# intergenic-distance bins requested by the user, + a >500 catch-all
+# Intergenic-distance bins in bp, with a >500 catch-all.
 BINS = [(-10**9, -1, "<0"), (0, 0, "0"), (1, 100, "1-100"),
         (101, 200, "100-200"), (201, 300, "200-300"), (301, 400, "300-400"),
         (401, 500, "400-500"), (501, 10**9, ">500")]
 BIN_NAMES = [b[2] for b in BINS]
-# green (tight / overlapping = strong coupling) -> red (far apart = weak)
+# Green (tight or overlapping) to red (far apart).
 BIN_COLORS = [L.GREEN, L.TEAL, L.LIME, L.YELLOW, L.AMBER, L.ORANGE, L.RED, "#8a1220"]
 
 
 def _bin_of(gap):
+    """Returns the name of the intergenic bin containing gap."""
     for lo, hi, nm in BINS:
         if lo <= gap <= hi:
             return nm
@@ -82,7 +41,7 @@ def _bin_of(gap):
 
 
 def _build_contig_map(run_root, organisms):
-    """(organism, feature_id) -> contig id, parsed from gene_id in labeled-genes."""
+    """Returns {(organism, feature_id): contig id}, parsed from gene_id in labeled-genes.tsv."""
     rx = __import__("re").compile(r"^(.*)_(\d+)([+-])(\d+)$")
     m = {}
     for org in organisms:
@@ -102,6 +61,7 @@ def _build_contig_map(run_root, organisms):
 
 
 def make(genes, operons, outdir):
+    """Counts within-operon adjacencies per bin and pair, then draws the four panels and TSVs."""
     run_root = outdir.parents[3]
     g = genes.copy()
     organisms = sorted(g["organism"].unique())
@@ -109,6 +69,7 @@ def make(genes, operons, outdir):
     g["contig"] = [contig.get((o, f)) for o, f in zip(g["organism"], g["feature_id"])]
 
     def norm(d):
+        """Returns the lower-cased, stripped descriptor."""
         return (d or "").strip().lower()
 
     uninf = {(o, f): bool(u) for o, f, u in
@@ -116,7 +77,7 @@ def make(genes, operons, outdir):
     cln = {(o, f): norm(c) for o, f, c in
            zip(g["organism"], g["feature_id"], g["clean_descriptor"])}
 
-    # ---- within-operon adjacencies -----------------------------------------
+    # ---- within-operon adjacencies ----
     inst_bins = defaultdict(int)         # bin -> instance count (ALL adjacencies)
     inst_bins_info = defaultdict(int)    # bin -> instance count (info-info only)
     pair_inst = defaultdict(int)         # (dA,dB) -> #adjacency instances
@@ -158,7 +119,7 @@ def make(genes, operons, outdir):
             deg[db] += 1
             M += 1
 
-    # ---- per descriptor-pair statistics (by-chance + always-co-occur) ------
+    # ---- per descriptor-pair statistics (by-chance + always-co-occur) ----
     rows = []
     for key, inst in pair_inst.items():
         a, b = key
@@ -180,11 +141,11 @@ def make(genes, operons, outdir):
         })
     pairs = pd.DataFrame(rows)
 
-    # ======================= FIGURE =========================================
+    # ---- figure ----
     fig, axes = plt.subplots(2, 2, figsize=(15.5, 12.4))
     axA, axB, axC, axD = axes.ravel()
 
-    # ---- (a) intergenic-bin histogram of within-operon adjacencies ---------
+    # ---- (a) intergenic-bin histogram of within-operon adjacencies ----
     tot_all = sum(inst_bins.values()) or 1
     all_counts = [inst_bins.get(nm, 0) for nm in BIN_NAMES]
     info_counts = [inst_bins_info.get(nm, 0) for nm in BIN_NAMES]
@@ -208,7 +169,7 @@ def make(genes, operons, outdir):
     L.boldticks(axA)
     axA.grid(False)
 
-    # ---- (b) do they always co-occur?  conditional co-occurrence -----------
+    # ---- (b) do they always co-occur?  conditional co-occurrence ----
     cond = pairs["conditional_cooccurrence"].dropna().to_numpy()
     multi = pairs[pairs["n_genomes_copresent"] >= 2]["conditional_cooccurrence"].dropna().to_numpy()
     axB.hist(cond, bins=np.linspace(0, 1, 21), color=L.BLUE, edgecolor="black",
@@ -230,8 +191,8 @@ def make(genes, operons, outdir):
     L.boldticks(axB)
     axB.grid(False)
 
-    # ---- (c) by-chance probability per bin ---------------------------------
-    # well-populated bins get their own box; sparse far bins are pooled as >=100
+    # ---- (c) by-chance probability per bin ----
+    # Well-populated bins get their own box; sparse far bins are pooled as >=100.
     near = ["<0", "0", "1-100"]
     box_data, box_labels, box_cols = [], [], []
     for nm, col in zip(BIN_NAMES, BIN_COLORS):
@@ -269,7 +230,7 @@ def make(genes, operons, outdir):
     L.boldticks(axC)
     axC.grid(False)
 
-    # ---- (d) strongest conserved modules -----------------------------------
+    # ---- (d) strongest conserved modules ----
     top = pairs.sort_values(["n_genomes_adjacent", "lift"],
                             ascending=False).head(12).iloc[::-1]
     if len(top):
@@ -300,7 +261,7 @@ def make(genes, operons, outdir):
                  y=1.004)
     fig.tight_layout(h_pad=2.6, w_pad=3.0)
 
-    # ---- TSVs --------------------------------------------------------------
+    # ---- TSVs ----
     L.write_tsv(pairs.sort_values(["n_genomes_adjacent", "lift"], ascending=False),
                 outdir / "fig01_pair_intergenic_cooccurrence.tsv")
 

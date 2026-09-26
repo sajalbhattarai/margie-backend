@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""make_organism_report.py -- per-organism report figures + TSVs.
+"""make_organism_report.py -- per-organism report figures and TSVs.
 
-Runs AFTER a genome's scoring is finished. Reads only that genome's finished
-scoring outputs plus the depot pangenome operon reference (read-only); writes
-only into  <run>/<organism>/scoring/figures/ . Cannot affect scoring.
-
-Every figure presents this organism's results IN THE CONTEXT of the pangenome.
-Presentation only -- no conclusions in any title/label. Each figure emits a
->=400 dpi PNG and a companion TSV with the exact plotted numbers.
+Runs after a genome is scored; reads its scoring outputs and the depot operon
+reference and writes <run>/<organism>/scoring/figures/. Each figure shows the
+organism against the pangenome as a matplotlib PNG (>= 400 dpi) with a TSV of
+the plotted numbers.
 """
 from __future__ import annotations
 
@@ -29,9 +26,7 @@ _OPERON_DB = None
 
 
 def _table_units(members) -> float:
-    """Total text lines a gene table needs for these members (header + wrapped
-    SOURCE-PREFIXED descriptor lines), so the table axis is sized for exactly
-    what render_gene_table will draw (long 'PGAP: …' names never overrun)."""
+    """Returns the number of text lines render_gene_table needs for these members."""
     return L.member_table_units(members)
 
 
@@ -39,6 +34,7 @@ def _table_units(members) -> float:
 # fig01 -- confidence tiers and the confidence-score distribution
 # ---------------------------------------------------------------------------
 def fig01(genes: pd.DataFrame, outdir: Path, org_label: str) -> None:
+    """Draws genes per confidence tier and the final-score histogram (numpy)."""
     coding = genes[genes["confidence_tier"] != L.NONCODING_TIER]
     counts = coding["confidence_tier"].value_counts()
     tiers = [t for t in L.CONF_TIER_ORDER if t in counts.index]
@@ -85,9 +81,10 @@ def fig01(genes: pd.DataFrame, outdir: Path, org_label: str) -> None:
 # fig02 -- preliminary -> operon-adjusted -> final confidence
 # ---------------------------------------------------------------------------
 def fig02(genes: pd.DataFrame, outdir: Path, org_label: str) -> None:
-    # In the current scoring formula the final score IS the operon-adjusted score
-    # (confidence_score == final_confidence_operon_context), so we show
-    # preliminary → final and the operon correction (final − preliminary).
+    """Draws preliminary vs final confidence, the operon-correction histogram and before/after means.
+
+    The final score equals the operon-adjusted score, so the correction is final - preliminary.
+    """
     d = genes.copy()
     prelim = pd.to_numeric(d["preliminary_confidence_c1_c4"], errors="coerce")
     adj = pd.to_numeric(d["final_confidence_operon_context"], errors="coerce")
@@ -171,12 +168,14 @@ def fig02(genes: pd.DataFrame, outdir: Path, org_label: str) -> None:
 # fig03 -- operon-context score and pangenome breadth by operon size
 # ---------------------------------------------------------------------------
 def _box_by_bin(ax, df, value_col, color, ylabel):
+    """Draws box plots of value_col by operon size bin via reportfig_lib.box_by_bin."""
     return L.box_by_bin(ax, df, "size_bin", value_col, L.SIZE_BIN_ORDER, color,
                         ylabel, "operon size (number of member genes)")
 
 
 def fig03(genes: pd.DataFrame, operons: pd.DataFrame, recurrence: dict,
           outdir: Path, org_label: str) -> None:
+    """Draws C3 by operon size and the share of operons recurring in >= 2 pangenome organisms."""
     d = genes[genes["in_operon"]].copy()
     d["size_bin"] = d["operon_member_count"].map(L.size_bin)
 
@@ -235,6 +234,7 @@ def fig03(genes: pd.DataFrame, operons: pd.DataFrame, recurrence: dict,
 # fig04 -- distribution of each confidence component (C1..C4)
 # ---------------------------------------------------------------------------
 def fig04(genes: pd.DataFrame, outdir: Path, org_label: str) -> None:
+    """Draws a histogram with median for each of C1-C4."""
     comps = [("C1", "c1_score"), ("C2", "c2_score_from_operon_probability"),
              ("C3", "c3_score"), ("C4", "c4_score")]
     fig, axes = plt.subplots(2, 2, figsize=(13.2, 10.0))
@@ -265,8 +265,7 @@ def fig04(genes: pd.DataFrame, outdir: Path, org_label: str) -> None:
 # fig05 -- one real operon neighbourhood (gene track)
 # ---------------------------------------------------------------------------
 def _pick_window(genes: pd.DataFrame, span: int = 11) -> pd.DataFrame:
-    """Pick a genomic window on the densest contig centred on an operon
-    boundary (two different operons meeting across a wide gap)."""
+    """Returns a window of genes on the largest contig centred on a boundary between two operons at least 100 bp apart."""
     g = genes.dropna(subset=["gene_start"]).copy()
     if g.empty:
         return g
@@ -274,6 +273,7 @@ def _pick_window(genes: pd.DataFrame, span: int = 11) -> pd.DataFrame:
     sub = g[g["contig"] == contig].sort_values("gene_start").reset_index(drop=True)
 
     def oid(i):
+        """Returns row i's operon id when it is in a real operon, else None."""
         v = sub.loc[i, "operon_id"]
         return v if (v and v != L._NOT_IN_OPERON and bool(sub.loc[i, "in_operon"])) else None
 
@@ -297,6 +297,7 @@ def _pick_window(genes: pd.DataFrame, span: int = 11) -> pd.DataFrame:
 
 
 def fig05(genes: pd.DataFrame, outdir: Path, org_label: str) -> None:
+    """Draws one real genome window with its operons via reportfig_lib.render_operon_page."""
     from matplotlib.patches import Patch
     win = _pick_window(genes)
     members = [{"start": r.gene_start, "end": r.gene_end, "strand": r.RAST_strand,
@@ -318,8 +319,7 @@ def fig05(genes: pd.DataFrame, outdir: Path, org_label: str) -> None:
     handles = [Patch(facecolor="#eef1f6", edgecolor="#c3ccd6", label="genes of one operon"),
                Patch(facecolor="#9aa0a6", edgecolor="#222222",
                      label="gene  (arrow points 5'→3' along its coding strand)")]
-    # SHARED renderer -> identical formatting to the atlas (full C1-C4 table, fonts,
-    # symmetry); a real contiguous stretch of the genome, operon bands captioned.
+    # Shared renderer, same formatting as the atlas.
     span = f"{int(win.gene_start.min()):,}–{int(win.gene_end.max()):,} bp"
     L.render_operon_page(outdir / "fig05_operon_neighbourhood.png",
                          [{"members": members, "heading": span,
@@ -335,10 +335,8 @@ def fig05(genes: pd.DataFrame, outdir: Path, org_label: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# fig06 / fig07 -- top-10 most-reproduced and most-unique operons.
-# Each operon is one row: a gene-track (grouping band, coloured nodes tagged
-# A/B/C, gaps) on the left, and the FULL descriptor for each tag + its final
-# confidence on the right. No gene name is truncated.
+# fig06 / fig07 / fig08 -- galleries of the most-reproduced, most-unique and
+# penalised operons: gene track plus full descriptors and confidence.
 # ---------------------------------------------------------------------------
 _GALLERY_N = 10
 _GALLERY_CAP = 6   # members drawn per operon row
@@ -347,6 +345,7 @@ _GALLERY_CAP = 6   # members drawn per operon row
 def _operon_gallery(ops_ranked: pd.DataFrame, outdir: Path, org_label: str,
                     fname: str, tsv: str, suptitle: str, mode: str = "reproduced",
                     note: str | None = None, pool_n: int | None = None) -> None:
+    """Renders the top _GALLERY_N operons as one gallery page and writes its TSV."""
     top = ops_ranked.head(_GALLERY_N).reset_index(drop=True)
     if len(top) == 0:
         return
@@ -359,7 +358,7 @@ def _operon_gallery(ops_ranked: pd.DataFrame, outdir: Path, org_label: str,
         if mode == "unique":
             where = "seen in no other genome"
         elif mode == "penalized":
-            # the recurrence IS the penalty trail: low cross-genome conservation (C3)
+            # recurrence explains the penalty (low conservation, C3)
             where = f"lowered by weak conservation — operon seen in {ofn} genomes"
         else:
             where = f"conserved in {ofn} genomes" if k != 1 else f"in 1 of {pool_n or '?'} genomes"
@@ -371,8 +370,7 @@ def _operon_gallery(ops_ranked: pd.DataFrame, outdir: Path, org_label: str,
                      "pangenome_occurrences": int(r.get("pangenome_occurrences", 0) or 0),
                      "operon_confidence_penalty": round(float(r.get("penalty", 0.0) or 0.0), 4),
                      "members_in_order": r["members_in_order"]})
-    # SHARED renderer -> identical formatting (full C1-C4 table, fonts, symmetry,
-    # aligned columns) to the full-genome atlas; defaults match the atlas.
+    # Shared renderer, same formatting as the atlas.
     L.render_operon_page(outdir / fname, blocks, org_label=org_label, suptitle=suptitle,
                          run_root=_RUN_ROOT, note=note or L.OPERON_CORRECTION_NOTE,
                          footer_sources=L.organism_source_lines(_RUN_ROOT, org_label,
@@ -382,8 +380,7 @@ def _operon_gallery(ops_ranked: pd.DataFrame, outdir: Path, org_label: str,
 
 
 def _operon_penalty(r) -> float:
-    """Total downward operon correction across an operon's members
-    (Σ max(0, preliminary − final)); >0 means operon context LOWERED confidence."""
+    """Returns the summed downward correction Σ max(0, preliminary - final) over an operon's members."""
     tot = 0.0
     for p, f in zip(r.get("preliminaries", []) or [], r.get("confidences", []) or []):
         try:
@@ -397,6 +394,7 @@ def _operon_penalty(r) -> float:
 
 def fig06_07(operons: pd.DataFrame, recurrence: dict, outdir: Path, org_label: str,
              pool_n: int | None = None) -> None:
+    """Draws the reproduced (fig06), unique (fig07) and penalised (fig08) operon galleries."""
     ops = operons.copy()
     ops["pangenome_organisms"] = ops["members_in_order"].map(
         lambda m: recurrence.get(m, {}).get("organism_count", 0))
@@ -439,6 +437,7 @@ def fig06_07(operons: pd.DataFrame, recurrence: dict, outdir: Path, org_label: s
 
 # ---------------------------------------------------------------------------
 def main() -> None:
+    """Loads the organism and its leave-one-out OCC pool, draws every figure and exits 2 if any fails."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run-root", required=True)
     ap.add_argument("--organism", required=True)
@@ -458,27 +457,14 @@ def main() -> None:
     org_label = args.organism
     genes = L.load_organism_genes(run_root, args.organism)
     operons = L.build_operons(genes)
-    # Scope pangenome recurrence to the organisms actually SCORED in THIS run
-    # (the timestamped run folder). That is exactly the OCC pool this run's C3 was
-    # computed against -- so recurrence is self-consistent with the run, grows
-    # dynamically as the run adds organisms, and excludes both unrelated depot
-    # reference genomes and input-user genomes not yet scored in this run.
-    # Scope recurrence + pool caption to the ACTUAL OCC pool (occ_reference.pkl's
-    # organisms) -- the persistent baseline the C3 scores were computed against --
-    # NOT just this run's scored-so-far organisms (which under-reports mid-run,
-    # e.g. captioning "4 genomes" while C3 actually used all 21). Falls back to
-    # the run's organisms if the OCC reference is unreadable.
+    # Recurrence and the pool caption use the OCC reference's organisms,
+    # falling back to this run's organisms when the OCC is unreadable.
     restrict = L.load_occ_organisms() or set(L.discover_organisms(run_root))
-    # LEAVE-ONE-OUT: this organism's C3 was scored against the OTHER pool genomes
-    # (its own contribution is removed from the OCC before scoring), so the pool it
-    # is compared to -- for operon recurrence denominators AND the provenance
-    # caption -- excludes itself: 21 in the reference -> 20 here.
+    # Leave-one-out: the pool excludes this organism, as in its C3 scoring.
     restrict = set(restrict)
     restrict.discard(org_label)
     recurrence = L.load_operon_recurrence(Path(args.operon_db), restrict_to=restrict)
-    # Provenance line under every figure title: the LOO pool (genome count + gene
-    # and operon tallies) read from the OCC's genome-stats sidecar -- complete even
-    # mid-run, unlike the run folder which under-counts to this single genome.
+    # Provenance line: pool size and tallies from the OCC genome-stats sidecar.
     pool_list = sorted(restrict)
     pstats = L.aggregate_pool_stats(L.load_pool_stats(), pool_list)
     L.set_provenance(L.provenance_text(len(pool_list), pstats, leave_one_out=True))

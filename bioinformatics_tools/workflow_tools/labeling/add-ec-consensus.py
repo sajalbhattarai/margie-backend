@@ -1,68 +1,13 @@
 #!/usr/bin/env python3
-"""add-ec-consensus.py — margie_sb phase10 (labeling), Tier-1 consensus
-layer: EC numbers.
+"""add-ec-consensus.py — labeling stage: EC-number consensus.
 
-Reads labeled-genes.tsv (assign-canonical-label.py's output, READ-ONLY --
-this script never modifies or extends that file) and
-consolidated-merged-all-columns.tsv (for EC evidence across multiple
-independent tools), joins on feature_id, and writes its OWN standalone
-table: a small set of identity/decision columns for cross-reference, plus
-the EC consensus columns. Kept as a separate output file, not merged back
-into labeled-genes.tsv -- the same "one core table, several focused
-derived views" pattern as consolidation/extract-ec-numbers.py relative to
-merge-all-columns.py. This keeps labeled-genes.tsv itself untouched and
-auditable on its own, and keeps this consensus question (do independent
-sources agree with each other?) clearly separate from the hierarchical
-decision itself (which tool's text wins canonical_label).
-
-EC EVIDENCE: same 13 sources as consolidation/extract-ec-numbers.py (a
-few tools have a dedicated EC column, the rest have EC numbers embedded
-inline in their description text).
-
-AGREEMENT CLASSIFICATION compares each tool's FULL SET of reported ECs
-against the others (not one EC at a time) -- needed for two real reasons:
-  1. Bifunctional enzymes genuinely have >1 correct EC number (e.g. FolD,
-     EC 1.5.1.5 AND EC 3.5.4.9, both real). When multiple tools each
-     report the SAME pair, that's perfect agreement -- voting on
-     individual EC numbers as if they were competing alternatives ties
-     each EC at the same vote count and wrongly calls it "conflicting".
-     Comparing full sets also fixes a single tool legitimately reporting
-     2 activities with no second tool to compare against at all -- that's
-     single_source, not a tie needing breaking.
-  2. EC nomenclature itself has a wildcard: "2.3.4.-" means "subclass
-     known, exact reaction not yet pinned down", and is the SAME enzyme
-     as a more specific "2.3.4.1" from the same subclass, not a different
-     one. ec_compatible() treats these as one compatibility class (the
-     fully-resolved value is the reported representative) rather than
-     two competing, unrelated ECs.
-  Genuinely different EC numbers (e.g. EGGNOG: 2.3.1.15 vs KEGG: 2.3.1.275
-  for the same gene) remain correctly flagged conflicting -- this only
-  removes FALSE conflicts, not real ones. One known residual case this
-  can't resolve: EC class 7 ("translocases") was only introduced in 2018
-  to reclassify ABC-transporter ATPases that used to sit under 3.6.3.x --
-  two tools of different vintage reporting e.g. "3.6.3.27" vs "7.3.2.1"
-  for the same transporter may be the SAME call under old vs. new
-  nomenclature, not a real disagreement, but detecting that needs an
-  external EC-to-EC cross-reference table this pipeline doesn't have --
-  left as a known limitation, still reported as "conflicting".
-
-  full_consensus      -- every tool that reported anything agrees on
-                         exactly the same set of ECs (zero disagreement).
-  majority_consensus  -- tools share a non-empty common core, but at
-                         least one tool reports an extra EC the others
-                         don't confirm.
-  single_source       -- exactly one tool reported anything at all -- real
-                         evidence, but nothing independent to check it
-                         against.
-  conflicting         -- multiple tools reported genuinely different ECs
-                         with no shared core at all.
-  no_evidence         -- no tool reported any EC for this gene.
-
-label_ec_consistent: does the WINNING tool's (label_source) own EC set
-overlap at all with the consensus EC set? True/False/NA -- NA when
-there's no EC evidence at all, or the winning tool has no EC of its own
-to check (e.g. PGAP/TIGRFAM/HAMAP winning on a non-enzymatic structural
-family).
+Collects EC numbers from 13 tools in the merged table (dedicated EC columns or
+regex on descriptions) and compares each tool's full EC set. "X.X.X.-" is
+compatible with any fully resolved EC in the same subclass. Status is
+full_consensus, majority_consensus, single_source, conflicting or no_evidence;
+product_descriptor_ec_consistent says whether the winning label source's ECs
+overlap the consensus (True/False/NA). Old 3.6.3.x vs new class 7 numbers
+still count as conflicting.
 """
 from __future__ import annotations
 
@@ -76,8 +21,7 @@ csv.field_size_limit(10_000_000)
 
 EC_PATTERN = re.compile(r"(\d+\.\d+\.\d+\.(?:\d+|-))")
 
-# tool_name -> source column to scan for EC numbers in the merged table.
-# Same mapping as consolidation/extract-ec-numbers.py.
+# tool_name -> merged-table column scanned for EC numbers.
 EC_SOURCE_COLUMN: dict[str, str] = {
     "RAST": "RAST_EC_numbers",
     "DBCAN": "DBCAN_ec_numbers",
@@ -104,12 +48,14 @@ _IDENTITY_COLUMNS = [
 
 
 def extract_ec_numbers(text: str) -> set[str]:
+    """Returns the set of EC numbers found in text by regex."""
     if not text:
         return set()
     return set(EC_PATTERN.findall(text))
 
 
 def collect_ec_evidence(merged_row: dict[str, str]) -> dict[str, set[str]]:
+    """Returns {tool: EC set} for every tool with at least one EC in the merged row."""
     evidence: dict[str, set[str]] = {}
     for tool, src_col in EC_SOURCE_COLUMN.items():
         values = extract_ec_numbers(merged_row.get(src_col, ""))
@@ -119,15 +65,7 @@ def collect_ec_evidence(merged_row: dict[str, str]) -> dict[str, set[str]]:
 
 
 def ec_compatible(a: str, b: str) -> bool:
-    """True if two EC numbers are the same enzyme at a coarser/finer
-    specificity -- "2.3.4.-" (subclass known, exact reaction not pinned
-    down) is compatible with "2.3.4.1" (the same subclass, fully
-    resolved). EC_PATTERN only ever places "-" in the 4th position (the
-    first three levels are always digits), so compatibility only needs:
-    same first three levels, and either side's 4th level is the wildcard
-    "-" or they match exactly. Two fully-resolved-but-different 4th
-    levels (e.g. "6.3.5.6" vs "6.3.5.7") are NOT compatible -- those are
-    two distinct, specific reactions, not a coarse/fine pair."""
+    """Returns True when two ECs share the first three levels and the fourth matches or either is "-"."""
     a_parts, b_parts = a.split("."), b.split(".")
     if a_parts[:3] != b_parts[:3]:
         return False
@@ -135,17 +73,13 @@ def ec_compatible(a: str, b: str) -> bool:
 
 
 def most_specific(ec_values: set[str]) -> str:
-    """Within a compatibility class, prefer a fully-resolved member
-    ("2.3.4.1") over a coarser "X.X.X.-" placeholder as the reported
-    representative."""
+    """Returns a class representative, preferring a fully resolved EC over "X.X.X.-"."""
     resolved = sorted(v for v in ec_values if not v.endswith(".-"))
     return resolved[0] if resolved else sorted(ec_values)[0]
 
 
 def cluster_ec_values(all_values: set[str]) -> list[set[str]]:
-    """Groups EC strings into ec_compatible() classes. Pairwise/greedy,
-    not a full union-find -- fine here since a single gene has at most a
-    handful of distinct EC values across all tools."""
+    """Groups EC strings into ec_compatible() classes by greedy pairwise assignment."""
     clusters: list[set[str]] = []
     for val in all_values:
         for cluster in clusters:
@@ -158,10 +92,11 @@ def cluster_ec_values(all_values: set[str]) -> list[set[str]]:
 
 
 def classify_ec_agreement(evidence: dict[str, set[str]]) -> tuple[str, str, int, int, str]:
-    """Returns (status, consensus_ecs, supporting_tool_count,
-    total_distinct_classes, supporting_tools). consensus_ecs may be a
-    ";"-joined list of more than one EC when the gene is genuinely
-    multi-functional and every tool agrees on the same set."""
+    """Classifies per-tool EC class sets by set intersection and union.
+
+    Returns (status, consensus_ecs, supporting_tool_count, total_distinct_classes,
+    supporting_tools); consensus_ecs is ";"-joined when several ECs agree.
+    """
     if not evidence:
         return "no_evidence", "", 0, 0, ""
 
@@ -197,9 +132,7 @@ def classify_ec_agreement(evidence: dict[str, set[str]]) -> tuple[str, str, int,
         supporting = [t for t in tools if intersection <= tool_to_classes[t]]
         return "majority_consensus", consensus, len(supporting), total_distinct, ";".join(sorted(supporting))
 
-    # No shared class at all -- report whichever class has the most tool
-    # support as the representative "consensus" pick, but the status
-    # itself stays conflicting since nothing is truly agreed.
+    # No shared class: reports the best-supported class, status conflicting.
     class_support: dict[str, set[str]] = {}
     for tool, classes in tool_to_classes.items():
         for c in classes:
@@ -209,10 +142,7 @@ def classify_ec_agreement(evidence: dict[str, set[str]]) -> tuple[str, str, int,
 
 
 def check_label_consistency(product_descriptor_source: str, evidence: dict[str, set[str]], consensus_ecs: str) -> str:
-    """True/False/NA -- does the winning tool's own EC set overlap AT
-    ALL with the consensus EC set? (Overlap, not exact match -- a
-    winning tool reporting just one of two agreed bifunctional ECs is
-    still consistent, not a mismatch.)"""
+    """Returns "True"/"False"/"NA" for whether the winning tool's ECs overlap the consensus set."""
     if not consensus_ecs or product_descriptor_source not in EC_SOURCE_COLUMN:
         return "NA"
     winner_values = evidence.get(product_descriptor_source)
@@ -223,15 +153,13 @@ def check_label_consistency(product_descriptor_source: str, evidence: dict[str, 
 
 
 def build_evidence_string(evidence: dict[str, set[str]]) -> str:
-    """Full per-tool breakdown of everything reported, e.g.
-    'EGGNOG: 2.3.1.15; KEGG: 2.3.1.275' -- shows exactly what every tool
-    said, including the ones that disagreed with the consensus, not just
-    the winning count."""
+    """Formats every tool's ECs as 'EGGNOG: 2.3.1.15; KEGG: 2.3.1.275'."""
     parts = [f"{tool}: {','.join(sorted(values))}" for tool, values in sorted(evidence.items())]
     return "; ".join(parts)
 
 
 def main() -> None:
+    """Joins labeled genes to merged-table EC evidence with csv and writes the EC consensus table."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--labeled-input", required=True,

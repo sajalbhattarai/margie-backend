@@ -14,7 +14,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load project-root .env first, then allow shell environment to override values.
+# Loads the project-root .env first; shell environment values take precedence.
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(dotenv_path=_PROJECT_ROOT / '.env', override=False)
 load_dotenv(override=False)  # Must run before local imports that read env vars at import time
@@ -43,10 +43,8 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# Add CORS middleware. Defaults to "*" so local dev (frontend on any of
-# localhost:5173/3000/etc.) keeps working untouched; set BSP_CORS_ALLOWED_ORIGINS
-# to a comma-separated list of real origins (e.g. https://dane.anvilcloud.rcac.purdue.edu)
-# for a public deployment.
+# CORS defaults to "*" for local development; BSP_CORS_ALLOWED_ORIGINS takes a
+# comma-separated list of origins for a public deployment.
 _cors_origins_env = os.getenv('BSP_CORS_ALLOWED_ORIGINS', '*')
 _cors_origins = ["*"] if _cors_origins_env == '*' else [
     origin.strip() for origin in _cors_origins_env.split(',') if origin.strip()
@@ -59,16 +57,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Where this API records the node and pid it is running on. $HOME is shared
-# across login nodes but /tmp is not, so this must live under $HOME for the
-# launcher on any node -- or on the user's laptop over SSH -- to find it.
-#
-# Why it exists: an abandoned dane-api holds port 8000 on whichever login node
-# it happens to be on, and ssh to the cluster address round-robins, so the next
-# launch usually lands somewhere else and never sees it. Processes were found
-# still holding 8000 twenty-six days after their session ended. Sweeping a
-# hardcoded list of login node names would be both fragile and cluster-specific;
-# recording the location is exact and portable.
+# Records the node and pid this API runs on, so a launcher on any login node can
+# find and stop an abandoned server. Lives under $HOME, which login nodes share.
 API_ADVERT = Path(
     os.getenv('BSP_API_ADVERT',
               os.path.expanduser('~/.local/share/bsp/api-endpoint.json'))
@@ -88,13 +78,12 @@ def _write_api_advert() -> None:
         LOGGER.info('API advert written: %s (%s pid %s)',
                     API_ADVERT, socket.getfqdn(), os.getpid())
     except Exception as exc:
-        # Never block startup over bookkeeping.
+        # Startup never fails over the advert.
         LOGGER.warning('Could not write API advert: %s', exc)
 
 
 def _remove_api_advert() -> None:
-    """Only remove it if it is still ours -- a newer server may have replaced it,
-    and deleting that entry would hide a live process from the next launcher."""
+    """Removes the advert only if it still names this process."""
     try:
         if API_ADVERT.is_file():
             if json.loads(API_ADVERT.read_text()).get('pid') == os.getpid():
@@ -146,21 +135,9 @@ async def health():
 
 
 def _ensure_remote_deployment_symlink() -> None:
-    """The /v1/ssh/run_workflow endpoint SSHes into the user's own cluster
-    account and runs `uvx --from ~/bioinformatics-tools/ dane_wf ...` -- a
-    deliberately separate code path from whatever process dane-api itself
-    is running from, since the API and the SSH target may be different
-    machines in a multi-user deployment. When they happen to be the same
-    machine (a single-developer setup, or local testing), ~/bioinformatics-
-    tools needs to actually point at this checkout, or the SSH-invoked
-    workflow silently runs against a stale, disconnected copy instead of
-    whatever's actually being worked on.
+    """Links ~/bioinformatics-tools to this checkout so SSH-launched dane_wf runs this code.
 
-    Self-heals the common, safe case (missing, or a symlink pointing
-    somewhere else) by linking it to this same checkout, every time the API
-    starts. Never touches an existing REAL directory there -- only logs a
-    warning, so a deliberate, separate deployment is never silently
-    destroyed.
+    Replaces a missing or stale symlink; leaves a real directory alone and logs a warning.
     """
     target = Path.home() / "bioinformatics-tools"
     try:

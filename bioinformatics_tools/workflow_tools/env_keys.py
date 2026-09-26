@@ -1,11 +1,8 @@
-"""Ensure the backend secret keys exist before the licensing gate imports the
-API layer (which requires BSP_SECRET_KEY / BSP_ENCRYPTION_KEY at import time).
+"""Creates the backend secret keys before the licensing gate imports the API layer.
 
-This lets a plain `uv sync` + `dane_wf` work without a manual `.env` step: on
-first CLI use the keys are generated and written to the backend `.env` (the same
-file dane-api reads). It is idempotent and NEVER overwrites keys that already
-exist, so a configured server/`.env` is left untouched. Imports only stdlib
-(+ cryptography, lazily) so importing it does not pull in the API package.
+Missing BSP_SECRET_KEY / BSP_ENCRYPTION_KEY are generated and appended to the backend
+.env that dane-api reads; existing keys are never overwritten. Uses only the stdlib
+(cryptography lazily) so importing it does not load the API package.
 """
 from __future__ import annotations
 
@@ -17,8 +14,7 @@ _KEYS = ("BSP_SECRET_KEY", "BSP_ENCRYPTION_KEY")
 
 
 def _repo_root() -> Path:
-    # bioinformatics_tools/workflow_tools/env_keys.py -> repo root is parents[2]
-    # (same as api/main.py's _PROJECT_ROOT, so we write the .env it reads).
+    # Same root as api/main.py's _PROJECT_ROOT, so the .env written is the one it reads.
     return Path(__file__).resolve().parents[2]
 
 
@@ -43,9 +39,7 @@ def _generate(key: str) -> str:
 
 
 def ensure_api_keys() -> None:
-    """Guarantee BSP_SECRET_KEY / BSP_ENCRYPTION_KEY are set for this process,
-    generating and persisting any that are missing. Best-effort on the file
-    write (keys still land in os.environ for the current run either way)."""
+    """Sets both keys in os.environ, generating and appending any missing ones to .env (best effort)."""
     env_path = _repo_root() / ".env"
     existing = _read_env(env_path)
     added: dict[str, str] = {}
@@ -54,7 +48,7 @@ def ensure_api_keys() -> None:
         if not val:
             val = _generate(key)
             added[key] = val
-        os.environ.setdefault(key, val)   # available for the imminent API import
+        os.environ.setdefault(key, val)
 
     if not added:
         return
@@ -67,4 +61,4 @@ def ensure_api_keys() -> None:
             f.write(prefix + "".join(f"{k}={v}\n" for k, v in added.items()))
         env_path.chmod(0o600)
     except OSError:
-        pass  # keys are set in os.environ for this run; persistence is best-effort
+        pass  # the keys are still set in os.environ for this run

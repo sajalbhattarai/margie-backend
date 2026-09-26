@@ -1,16 +1,8 @@
 """
-A single-machine stand-in for the four SLURM commands the API calls.
+Single-machine stand-in for the sbatch, squeue, sacct and scancel commands the API calls.
 
-The API submits work by SSHing into a login node and running `sbatch`, then
-watches it with `squeue` and `sacct` and stops it with `scancel`. On a laptop
-used as its own "cluster" for development there is no SLURM, so these four
-commands do the same job with plain processes: a job is a detached `bash`
-running the submitted script, and its record is a folder under
-~/.margie-dev/slurm/<id>/ holding what squeue and sacct report.
-
-Only what the API actually asks for is implemented (see
-bioinformatics_tools/utilities/ssh_slurm.py): the flags it passes and the
-format fields it reads. Anything else is refused loudly rather than guessed.
+A job is a detached bash process; its record lives in ~/.margie-dev/slurm/<id>/.
+Only the flags and format fields used by utilities/ssh_slurm.py are supported.
 """
 from __future__ import annotations
 
@@ -26,7 +18,7 @@ ROOT = Path(os.environ.get('MARGIE_DEV_SLURM', Path.home() / '.margie-dev' / 'sl
 USER = os.environ.get('USER') or os.environ.get('LOGNAME') or 'user'
 
 
-# ---------------------------------------------------------------- job records
+# ---- job records ----
 
 def _dir(job: str) -> Path:
     return ROOT / str(job)
@@ -52,13 +44,13 @@ def _alive(pid: str) -> bool:
 
 
 def _state(job: str) -> str:
-    """RUNNING while the process lives; afterwards what it ended as."""
+    """Returns RUNNING while the process lives, otherwise its final state."""
     end = _read(job, 'state')
     if end in ('COMPLETED', 'FAILED', 'CANCELLED'):
         return end
     if _alive(_read(job, 'pid')):
         return 'RUNNING'
-    # Gone without saying how: it died (killed, machine slept, ...).
+    # The process ended without recording a state, e.g. it was killed.
     rc = _read(job, 'exit')
     state = 'COMPLETED' if rc == '0' else 'FAILED'
     _write(job, 'state', state)
@@ -80,7 +72,7 @@ def _jobs() -> list[str]:
     return sorted((p.name for p in ROOT.iterdir() if p.name.isdigit()), key=int)
 
 
-# ---------------------------------------------------------------- sbatch
+# ---- sbatch ----
 
 def sbatch(argv: list[str]) -> int:
     parsable = '--parsable' in argv
@@ -93,7 +85,7 @@ def sbatch(argv: list[str]) -> int:
         print(f'sbatch: {script}: no such file', file=sys.stderr)
         return 1
 
-    # #SBATCH lines in the script, then the command line (which wins).
+    # Reads #SBATCH lines, then command-line options, which take precedence.
     opts: dict[str, str] = {}
     for line in script.read_text(errors='replace').splitlines():
         m = re.match(r'#SBATCH\s+(--?[\w-]+)(?:[= ]\s*(\S.*))?', line)
@@ -122,8 +114,7 @@ def sbatch(argv: list[str]) -> int:
     for key, value in (('name', name), ('workdir', workdir), ('script', str(script)), ('start', str(time.time()))):
         _write(job, key, value)
 
-    # The job runs detached, and writes its own ending when it finishes, so the
-    # record is right whether or not anything is watching.
+    # The detached job records its own exit code, end time and state.
     record = _dir(job)
     wrapper = (
         f'cd {sh(workdir)} || exit 1\n'
@@ -146,7 +137,7 @@ def sh(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-# ---------------------------------------------------------------- squeue / sacct
+# ---- squeue / sacct ----
 
 FIELDS = {
     '%i': lambda j: j,

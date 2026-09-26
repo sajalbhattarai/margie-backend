@@ -267,8 +267,7 @@ def update_credentials(body: UpdateClusterCredentials, current_user: dict = Depe
             )
         )
 
-    # New host/username/key may point at an account that has never run a job
-    # here before -- make sure dane_wf is ready there too.
+    # The new account may never have run a job here, so dane_wf is provisioned there too.
     try:
         ensure_remote_dane_wf(conn)
     except Exception as exc:

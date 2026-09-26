@@ -2,34 +2,15 @@
 """
 C3 organism scorer -- Operon Context Confidence (OCC).
 
-Scores every gene in ONE organism for how reliably its operon neighbourhood
-recurs across the pan-genome.
-
-FORMULA (per operon, shared by every member)
-    C3_pair(a,b) = P_ab * rho_adj(desc_a, desc_b)
-    C3_operon    = geometric mean of C3_pair over the operon's adjacencies
-    C3(gene)     = C3_operon
-  where
-    P_ab         = UniOP per-pair operon probability (operon_results.tsv)
-    rho_adj(a,b) = OCC pan-genome adjacency reliability: the Jeffreys estimate
-                   of P(adjacent | both descriptors present) x an enrichment
-                   safeguard that down-weights promiscuous high-degree hubs.
-                   k = #organisms the descriptor pair is adjacent in, n = #orgs
-                   both descriptors are present in.  c3_score uses the Jeffreys
-                   posterior mean (k+0.5)/(n+1); c3_lowerbound uses the Jeffreys
-                   95% lower bound.
-
-EDGE RULES
-    - pair where EITHER gene is uninformative/hypothetical  -> pair_term = 0.5
-    - pair never seen adjacent / same descriptor (rho=0)     -> pair_term = 0.5
-      (NEUTRAL, not a collapse -- avoids a false zero from tandem paralogs)
-    - singleton (not in an operon) / non-coding              -> C3 = 0.5
-    - operon with ZERO informative members (e.g. two hypos)  -> C3 = 0.5
-      (--allhyp-value overrides; default 0.5, equivalent to a singleton)
-
-The reference lookup keys on clean_descriptor (the functional name with the
-SOURCE: tag stripped); is_uninformative() decides the hypothetical gate.  Both
-come from c3_lib so they match how the OCC reference was built.
+Scores every gene of one organism by how well its operon neighbourhood recurs
+across the pan-genome reference (leave-one-out by default).
+  adjacency mode: C3 = geometric mean of rho_adj over the operon's UniOP-linked
+                  adjacencies with OCC evidence; rho_adj is the Jeffreys posterior
+                  mean (k+0.5)/(n+1) times the enrichment weight.
+  hybrid mode:    per-gene max of best adjacent rho_adj and best co-member rho_op.
+Pairs with a hypothetical member or no OCC evidence are excluded; an operon with
+none left scores 0. Singletons, non-coding genes and all-hypothetical operons
+score 0.5 (--allhyp-value). Both variants are written side by side.
 
 Usage:
     python3 c3_score_organism.py \
@@ -46,9 +27,7 @@ import math
 import sys
 from pathlib import Path
 
-# OCC engine (c3_occ) and the descriptor gate / loader (c3_lib), both
-# alongside this script, so descriptor cleaning, the uninformative gate, and
-# rho all match how the reference was built.
+# c3_occ and c3_lib sit next to this script and match how the reference was built.
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 import c3_occ            # noqa: E402
@@ -60,12 +39,11 @@ _NEUTRAL = 0.5
 
 
 # ---------------------------------------------------------------------------
-# rho_adj as the Jeffreys posterior mean (drives c3_score); c3_occ.rho_adj
-# supplies the Jeffreys 95% lower bound (drives c3_lowerbound).
+# Adjacency channel: Jeffreys posterior mean here (c3_score); c3_occ.rho_adj
+# gives the 95% lower bound (c3_lowerbound).
 # ---------------------------------------------------------------------------
 def _enrich_w(key, na, nb, ref):
-    """Enrichment safeguard, identical to c3_occ.finalize_reference._w
-    (down-weights promiscuous high-degree descriptors)."""
+    """Returns the adjacency enrichment weight lift/(lift+lambda), as in c3_occ.finalize_reference."""
     p = ref["params"]
     if not p.get("use_enrichment", True):
         return 1.0
@@ -81,9 +59,10 @@ def _enrich_w(key, na, nb, ref):
 
 
 def rho_adj_mean(a, b, ref):
-    """Jeffreys POSTERIOR MEAN (k+0.5)/(n+1) of P(adjacent | both present),
-    times the engine's enrichment safeguard.  0.0 guard for empty / a==b /
-    never-seen-adjacent pairs (same guard as c3_occ.rho_adj)."""
+    """Returns the Jeffreys posterior mean (k+0.5)/(n+1) of P(adjacent | both present) times the enrichment weight.
+
+    0.0 for empty, identical or never-adjacent descriptors.
+    """
     na, nb = c3_occ._norm(a), c3_occ._norm(b)
     if not na or not nb or na == nb:
         return 0.0
@@ -102,12 +81,7 @@ def rho_adj_mean(a, b, ref):
 
 
 def enrich_weight(a, b, ref):
-    """The enrichment weight w = lift/(lift+lambda) alone -- how far above chance
-    this adjacency co-occurs ('the chance of them NOT appearing together by
-    chance'). 0.0 if never-seen. Aggregated per operon, this SCALES the final
-    operon-context correction: a chance-level relationship yields a small
-    correction, so operon context can discount but never erase a gene's own
-    evidence."""
+    """Returns the adjacency enrichment weight alone, 0.0 for never-adjacent pairs."""
     na, nb = c3_occ._norm(a), c3_occ._norm(b)
     if not na or not nb or na == nb:
         return 0.0
@@ -118,15 +92,10 @@ def enrich_weight(a, b, ref):
 
 
 # ---------------------------------------------------------------------------
-# MEMBERSHIP channel (co-operon, order-FREE): the analogue of rho_adj_mean for
-# the coop_org counts.  Used only by the --c3-mode hybrid path, which scores a
-# gene by the STRONGER of its best immediate-neighbour (adjacency) and its best
-# co-member (membership) partnership -- robust to a hypothetical breaking the
-# adjacency chain or to gene-order shuffling across genomes.  The reference
-# already carries coop counts (built next to adj), so no rebuild is needed; all
-# counts are leave-one-out-correct because leave_one_out() subtracts both channels.
+# Membership channel (co-operon, order-free), used by the hybrid C3.
 # ---------------------------------------------------------------------------
 def _enrich_w_op(key, na, nb, ref):
+    """Returns the co-operon enrichment weight lift/(lift+lambda)."""
     p = ref["params"]
     if not p.get("use_enrichment", True):
         return 1.0
@@ -141,9 +110,7 @@ def _enrich_w_op(key, na, nb, ref):
 
 
 def rho_op_mean(a, b, ref):
-    """Jeffreys POSTERIOR MEAN (k+0.5)/(n+1) of P(share an operon | both present),
-    times the enrichment safeguard.  k = #genomes a,b co-occur in an operon (any
-    distance); n = #genomes both present.  0.0 for empty / a==b / never-co-seen."""
+    """Returns the Jeffreys posterior mean (k+0.5)/(n+1) of P(share an operon | both present) times the enrichment weight."""
     na, nb = c3_occ._norm(a), c3_occ._norm(b)
     if not na or not nb or na == nb:
         return 0.0
@@ -161,7 +128,7 @@ def rho_op_mean(a, b, ref):
 
 
 def rho_op_lb(a, b, ref):
-    """Jeffreys 95% LOWER BOUND for the membership channel (finalized, LOO-correct)."""
+    """Returns the finalized Jeffreys 95% lower bound for the membership channel."""
     na, nb = c3_occ._norm(a), c3_occ._norm(b)
     if not na or not nb or na == nb:
         return 0.0
@@ -170,7 +137,7 @@ def rho_op_lb(a, b, ref):
 
 # ---------------------------------------------------------------------------
 def geomean(vals):
-    """Geometric mean.  0.0 if any term <= 0 (faithful collapse); None if empty."""
+    """Returns the geometric mean via math.log/exp; 0.0 if any term <= 0, None if empty."""
     vals = list(vals)
     if not vals:
         return None
@@ -180,33 +147,22 @@ def geomean(vals):
 
 
 def is_informative(uninformative, clean_descriptor):
+    """Returns True when the gene is not uninformative and has a descriptor."""
     if bool(uninformative):
         return False
     return bool(str(clean_descriptor).strip())
 
 
 # ---------------------------------------------------------------------------
-# Conflict signal: does the cross-genome consensus contradict THIS gene's
-# functional DESCRIPTOR at its operon slot? We score the functional call (the
-# best_consensus_product_descriptor), placement given. For each operon neighbour
-# a, the OCC tells us which partner descriptors a is seen with and in how many
-# genomes; if a has a robust consensus partner D* (>= MIN_SUPPORT genomes) and
-# our descriptor is a contradicted minority (<= MINORITY of D*'s support), the
-# functional call is flagged. Absence of any consensus (novel context) -> 0 (no
-# conflict). Returned strength in [0,1] feeds the final penalty via
-# geomean(C2, conflict).
+# Conflict signal: a mate's consensus partner (>= _CONFLICT_MIN_SUPPORT genomes)
+# differs from this descriptor, which has <= _CONFLICT_MINORITY of that support.
+# Reported as c3_descriptor_conflict; not applied to the score.
 _CONFLICT_MIN_SUPPORT = 3
 _CONFLICT_MINORITY = 0.34
 
 
 def build_partner_consensus(ref):
-    """descriptor -> Counter{co-operon partner descriptor: #genomes}. Built from
-    coop_org (CO-OPERON membership, order-FREE) not adj_org (adjacency, order-
-    sensitive): 'do these functions share an operon' is the conserved biological
-    signal; 'who is immediately next to whom' is rearranged freely and caused
-    false conflicts (e.g. a DAP enzyme flagged only because its neighbour differs
-    while the whole DAP module is intact). Co-membership asks the right question:
-    does this descriptor BELONG in this module."""
+    """Returns {descriptor: Counter{co-operon partner: #genomes}} from the order-free coop_org counts (collections.Counter)."""
     from collections import Counter, defaultdict
     partners = defaultdict(Counter)
     for key, orgs in ref.get("coop_org", ref.get("adj_org", {})).items():
@@ -221,9 +177,7 @@ def build_partner_consensus(ref):
 
 
 def descriptor_conflict(descriptor, neigh_descriptors, partners):
-    """Strongest contradiction of `descriptor` by its neighbours' consensus
-    partners. 0.0 = agrees with consensus, or novel (no robust consensus);
-    up to 1.0 = strongly contradicted by a different-descriptor consensus."""
+    """Returns the strongest contradiction (0-1) of a descriptor by its mates' consensus partners."""
     worst = 0.0
     for a in neigh_descriptors:
         pc = partners.get(a)
@@ -238,8 +192,7 @@ def descriptor_conflict(descriptor, neigh_descriptors, partners):
 
 
 def load_pairwise_probs(operon_results_path):
-    """{frozenset{feature_id, neighbour_gene_id}: P_ab} from UniOP's per-pair
-    operon probabilities in operon_results.tsv."""
+    """Reads operon_results.tsv with csv into {frozenset{feature_id, neighbour_id}: UniOP pair probability}."""
     pmap = {}
     p = Path(operon_results_path)
     if not p.is_file():
@@ -265,17 +218,11 @@ def load_pairwise_probs(operon_results_path):
 
 # ---------------------------------------------------------------------------
 def compute(genes, ref, pmap, allhyp_value=_NEUTRAL, c3_mode="adjacency"):
-    """Return {feature_id: {c3, c3_lowerbound, gene_class, operon_id, ...}}.
+    """Scores every gene with pandas groupby per operon and returns {feature_id: {c3, c3_lowerbound, ...}}.
 
-    c3_mode:
-      'adjacency' (default) -- C3 = operon-level geomean(rho_adj) over supported
-                    informative adjacencies (the shipped behaviour; unchanged).
-      'hybrid'    -- C3 = PER-GENE max(best immediate-neighbour rho_adj,
-                    best co-member rho_op); 0 if no supported partner; an
-                    uninformative member inherits the mean of its operon's
-                    informative members (guilt-by-association).  Same boost-only,
-                    0-neutral semantics -- it just makes C3 per-gene, order-free,
-                    and robust to a hypothetical breaking the adjacency chain."""
+    Computes both the adjacency and hybrid C3; c3_mode picks which is the primary c3.
+    In hybrid mode uninformative members inherit their operon's mean.
+    """
     per_gene = {}
 
     g = genes.copy()
@@ -306,13 +253,8 @@ def compute(genes, ref, pmap, allhyp_value=_NEUTRAL, c3_mode="adjacency"):
         n_inf = sum(1 for x in recs if x.inf_flag)
         all_hyp = (n_inf == 0)
 
-        # C3 is now PURE cross-genome conservation (geomean of rho_adj only). The
-        # pairwise operon probability P_ab is NO LONGER folded in here -- operon
-        # probability is applied once, as C2, in the final score's C2-gated
-        # geometric mean. A never-seen adjacency is NO EVIDENCE (novel), so it is
-        # EXCLUDED from the geomean rather than scored 0.5 -- novelty must be
-        # neutral (it neither boosts nor penalizes), which the final achieves via
-        # geomean(C2, C3): a novel operon has C3 -> 0 -> no boost, no penalty.
+        # C3 is conservation only (UniOP probability enters later as C2); a
+        # never-seen adjacency is excluded rather than scored.
         terms_mean, terms_lb, w_terms = [], [], []
         n_zero = n_neutral = n_supported = n_nolink = 0
         for a, b in zip(recs[:-1], recs[1:]):
@@ -334,9 +276,7 @@ def compute(genes, ref, pmap, allhyp_value=_NEUTRAL, c3_mode="adjacency"):
                 n_zero += 1
 
         n_used = len(terms_mean)
-        # operon significance = geomean enrichment over supported adjacencies
-        # ('chance of NOT appearing together'); scales the final correction so a
-        # chance-level relationship can only lightly discount, never erase.
+        # Operon significance: geometric mean enrichment over supported adjacencies
         operon_sig = geomean(w_terms) if w_terms else 0.0
         if all_hyp:
             c3 = c3_lb = allhyp_value
@@ -349,17 +289,11 @@ def compute(genes, ref, pmap, allhyp_value=_NEUTRAL, c3_mode="adjacency"):
             c3_lb = geomean(terms_lb)
             gclass = "operon_member"
 
-        # operon-inference ambiguity = m/n = fraction of this operon's adjacent
-        # pairs blocked by a hypothetical/uncharacterized member. It is NOT a
-        # score term (scoring is boost-only); it is surfaced as a review COMMENT
-        # explaining why operon context could not corroborate the call.
+        # Operon ambiguity: fraction of adjacent pairs with a hypothetical member (review note only)
         n_pairs_total = len(recs) - 1
         operon_ambiguity = (n_neutral / n_pairs_total) if n_pairs_total > 0 else 0.0
 
-        # ---- ALWAYS compute BOTH C3 variants so the output carries them side by
-        # side: 'adjacency' (operon-level geomean(rho_adj), above) and 'hybrid'
-        # (per-gene max(best adjacency, best co-member)).  --c3-mode only chooses
-        # which one is the PRIMARY c3_score (default 'adjacency' = shipped). ------
+        # ---- Hybrid variant: per-gene max(best adjacency, best co-member) ------
         hyb_per, hyb_mean, hyb_mean_lb = {}, 0.0, 0.0
         if not all_hyp:
             inf_pos = [i for i, r in enumerate(recs)
@@ -383,9 +317,7 @@ def compute(genes, ref, pmap, allhyp_value=_NEUTRAL, c3_mode="adjacency"):
                 hyb_mean_lb = sum(v[1] for v in hyb_per.values()) / len(hyb_per)
 
         for idx, x in enumerate(recs):
-            # per-gene conflict: does this descriptor BELONG in the module? Compare
-            # against ALL operon-mates via co-membership (order-free), not just the
-            # two immediate neighbours -- so a different arrangement never fires.
+            # Conflict is checked against all operon mates (order-free).
             mates = [recs[j].clean_descriptor for j in range(len(recs)) if j != idx]
             conflict = (descriptor_conflict(x.clean_descriptor, mates, partners)
                         if x.inf_flag else 0.0)
@@ -399,7 +331,7 @@ def compute(genes, ref, pmap, allhyp_value=_NEUTRAL, c3_mode="adjacency"):
             else:
                 c3_hyb, c3_hyb_lb = hyb_mean, hyb_mean_lb  # uninformative inherits coherence
             g_c3, g_lb = ((c3_hyb, c3_hyb_lb) if c3_mode == "hybrid"
-                          else (c3_adj, c3_adj_lb))       # PRIMARY (default adjacency)
+                          else (c3_adj, c3_adj_lb))       # primary variant
             per_gene[x.feature_id] = dict(
                 c3=g_c3, c3_lowerbound=g_lb,
                 c3_adjacency=c3_adj, c3_lb_adjacency=c3_adj_lb,
@@ -416,7 +348,7 @@ def compute(genes, ref, pmap, allhyp_value=_NEUTRAL, c3_mode="adjacency"):
 
 # ---------------------------------------------------------------------------
 def _breakdown_and_formula(info, raw_operon_id):
-    """Human-readable reason + formula string for one gene."""
+    """Returns the (reason, formula) text for one gene's C3."""
     cls = info["gene_class"]
     c3 = info["c3"]
     if cls == "singleton":
@@ -448,6 +380,7 @@ def _breakdown_and_formula(info, raw_operon_id):
 
 
 def main():
+    """Loads the OCC reference (optionally leave-one-out), scores the organism and writes the C3 table with csv."""
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--operon-info", required=True,
@@ -478,7 +411,7 @@ def main():
             sys.exit(1)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
-    # organism name (for load_organism + stamping) from the labeled file
+    # Organism name from the first labeled row
     organism = ""
     with open(args.genes_file, newline="") as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
@@ -494,16 +427,13 @@ def main():
           f"{len(ref['rho_adj'])} rho_adj entries")
 
     print("[c3-scorer] joining labeled-genes + operon-info ...")
-    # compute_hash=True -> per-gene aa_hash, needed to fingerprint this genome
-    # for leave-one-out identity (see below); harmless otherwise.
+    # compute_hash=True adds aa_hash for the leave-one-out content fingerprint.
     genes = L.load_organism(organism, Path(args.genes_file),
                             Path(args.operon_info), compute_hash=True)
     print(f"  genes: {len(genes)}")
 
-    # --- leave-one-out: if THIS genome is already in the reference, remove its
-    # own contribution so its C3 is a genuine out-of-sample estimate (no genome
-    # corroborates itself).  Identity is by CONTENT fingerprint (robust to the
-    # arbitrary organism/file name), falling back to the name.
+    # --- Leave-one-out: removes this genome from the reference when present,
+    # matched by content fingerprint, else by name.
     if args.leave_one_out:
         run_root = Path(args.genes_file).resolve().parents[2]
         fp = L.genome_fingerprint(genes["aa_hash"])
@@ -530,7 +460,7 @@ def main():
     per_gene = compute(genes, ref, pmap, allhyp_value=args.allhyp_value,
                        c3_mode=args.c3_mode)
 
-    # ---- write one row per operon-info row (all genes, order preserved) -----
+    # ---- one output row per operon-info row, in order -----------------------
     output_columns = [
         "feature_id", "organism_name", "best_consensus_product_descriptor",
         "product_descriptor_source", "product_descriptor_source_id", "operon_id",
@@ -539,7 +469,7 @@ def main():
         "c3_signal_breakdown", "c3_formula",
         "c3_gene_class", "c3_operon_id", "c3_n_pairs_used", "c3_n_supported",
         "c3_n_neutral", "c3_n_unlinked", "c3_lowerbound",
-        # both variants side by side (primary c3_score = --c3-mode selection)
+        # both variants; c3_score is the --c3-mode selection
         "c3_score_adjacency", "c3_lowerbound_adjacency",
         "c3_score_hybrid", "c3_lowerbound_hybrid",
     ]

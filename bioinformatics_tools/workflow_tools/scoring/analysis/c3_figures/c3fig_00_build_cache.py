@@ -18,6 +18,7 @@ import c3fig_lib as L
 
 
 def main():
+    """Discovers organisms, builds the gene, operon and adjacent-pair tables and pickles them."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--labeling-root", required=True,
                     help="output run dir containing <organism>/labeling/…")
@@ -46,7 +47,7 @@ def main():
     L.save_cache(pairs, cache / "adjacent_pairs.pkl")
     print(f"[build_cache] adjacent_pairs: {len(pairs):,} rows", file=sys.stderr)
 
-    # quick human-readable manifest
+    # Writes a human-readable manifest of the cache sizes.
     with open(cache / "cache-manifest.txt", "w") as fh:
         fh.write(f"organisms\t{genes['organism'].nunique()}\n")
         fh.write(f"genes_total\t{len(genes)}\n")

@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-"""Parse SignalP 4.1's `-f short` stdout into the project's standard
-per-protein results.tsv shape (margie_sb phase8, envelope-dependent).
+"""Parses SignalP 4.1 `-f short` output into the standard per-protein results.tsv.
 
-signalp4 has no build-here container/entrypoint (HPC envmodule wrapping
-a pre-built image we don't own) -- this script is the missing
-"processing" step that deepsig/psortb get for free from their own
-containers' /usr/local/bin/run. Invoked directly from margie_sb.smk's
-run_signalp4 rule; writes into signalp4's own processed/ dir first, then
-run_signalp4 cp's the result into the final Snakemake output, same as
-every other tool. Envelope enrichment (ENVELOPE_*) is added afterwards
-by enrich_with_envelope.py in load_signalp4_to_db, same as deepsig/psortb.
+Called by margie_sb.smk's run_signalp4 rule, since the SignalP 4.1 module has no
+processing entrypoint of its own; ENVELOPE_* columns are added later by
+enrich_with_envelope.py.
 
 Usage:
     python process_signalp4.py --input signalp4_out.txt \
@@ -20,9 +14,7 @@ Usage:
 import argparse
 import csv
 
-# SignalP 4.1's "-f short" data-row columns, in order, after the name
-# column (which is the FASTA header up to the first whitespace, same
-# truncation RASTtk's fig|...peg.N ids already have -- no split needed).
+# Data columns after the name column (the FASTA id up to the first whitespace).
 _DATA_COLUMNS = (
     "signalp4_cmax", "signalp4_cmax_pos", "signalp4_ymax", "signalp4_ymax_pos",
     "signalp4_smax", "signalp4_smax_pos", "signalp4_smean", "signalp4_d",

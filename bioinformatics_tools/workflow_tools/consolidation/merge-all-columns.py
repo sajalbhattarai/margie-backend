@@ -1,24 +1,10 @@
 #!/usr/bin/env python3
-"""merge-all-columns.py — Stage 2 of margie_sb's consolidation pipeline.
+"""merge-all-columns.py — stage 2 of consolidation.
 
-Merges every per-tool results.tsv under output/<genome>/ (rasttk through
-every phase4-8 tool) into ONE wide per-feature (one row per gene) TSV with
-every column from every tool, preserved exactly as it appears in each
-tool's own table. This step ONLY merges -- it does not summarise, dedupe,
-or pick "best" hits. The one thing it does do: when the *same gene* has
-*multiple rows* within *one tool's* table (e.g. two PFAM domain hits, or
-43 TMBED topology segments), those rows get joined into a single cell
-using a "key: value; key2: value2" pairing, where "key" is whatever
-already-existing column uniquely identifies each row for that tool (an
-accession ID for database-hit tools, a start-end coordinate range for
-segment/region tools, or a composite identifier for tools like geneprop
-where the obvious ID column alone can repeat within one gene). Genes with
-only ONE row for a given tool keep that value bare, with no key: prefix.
-
-Discovery/normalisation/row-key logic lives in _shared.py (also used by
-detect-columns.py). Downstream stages (filter-no-stat.py,
-filter-for-labeling.py) read THIS script's output, not the original
-per-tool files -- one expensive join, multiple cheap derived views.
+Joins every per-tool results.tsv under output/<genome>/ into one wide TSV
+with one row per gene and every tool column kept as is. When a gene has
+several rows in one tool's table they join into "key: value; key2: value2",
+keyed by accession or coordinate range (see _shared.py); single rows stay bare.
 """
 from __future__ import annotations
 
@@ -39,19 +25,16 @@ from _shared import (
 
 csv.field_size_limit(10_000_000)
 
-# kegg_results.tsv stores EVERY KofamScan profile-vs-query comparison,
-# significant or not, so a single gene can carry hundreds of rows where
-# only a handful clear KEGG_is_above_threshold=true. Every other tool's
-# own search command already filters at the source (e.g.
-# pfam/tigrfam/pgap's --cut_ga/--cut_tc), so this filter is kegg-specific,
-# not a general rule. Applied here (not in _shared.load_tool_table) so
-# detect-columns.py still surfaces the raw, unfiltered reality.
+# Per-tool row filters applied before merging. kegg_results.tsv holds every
+# KofamScan comparison, so only rows above threshold are kept; detect-columns.py
+# still sees the unfiltered table.
 TOOL_ROW_FILTERS: dict[str, tuple[str, str]] = {
     "kegg": ("KEGG_is_above_threshold", "true"),
 }
 
 
 def apply_tool_row_filter(table: ToolTable) -> ToolTable:
+    """Returns the table with TOOL_ROW_FILTERS applied, dropping genes left without rows."""
     filt = TOOL_ROW_FILTERS.get(table.tool_name)
     if not filt:
         return table
@@ -67,11 +50,10 @@ def apply_tool_row_filter(table: ToolTable) -> ToolTable:
 # ─── Merge ────────────────────────────────────────────────────────────────────
 
 def merge_rows_for_gene(tool: ToolTable, fid: str) -> dict[str, str]:
-    """Merge one tool's row(s) for one gene into a single dict of columns.
+    """Merges one tool's rows for one gene into a single dict of columns.
 
-    A single row's values pass through bare. Multiple rows get joined per
-    column as "key1: val1; key2: val2", deduplicated by key (first
-    occurrence wins), using that tool's row-key strategy.
+    A single row passes through bare; several rows join per column as
+    "key1: val1; key2: val2", deduplicated by the tool's row key.
     """
     rows = tool.rows_by_feature.get(fid, [])
     if not rows:
@@ -95,15 +77,8 @@ def merge_rows_for_gene(tool: ToolTable, fid: str) -> dict[str, str]:
         ordered_keyed.append((key, row))
 
     if len(ordered_keyed) == 1:
-        # Multiple raw rows, but all sharing the same key -- e.g. GeneProp
-        # emits one row per matched PATHWAY STEP, so a single pathway with
-        # several required steps produces several raw rows that all
-        # collapse to one distinct key here. Render bare, same as the
-        # len(rows) == 1 case above -- this is genuinely a single value,
-        # not a multi-hit needing "key: val" wrapping. Without this check,
-        # only key_cols would render bare (via the no-separator join
-        # below) while every other column stayed wrapped as "key: val"
-        # even though there was only one real entry.
+        # Several raw rows sharing one key (e.g. GeneProp's per-step rows)
+        # are a single value, so they render bare.
         return {col: ordered_keyed[0][1].get(col, "") for col in tool.tool_columns}
 
     key_cols = set(spec.columns) if spec.kind in ("column",) else set()
@@ -114,7 +89,7 @@ def merge_rows_for_gene(tool: ToolTable, fid: str) -> dict[str, str]:
         if col in key_cols:
             merged[col] = ";".join(key for key, _ in ordered_keyed if key)
         elif col in bare_extra_cols:
-            # Bare deduplicated by the COLUMN's own values, not the primary key.
+            # Deduplicates by the column's own values, not the row key.
             seen_vals: set[str] = set()
             ordered_vals: list[str] = []
             for _, row in ordered_keyed:
@@ -124,10 +99,7 @@ def merge_rows_for_gene(tool: ToolTable, fid: str) -> dict[str, str]:
                     ordered_vals.append(v)
             merged[col] = ";".join(ordered_vals)
         elif tool.tool_name == "geneprop" and col == "GENEPROP_description":
-            # Special render: "GenProp1235: Adenine and adenosine salvage
-            # III(PARTIAL)" -- combines description + status into one
-            # value per distinct GENEPROP_id (a generic per-column
-            # id:value pairing would keep these separate).
+            # Renders "GenProp1235: <description>(<status>)" per GENEPROP_id.
             parts = []
             for key, row in ordered_keyed:
                 desc = row.get(col, "")
@@ -149,18 +121,10 @@ SHARED_INTERPRO_COLUMNS: tuple[str, ...] = (
 
 
 def aggregate_shared_interpro_columns(interpro_tables: list[ToolTable], fid: str) -> dict[str, str]:
-    """INTERPRO_id/_description/_go_terms/_pathways are the cross-database
-    InterPro entry reference -- the *same* literal column name appears in
-    every interpro_<db> table (e.g. interpro_pfam_results.tsv and
-    interpro_cdd_results.tsv both have their own "INTERPRO_id" column).
-    Looping tool-by-tool and overwriting row[col] each time would silently
-    keep only whichever interpro_<db> table happened to be processed last
-    for this gene, discarding every other database's InterPro entries --
-    a gene matching several distinct InterPro IDs across cdd/pfam/
-    superfamily/etc. would otherwise lose all but the last one processed.
-    This aggregates across ALL interpro_<db> tables' rows for this gene
-    instead, deduped by InterPro ID, same "key: value" pairing convention
-    as everywhere else once there's more than one distinct entry.
+    """Aggregates the shared INTERPRO_* columns across all interpro_<db> tables for one gene.
+
+    These column names repeat in every member-database table, so entries are
+    collected from all of them, deduplicated by InterPro id and "key: value" joined.
     """
     seen_ids: set[str] = set()
     ordered: list[dict[str, str]] = []
@@ -186,25 +150,15 @@ def aggregate_shared_interpro_columns(interpro_tables: list[ToolTable], fid: str
 
 
 def assert_shared_feature_namespace(all_tables: list[ToolTable]) -> None:
-    """Abort if any tool's feature_ids live in a different namespace to RASTtk's.
+    """Exits if a non-empty tool table shares no feature_id with RASTtk's table.
 
-    Every phase4-8 tool is fed rast.faa, so its feature_ids can only be RASTtk's
-    own. A table sharing NOTHING with rasttk is therefore not a tool that found
-    no hits (that table would be empty) -- it is a table computed against a
-    DIFFERENT RASTtk submission, whose fig|6666666.<job>.peg.<n> namespace does
-    not overlap this run's.
-
-    That must be fatal, because the merge below unions feature_ids: a foreign
-    table does not fail to join, it silently ADDS its genes as extra rows. The
-    result looks superficially fine -- roughly double the row count -- but every
-    scored gene has no coordinates and every coordinate-bearing gene has no
-    annotation, which then flows into scoring, the circular map and the viewer
-    as confidently-presented nonsense. A loud stop here is the whole point.
+    Such a table comes from a different RASTtk submission; since the merge
+    unions feature_ids, it would otherwise add its genes as unrelated rows.
     """
     by_tool = {t.tool_name: t for t in all_tables}
     rast = by_tool.get("rasttk")
     if not rast or not rast.rows_by_feature:
-        return                                  # nothing to anchor against
+        return                                  # no rasttk table to compare against
     spine = set(rast.rows_by_feature)
     foreign = []
     for t in all_tables:
@@ -233,6 +187,7 @@ def build_merged_rows(
     organism_name_override: str,
     domain_override: str,
 ) -> tuple[list[dict], list[str]]:
+    """Builds one merged row per feature_id across all tool tables and returns rows plus column order."""
     by_tool: dict[str, ToolTable] = {t.tool_name: t for t in all_tables}
     rast = by_tool.get("rasttk")
 
@@ -246,13 +201,12 @@ def build_merged_rows(
     seen_cols: set[str] = set()
 
     def register(col: str) -> None:
+        """Appends a column to the output order once."""
         if col not in seen_cols:
             seen_cols.add(col)
             all_columns_order.append(col)
 
-    # gram_stain deliberately excluded -- ENVELOPE_envelope_type already
-    # carries this (diderm-gram-negative-like / monoderm-gram-positive-
-    # like / archaea), a separate gram_stain field would be redundant.
+    # No gram_stain column: ENVELOPE_envelope_type carries it.
     for col in ("organism_name", "domain", "feature_id"):
         register(col)
     for col in RASTTK_IDENTITY_COLUMNS:
@@ -276,11 +230,8 @@ def build_merged_rows(
             rast_merged = merge_rows_for_gene(rast, fid)
             for col in rast.tool_columns:
                 row[col] = rast_merged.get(col, "")
-            # gene_id/gene_start/gene_end/na_length/aa_length/na_seq/aa_seq
-            # are GLOBAL_COLUMNS -- deliberately excluded from tool_columns
-            # (so they're not double-prefixed or multi-hit-wrapped), which
-            # means rast_merged (built from tool_columns only) never has
-            # them either. Pull them from rasttk's raw first row instead.
+            # Identity columns are GLOBAL_COLUMNS, absent from tool_columns,
+            # so they come from rasttk's first raw row.
             rast_rows = rast.rows_by_feature.get(fid, [])
             if rast_rows:
                 r0 = rast_rows[0]
@@ -326,6 +277,7 @@ def build_merged_rows(
 # ─── Output ───────────────────────────────────────────────────────────────────
 
 def write_merged_table(rows: list[dict], columns: list[str], out_path: Path) -> None:
+    """Writes the merged rows as a TSV with csv.DictWriter."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=columns, delimiter="\t", extrasaction="ignore")
@@ -334,6 +286,7 @@ def write_merged_table(rows: list[dict], columns: list[str], out_path: Path) -> 
 
 
 def write_manifest(all_tables: list[ToolTable], manifest_path: Path) -> None:
+    """Writes a TSV listing each tool's source file, feature count and column count."""
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with open(manifest_path, "w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
@@ -345,6 +298,7 @@ def write_manifest(all_tables: list[ToolTable], manifest_path: Path) -> None:
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
+    """Parses the command-line options with argparse."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input-root", required=True,
@@ -358,6 +312,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Loads and filters every tool table, merges them and writes the TSV and optional manifest."""
     args = parse_args()
 
     output_root = Path(args.input_root)

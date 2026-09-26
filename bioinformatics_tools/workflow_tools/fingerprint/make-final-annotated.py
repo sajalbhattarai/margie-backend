@@ -1,24 +1,9 @@
 #!/usr/bin/env python3
-"""make-final-annotated.py — build the publication-ready FINAL-scored-labeled-genes-annotated.tsv.
+"""make-final-annotated.py — builds scoring/FINAL-scored-labeled-genes-annotated.tsv.
 
-Joins the full evidence file (labeled-genes-final-annotated.tsv, from
-add-fingerprint-to-final.py) with labeled-genes.tsv (gene details + product
-descriptor hierarchy) and phobius_top1.tsv to produce a clean, self-contained
-publication file.
-
-Inputs (all required):
-  labeled-genes-final-annotated.tsv      primary evidence (from add-fingerprint-to-final.py);
-                                           includes C1-C4 scores + formulas, EC evidence, and
-                                           fingerprint frequency columns
-  labeling/labeled-genes.tsv             gene details: na/aa seq, positions, product_descriptor_hierarchy,
-                                           product_descriptor_audit_trail, product_descriptor_confirmatory_summary
-  phobius/phobius_top1.tsv               per-gene phobius topology summary
-  fingerprint/labeled-genes-fingerprint-full.tsv
-                                           full fingerprint: pattern hash || label ||
-                                           annotation pattern (all tool slots)
-
-Output:
-  scoring/FINAL-scored-labeled-genes-annotated.tsv
+Joins labeled-genes-final-annotated.tsv (scores, EC evidence, fingerprint
+counts) with labeled-genes.tsv (gene details, product-descriptor hierarchy)
+and labeled-genes-fingerprint-full.tsv into the _OUT_COLS column set.
 """
 from __future__ import annotations
 
@@ -78,8 +63,7 @@ _OUT_COLS = [
     "confidence_tier",
     "needs_review",
     "needs_review_reason",
-    # ── Quick-view result copies (repeated at the very end so the label +
-    #    coordinates sit next to the confidence columns, no scrolling back) ─
+    # ── Copies of label and coordinates placed next to the confidence columns ─
     "gene_id_copy",
     "gene_start_copy",
     "gene_end_copy",
@@ -88,6 +72,7 @@ _OUT_COLS = [
 
 
 def _load_tsv(path: Path, key_col: str) -> dict[str, dict]:
+    """Reads a TSV with csv into a dict keyed by key_col, keeping the first row per key."""
     result: dict[str, dict] = {}
     with open(path, newline="") as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
@@ -98,6 +83,7 @@ def _load_tsv(path: Path, key_col: str) -> dict[str, dict]:
 
 
 def main() -> None:
+    """Streams the evidence table with csv, joins gene details and fingerprints, and writes _OUT_COLS."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--full-evidence-input", required=True,
@@ -151,8 +137,7 @@ def main() -> None:
             lab = lab_by_gene.get(fid, {})
             fp  = fp_by_gene.get(fid, {})
 
-            # gene_fingerprint_with_hash: use fp_pattern directly — it already contains
-            # "pattern hash: XXXX || label: YYYY || fingerprint: ..." so prefixing again is redundant.
+            # The full fingerprint already reads "pattern hash: ... || label: ... || fingerprint: ...".
             fp_pattern = fp.get("fingerprint", "")
             if fp_pattern:
                 gene_fp = fp_pattern
@@ -202,7 +187,6 @@ def main() -> None:
                 "confidence_tier":               row.get("confidence_tier", ""),
                 "needs_review":                  row.get("needs_review", ""),
                 "needs_review_reason":           row.get("needs_review_reason", ""),
-                # quick-view copies (same values as the columns near the top)
                 "gene_id_copy":                  lab.get("gene_id", ""),
                 "gene_start_copy":               lab.get("gene_start", ""),
                 "gene_end_copy":                 lab.get("gene_end", ""),

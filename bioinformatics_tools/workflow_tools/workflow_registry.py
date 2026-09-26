@@ -12,31 +12,18 @@ from bioinformatics_tools.workflow_tools.workflow_helpers import WORKFLOW_PATH_D
 
 LOGGER = logging.getLogger(__name__)
 
-# Root for the accumulating, WRITABLE stores a run appends to -- the OCC operon
-# reference, the fingerprint databases, the genome pool, the historical scoring
-# archive. These are per-user by nature: two people running different genome
-# sets into one file both corrupt it and race on the lock. They used to default
-# to one shared path per store, which meant every new user silently inherited
-# (and wrote into) whatever the previous user had built.
-#
-# {user} is substituted by resolve_user_paths() with the cluster username at the
-# moment a config is generated or shown. Read-only reference data (db/, the tool
-# databases, sif images) is deliberately NOT under here -- that is genuinely
-# shared and duplicating it per user would waste terabytes.
+# Root for the per-user writable stores a run appends to (OCC operon reference,
+# fingerprint databases, genome pool, scoring archive). {user} is filled in by
+# resolve_user_paths(); read-only reference data stays shared.
 MARGIE_DEPOT_ROOT = '/depot/lindems/data/margie'
 MARGIE_USER_ROOT = f'{MARGIE_DEPOT_ROOT}/users/{{user}}'
 
 
 def resolve_user_paths(params: list[dict], username: str | None) -> list[dict]:
-    """Return *params* with {user} in path defaults filled in for *username*.
+    """Returns *params* with {user} in path defaults filled in for *username*.
 
-    Callers pass the CLUSTER username (the account the run executes as), not the
-    web login, so the path matches what the user sees on the filesystem.
-
-    Without a username the {user} placeholder cannot be resolved; rather than
-    emit a literal "{user}" directory that would then be created for real, the
-    legacy shared root is used. That reproduces the pre-per-user behaviour --
-    wrong, but wrong in the familiar way, and loudly logged.
+    *username* is the cluster username. Without one, the shared legacy root is
+    used (and logged) rather than creating a literal "{user}" directory.
     """
     if not params:
         return params
@@ -91,19 +78,9 @@ REQUIRED_SYSTEM_PARAMS = [
         'type': 'int'
     },
     {
-        # The DRIVER job -- the one Snakemake itself runs in, which then queues
-        # every per-rule job. Distinct from default_runtime above, which caps
-        # those individual rule jobs. The driver has to outlive all of them, so
-        # it asks for a wide margin.
-        #
-        # Adjustable because a generous limit is normally free (SLURM charges
-        # what a job uses, and the cpu partition is MaxTime=UNLIMITED) but
-        # stops being free during a maintenance reservation: SLURM refuses to
-        # start anything that cannot finish before the outage begins, so a
-        # 7-day request simply sits PENDING with
-        # "ReqNodeNotAvail, Reserved for maintenance" for the whole week
-        # leading up to one. Lowering it to fit the remaining gap is the fix,
-        # and that is a per-site/per-week judgement, not something to hardcode.
+        # Walltime of the driver job that runs Snakemake and queues every rule
+        # job (default_runtime caps those). Adjustable so it can be lowered to
+        # fit before a maintenance reservation, which blocks longer requests.
         'param': 'compute.cluster_default.driver_walltime',
         'default': '3-00:00:00',
         'description': ('SLURM walltime for the workflow driver job (D-HH:MM:SS or HH:MM:SS). '
@@ -116,15 +93,11 @@ REQUIRED_SYSTEM_PARAMS = [
 
 def workflow_path_params(wf_id: str, include_sif: bool = True, include_db_root: bool = True,
                          supports_batch_input: bool = True) -> list[dict]:
-    """Per-workflow root-path settings: sif_path, db_root, input_path, output_path.
-    Namespaced under the workflow's own config key (e.g. 'margie_sb.sif_path'),
-    same dot-notation as per-tool overrides like 'margie_sb.cog.threads'.
+    """Returns the per-workflow root-path settings (sif_path, db_root, input_path,
+    output_path), namespaced as e.g. 'margie_sb.sif_path'.
 
-    input_path/output_path always apply. sif_path/db_root are conditional --
-    only meaningful if the workflow resolves containers locally
-    (WorkflowKey.local_sif_only) or its .smk actually falls back to a
-    db_root (WorkflowKey.supports_db_root); margie.smk hardcodes each tool's
-    db path directly and has no such fallback.
+    sif_path/db_root are included only for workflows with local SIF lookup
+    (local_sif_only) or a db_root fallback (supports_db_root).
     """
     defaults = WORKFLOW_PATH_DEFAULTS.get(wf_id, {})
     params = []
@@ -239,12 +212,10 @@ def _margie_sb_default_runtime(tool_key: str) -> int:
 
 
 def margie_sb_sif_files(selected_tool_keys: set[str] | None = None) -> list[tuple]:
-    """SIF entries to validate for a margie_sb run -- always excludes tools
-    with uses_container=False (consolidation/labeling/scoring_heuristic run
-    as plain Python scripts, SignalP from HPC modules, and mauve/synteny have
-    no rule yet: none needs a .sif). When
-    selected_tool_keys is given, further restricts to just that subset, so
-    a partial-phase run never gets blocked on a container it doesn't need.
+    """Returns the SIF entries to validate for a margie_sb run.
+
+    Skips tools with uses_container=False and, when selected_tool_keys is given,
+    tools outside that subset.
     """
     return [
         (tool['sif'], 'latest') for tool in MARGIE_SB_PHASED_TOOLS
@@ -254,8 +225,8 @@ def margie_sb_sif_files(selected_tool_keys: set[str] | None = None) -> list[tupl
 
 
 def _margie_sb_location_params() -> list[dict]:
-    """Where each tool's database is, when not <db_root>/<tool> (margie_sb.smk's
-    db_path reads db.<tool> first), and where margie-build is on the cluster."""
+    """Returns the params for each tool's database location (when not
+    <db_root>/<tool>) and margie-build's location on the cluster."""
     params = [{
         'param': f"db.{tool['key']}",
         'default': '',
@@ -547,11 +518,9 @@ WORKFLOWS: dict[str, WorkflowKey] = {
                 'description': 'Default runtime limit in minutes for MARGIE(SB) tools unless overridden per tool',
                 'type': 'int'
             },
-            # The growing databases (job database, operon reference, fingerprint
-            # databases, genome pool) and the run archives are each user's own,
-            # in this folder -- copied there from the bases on the first run and
-            # tracked by api/services/user_stores.py, which sets the per-store
-            # paths itself. Empty: /scratch/<cluster>/<cluster user>/margie-2026.
+            # Folder for each user's growing databases and run archives, copied
+            # from the bases on the first run and tracked by api/services/user_stores.py.
+            # Empty: /scratch/<cluster>/<cluster user>/margie-2026.
             {
                 'param': 'margie_sb.stores_root',
                 'default': '',

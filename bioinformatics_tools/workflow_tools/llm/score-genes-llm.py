@@ -53,11 +53,7 @@ LOGGER = logging.getLogger("score_genes_llm")
 
 H = "=" * 100
 
-# ---------------------------------------------------------------------------
-# Calibration coefficients (manual formula, from scoring-development study)
-# C1 and C2: mechanical values passed through unchanged
-# C3, C4, C5: LLM-assessed values replace the mechanical ones
-# ---------------------------------------------------------------------------
+# ---- Calibration coefficients: mechanical C1/C2 pass through; LLM-assessed C3/C4/C5 replace the mechanical ones ----
 _INTERCEPT = 0.111
 _W = {"c1": 0.741, "c2": 0.063, "c3": 0.111, "c4": 0.068, "c5": -0.056}
 _TOPOLOGY_PENALTY = -0.05   # applied when TOPOLOGY == "inconsistent"
@@ -228,6 +224,7 @@ ASS_S = "<|start_header_id|>assistant<|end_header_id|>\n\n"
 
 
 def build_prompt(review_document: str) -> str:
+    """Wraps the system prompt and a gene report in the Llama 3 chat template."""
     return (
         BOS
         + SYS_S + SYSTEM_PROMPT + SYS_E
@@ -237,6 +234,7 @@ def build_prompt(review_document: str) -> str:
 
 
 def _detect_backend() -> str:
+    """Returns "mlx" or "hf" depending on which inference library imports, else "none"."""
     try:
         import mlx_lm  # noqa: F401
         return "mlx"
@@ -255,6 +253,7 @@ _BACKEND = _detect_backend()
 
 
 def load_model(model_path: Path):
+    """Loads a full model or a LoRA adapter on its base (via peft) with mlx_lm or transformers."""
     if not (model_path / "config.json").exists() and not (model_path / "adapter_config.json").exists():
         LOGGER.error(
             f"No config.json or adapter_config.json under {model_path} -- "
@@ -301,6 +300,7 @@ def load_model(model_path: Path):
 
 
 def generate_response(model, tokenizer, prompt: str, max_tokens: int) -> str:
+    """Generates one greedy completion and strips a trailing STOP token."""
     if _BACKEND == "mlx":
         from mlx_lm import generate
         output = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
@@ -322,13 +322,13 @@ def generate_response(model, tokenizer, prompt: str, max_tokens: int) -> str:
 
 
 def generate_batch(model, tokenizer, prompts: list[str], max_tokens: int) -> list[str]:
-    """Generate responses for a batch of prompts simultaneously on GPU (HF only).
-    Falls back to sequential on MLX."""
+    """Generates completions for a batch of prompts in one GPU call (transformers only);
+    runs them one by one on MLX or for a single prompt."""
     if _BACKEND != "hf" or len(prompts) == 1:
         return [generate_response(model, tokenizer, p, max_tokens) for p in prompts]
 
     import torch
-    # Left-pad so all generated tokens land after the (right-side) input end
+    # Left padding keeps every generated token after the input.
     orig_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     try:
@@ -351,6 +351,7 @@ def generate_batch(model, tokenizer, prompts: list[str], max_tokens: int) -> lis
 
 
 def _float_field(text: str, key: str) -> float | None:
+    """Reads a "KEY: number" line, clipped to [0, 1], or None."""
     m = re.search(rf'^{re.escape(key)}\s*:\s*([0-9]+(?:\.[0-9]+)?)', text,
                   re.IGNORECASE | re.MULTILINE)
     if not m:
@@ -360,13 +361,14 @@ def _float_field(text: str, key: str) -> float | None:
 
 
 def _str_field(text: str, key: str) -> str:
+    """Reads the value of a "KEY: text" line, or ""."""
     m = re.search(rf'^{re.escape(key)}\s*:\s*(.+?)(?:\n|\Z)', text,
                   re.IGNORECASE | re.MULTILINE)
     return m.group(1).strip() if m else ""
 
 
 def _section_text(text: str, header: str) -> str:
-    """Extract the body of a ## HEADER section."""
+    """Returns the body of a ## HEADER section, or ""."""
     m = re.search(
         rf'##\s*{re.escape(header)}\s*\n(.*?)(?=\n##\s|\Z)',
         text, re.IGNORECASE | re.DOTALL,
@@ -375,6 +377,7 @@ def _section_text(text: str, header: str) -> str:
 
 
 def _compute_verdict(llm_confidence: float | None, mech_score: float | None) -> str:
+    """Classifies the gap between LLM and mechanical scores as AGREES, PARTIAL or DISAGREES."""
     if llm_confidence is None or mech_score is None:
         return "UNPARSEABLE"
     delta = abs(llm_confidence - mech_score)
@@ -386,6 +389,7 @@ def _compute_verdict(llm_confidence: float | None, mech_score: float | None) -> 
 
 
 def parse_llm_output(response: str, mech_score: float | None = None) -> dict:
+    """Parses the model's SCORES block and section texts; unknown categorical values become "unparseable"."""
     scores_block = _section_text(response, "SCORES")
     if not scores_block:
         scores_block = response
@@ -400,7 +404,7 @@ def parse_llm_output(response: str, mech_score: float | None = None) -> dict:
     llm_conf    = _float_field(scores_block, "LLM_CONFIDENCE")
     summary     = _str_field(scores_block, "SUMMARY")
 
-    # Compute C3 mechanically from the two categorical answers
+    # C3 is computed from the two categorical neighbourhood answers.
     _FIT_BONUS   = {"strong": 0.4, "moderate": 0.2, "none": 0.0}
     _CONT_PENALTY = {"yes": -0.2, "no": 0.0}
     fit_bonus     = _FIT_BONUS.get(nbr_fit, 0.0)
@@ -433,7 +437,7 @@ def parse_llm_output(response: str, mech_score: float | None = None) -> dict:
 def compute_formula_score(mech_c1: float, mech_c2: float,
                            llm_c3: float | None, llm_c4: float | None,
                            llm_c5: float | None, topology: str) -> float | None:
-    """Manual-calibration formula with LLM-assessed C3/C4/C5."""
+    """Computes the calibrated formula score with LLM-assessed C3/C4/C5, or None if any is missing."""
     if any(v is None for v in (llm_c3, llm_c4, llm_c5)):
         return None
     adj = _TOPOLOGY_PENALTY if topology == "inconsistent" else 0.0
@@ -450,21 +454,20 @@ def compute_formula_score(mech_c1: float, mech_c2: float,
 
 
 def _extract_field(doc: str, label: str) -> str:
+    """Returns the value after the first "Label:" in a report, or ""."""
     m = re.search(rf'{re.escape(label)}\s*:\s*(.+?)(?:\n|\Z)', doc)
     return m.group(1).strip() if m else ""
 
 
 def _safe_float_field(doc: str, label: str) -> float:
+    """Returns a report field as a float, defaulting to 0.5."""
     try:
         return float(_extract_field(doc, label))
     except ValueError:
         return 0.5
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Report field parser — extracts every traceability column from the prepared
-# gene annotation report produced by build-gene-report.py (phase 14).
-# ─────────────────────────────────────────────────────────────────────────────
+# ---- Report field parser for build-gene-report.py (phase 14) reports ----
 
 _GENERAL_TOOLS = ["RAST", "PGAP", "TIGRFAM", "NCBIFAM", "COG", "PFAM",
                    "GENEPROP", "INTERPRO", "KEGG", "EGGNOG", "UNIPROT"]
@@ -473,8 +476,7 @@ _LOCAL_TOOLS   = ["SIGNALP6", "PHOBIUS", "TMBED", "PSORTB"]
 
 
 def _table_rows(block: str) -> dict:
-    """Parse all pipe-delimited rows in a text block.
-    Returns {TOOL: [[col1, col2, ...], ...]} (tool column excluded)."""
+    """Parses pipe-delimited table rows into {TOOL: [[col1, col2, ...], ...]} (tool column excluded)."""
     rows: dict = {}
     for line in block.split("\n"):
         if "|" not in line:
@@ -490,6 +492,7 @@ def _table_rows(block: str) -> dict:
 
 
 def _join_vals(vals: list) -> str:
+    """Joins distinct non-empty values with "; "."""
     seen: list = []
     for v in vals:
         if v and v != "-" and v not in seen:
@@ -498,12 +501,13 @@ def _join_vals(vals: list) -> str:
 
 
 def _component_score(block: str, label: str) -> str:
+    """Returns the number in a "Label | value" score-table row, or ""."""
     m = re.search(rf"^{re.escape(label)}\s*\|\s*([0-9.]+)", block, re.MULTILINE)
     return m.group(1) if m else ""
 
 
 def parse_report_fields(doc: str) -> dict:
-    """Extract every traceability field from a prepared gene annotation report."""
+    """Extracts every traceability field from a prepared gene annotation report."""
     f: dict = {}
 
     # ── IDENTITY ──────────────────────────────────────────────────────────────
@@ -600,6 +604,7 @@ def parse_report_fields(doc: str) -> dict:
 
 
 def parse_args():
+    """Parses the command-line options."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--trained-model", required=True)
@@ -660,6 +665,7 @@ SUMMARY_COLUMNS = [
 
 
 def main() -> None:
+    """Scores each prepared report in batches, appends the LLM section and writes the summary TSV."""
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s  %(levelname)s  %(message)s")
     args = parse_args()
@@ -704,7 +710,7 @@ def main() -> None:
                 except (ValueError, TypeError):
                     mech_score_f = None
 
-                # Pull mechanical C1/C2 from the report for the formula calculation
+                # Mechanical C1/C2 from the report feed the formula.
                 mech_c1 = _safe_float_field(review_doc, "C1 Tool Coverage")
                 mech_c2 = _safe_float_field(review_doc, "C2 Operon Presence")
 
@@ -718,7 +724,7 @@ def main() -> None:
 
                 mech_score = mech_score_str
 
-                # Build the LLM section appended to the report file
+                # LLM section appended to the report file.
                 llm_section = (
                     f"\n{H}\n"
                     f"LLM CONFIDENCE ASSESSMENT\n"

@@ -1,12 +1,7 @@
-"""Append envelope classification context to a phase8 tool's results.tsv.
+"""Appends the genome-level envelope classification to a tool's results.tsv.
 
-Envelope's decision (envelope_type, inference_basis, evidence_json) is
-genome-level, not per-protein, so the same three values get repeated on
-every row -- giving anyone reading deepsig/psortb/signalp4's own output
-table direct visibility into *why* the -k/-organism gram-class flag was
-set the way it was (e.g. a real detected call vs. the conservative
-tie-breaker default used for wall-less organisms like Mycoplasma), without
-cross-referencing envelope's separate output file.
+The three ENVELOPE_ values repeat on every row, so deepsig/psortb/signalp4
+tables show which gram-class flag was used and why.
 
 Usage:
     python enrich_with_envelope.py --input <tool>_results.tsv \
@@ -17,6 +12,7 @@ import csv
 
 
 def main() -> int:
+    """Reads the envelope summary row and writes the tool table with ENVELOPE_ columns added, using csv."""
     p = argparse.ArgumentParser()
     p.add_argument("--input", required=True)
     p.add_argument("--envelope-summary", required=True)

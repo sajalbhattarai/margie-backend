@@ -247,8 +247,7 @@ def _c3_pair_details_for_operon(
         if rho_mean <= 0.0 and rho_lb <= 0.0:
             parts.append(f"({da})<->({db}): no OCC evidence (novel) -> EXCLUDED from C3")
             continue
-        # C3 is PURE conservation now: term = rho_adj (no P_ab). Operon probability
-        # C2 gates in the final score, not here; UniOP pairwise shown for reference.
+        # The C3 term is conservation only (rho_adj); UniOP probability is shown for reference (C2 gates it later).
         parts.append(
             f"({da})<->({db}): C3 term=rho_mean={rho_mean:.4f} (OCC_lb={rho_lb:.4f}; "
             f"UniOP pairwise={p:.4f} -> C2 gate in final)"

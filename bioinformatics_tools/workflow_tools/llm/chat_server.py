@@ -45,13 +45,9 @@ from pathlib import Path
 MODEL = None
 TOKENIZER = None
 MODEL_NAME = ""
-# Last time anyone touched this server. The page sends a stop on exit, but that
-# never arrives if the browser crashes, the laptop sleeps, or the VPN drops --
-# exactly the cases where a GPU would otherwise sit idle until walltime. This
-# is the backstop that makes those cases self-correcting.
+# Time of the last request; the idle watchdog frees the GPU when the page is gone.
 LAST_SEEN = time.time()
-# Generation is serialised: one set of weights, and concurrent .generate() calls
-# on the same model would contend for the GPU and can interleave KV cache state.
+# Serialises generation: concurrent .generate() calls would interleave KV cache state.
 _GEN_LOCK = threading.Lock()
 
 
@@ -81,7 +77,7 @@ def load_model(model_path: str, dtype: str) -> None:
 
 
 def _build_inputs(system: str, prompt: str):
-    """Tokenised chat-template inputs, shared by the batch and streaming paths."""
+    """Returns tokenised chat-template inputs for the batch and streaming paths."""
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": prompt}]
     try:
@@ -93,12 +89,7 @@ def _build_inputs(system: str, prompt: str):
 
 
 def generate_stream(system: str, prompt: str, max_tokens: int):
-    """Yield text as it is produced.
-
-    Total time is unchanged, but the first words appear in well under a second
-    instead of after the whole answer. Generation runs in a worker thread
-    because .generate() blocks; TextIteratorStreamer is the handoff.
-    """
+    """Yields text as it is generated, via a worker thread and TextIteratorStreamer."""
     import torch
     from transformers import TextIteratorStreamer
 
@@ -108,8 +99,6 @@ def generate_stream(system: str, prompt: str, max_tokens: int):
     kwargs = dict(**inputs, max_new_tokens=max_tokens, do_sample=False,
                   pad_token_id=TOKENIZER.pad_token_id, streamer=streamer)
 
-    # The lock is held for the whole generation, same as the batch path: one set
-    # of weights, and concurrent generate() calls would interleave KV state.
     def run():
         with _GEN_LOCK, torch.no_grad():
             MODEL.generate(**kwargs)
@@ -130,7 +119,7 @@ def generate(system: str, prompt: str, max_tokens: int) -> str:
         out = MODEL.generate(
             **inputs,
             max_new_tokens=max_tokens,
-            do_sample=False,              # deterministic: same evidence -> same answer
+            do_sample=False,              # deterministic output
             pad_token_id=TOKENIZER.pad_token_id,
         )
     # Slice off the prompt so only the completion is returned.
@@ -153,8 +142,7 @@ class Handler(BaseHTTPRequestHandler):
         global LAST_SEEN
         p = self.path.rstrip("/")
         if p == "/health":
-            # A health poll counts as activity: while the page is open it polls,
-            # so the idle clock only advances once nobody is watching.
+            # Health polls from an open page count as activity.
             LAST_SEEN = time.time()
             self._send(200, {"ok": MODEL is not None, "model": MODEL_NAME,
                              "idle_s": 0})
@@ -167,9 +155,7 @@ class Handler(BaseHTTPRequestHandler):
         global LAST_SEEN
         p = self.path.rstrip("/")
         if p == "/shutdown":
-            # Fast path: the page was closed. Ack first, then stop — otherwise
-            # the caller (often a sendBeacon during unload) sees a dropped
-            # connection and cannot tell success from failure.
+            # Replies before stopping so the caller (often a sendBeacon) sees success.
             self._send(200, {"stopping": True})
             log("shutdown requested — exiting")
             threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -199,9 +185,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
             return
 
-        # Streaming: chunked transfer, plain UTF-8 text. Headers must go out
-        # before the first token or the client waits for the whole body anyway,
-        # which would defeat the point.
+        # Streams chunked UTF-8 text; headers go out before the first token.
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -215,7 +199,6 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            # Reader navigated away mid-answer. Not an error worth a traceback.
             log("client disconnected during stream")
         except Exception as exc:
             log(f"stream failed: {type(exc).__name__}: {exc}")
@@ -231,7 +214,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def advertise(path: Path, host: str, port: int, model: str) -> None:
-    """Publish the endpoint atomically so a reader never sees a half-written file."""
+    """Writes the endpoint file atomically (temp file + replace)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps({
@@ -250,13 +233,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=0, help="0 = pick a free port")
     ap.add_argument("--dtype", default="bfloat16",
                     choices=["bfloat16", "float16", "float32"])
-    # 5 minutes, not 30. The panel polls /health every 60s while it is open, so
-    # silence for five minutes means nobody is watching -- and that signal is
-    # reliable in a way page-exit events are not. pagehide does NOT fire on
-    # SvelteKit client-side navigation, so "user clicked back" never reached the
-    # stop endpoint and a GPU sat held until the old 30-minute timeout. This is
-    # the mechanism that actually frees the GPU; the stop endpoint is only a
-    # fast path for when it happens to work.
+    # The page polls /health every 60 s, so 5 min of silence means it is closed.
     ap.add_argument("--idle-timeout", type=int, default=300,
                     help="exit after this many seconds with no /chat or /health "
                          "(0 disables). Releases the GPU when the page is gone.")
@@ -291,8 +268,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        # Only remove the advert if it is still ours; a newer server may have
-        # replaced it, and deleting that would take chat offline for no reason.
+        # Removes the advert only if a newer server has not replaced it.
         try:
             if adv.is_file() and json.loads(adv.read_text()).get("pid") == os.getpid():
                 adv.unlink()

@@ -1,51 +1,12 @@
 #!/usr/bin/env python3
-"""add-cluster-agreement.py — margie_sb phase10 (labeling): tool-cluster
-agreement.
+"""add-cluster-agreement.py — labeling stage: tool-cluster agreement.
 
-Reads labeled-genes.tsv (assign-canonical-label.py's output, READ-ONLY)
-and consolidated-merged-all-columns.tsv (for the underlying per-tool
-accession columns), joins on feature_id, and writes its own standalone
-table -- identity columns plus two distinct kinds of signal.
-
-PURPOSE 1 -- collapsed cluster value, to fix scoring/score-c1-tool-
-coverage.py's double-counting: PGAP, TIGRFAM, and NCBIFAM (via InterPro)
-are three separate decision-tool slots in the trust hierarchy and in
-C1's denominator, but they are not three independent sources -- PGAP's
-own HMM library is built directly from TIGRFAM/NCBIfam's curated
-models, and NCBIfam absorbed TIGRFAM outright. Confirmed empirically:
-on a real genome, every gene where >=2 of these three had a hit, 100%
-shared the same accession (modulo PGAP's own trailing ".N" version
-suffix). tigrfam_cluster_* below collapses these three into one value/
-status, so C1 can count this as ONE slot instead of three.
-
-PURPOSE 2 -- confirmatory cross-reference, NOT consumed by C1 at all:
-EGGNOG's own decision-tool vote (its best-hit description) is genuinely
-independent -- a real DIAMOND/HMM search against eggNOG's own database.
-But EGGNOG also reports a COG category (EGGNOG_COG_category, sometimes
-a specific COG number embedded directly in EGGNOG_description) and a
-KEGG KO number (EGGNOG_KEGG_ko) -- both LOOKED UP from its own
-orthologous group's precomputed annotation table, not independently
-searched. Comparing these against the standalone COG/KEGG tools' own
-direct hits is real corroborating-or-contradicting evidence (same role
-as the existing MEROPS/TCDB/DBCAN confirmatory check in assign-
-canonical-label.py), but it must never be folded into C1's tool-
-coverage count, since EGGNOG's own slot there is already counted via
-its independent description.
-Confirmed empirically these genuinely disagree often enough to matter:
-COG vs EGGNOG's embedded COG# agree ~86% of the time (family-ID level,
-when EGGNOG names one); KEGG vs EGGNOG_KEGG_ko agree ~80% of the time.
-Neither is close to the TIGRFAM cluster's ~100%, since EGGNOG's value
-is inherited at the whole-ortholog-group level, not the same per-gene
-hit.
-
-cdd_cog_overlap: checked directly against the same accession-prefix
-question -- on every install checked so far, this InterPro build only
-ever surfaces "cd#####"-prefixed CDD accessions, never the "COG####"-
-formatted entries that also live inside NCBI's broader CDD/cddid.tbl
-distribution. So this currently always reports False, but the check
-itself stays general (a literal COG-prefixed token in
-INTERPRO_CDD_id) in case a different InterPro/database version ever
-surfaces one.
+Joins labeled-genes.tsv with the merged table and writes, per gene:
+  - tigrfam_cluster_*: TIGRFAM, PGAP and NCBIfam (InterPro) collapsed into one
+    value and status, because they share curated models; C1 counts it as one slot.
+  - cog_/kegg_crossref_*: EGGNOG's looked-up COG and KO compared with the
+    standalone COG and KEGG hits; confirmatory only, never counted in C1.
+  - cdd_cog_overlap: whether INTERPRO_CDD_id carries a COG-formatted accession.
 """
 from __future__ import annotations
 
@@ -76,8 +37,7 @@ TIGRFAM_CLUSTER_COLUMNS = {
 
 
 def normalize_accessions(raw: str) -> set[str]:
-    """';'-joined accessions -> a set, stripping any trailing '.N' version
-    suffix (PGAP_id carries one, e.g. 'TIGR02928.1'; the others don't)."""
+    """Splits ';'-joined accessions into a set, stripping trailing '.N' versions (e.g. 'TIGR02928.1')."""
     out: set[str] = set()
     for tok in raw.split(";"):
         tok = tok.strip()
@@ -89,12 +49,11 @@ def normalize_accessions(raw: str) -> set[str]:
 
 
 def classify_agreement(evidence: dict[str, set[str]]) -> tuple[str, str, str]:
-    """Generic per-tool value-set agreement classifier -- same shape as
-    add-ec-consensus.py's classify_ec_agreement(), without that script's
-    EC-specific wildcard-compatibility clustering (these accessions
-    don't have a coarser/finer wildcard concept the way EC numbers do,
-    so plain set intersection/union is the right level of complexity
-    here). Returns (status, consensus_value, supporting_tools)."""
+    """Classifies per-tool value sets by set intersection and union.
+
+    Returns (status, consensus_value, supporting_tools); status is no_evidence,
+    single_source, full_consensus, majority_consensus or conflicting.
+    """
     if not evidence:
         return "no_evidence", "", ""
     tools = list(evidence.keys())
@@ -113,7 +72,7 @@ def classify_agreement(evidence: dict[str, set[str]]) -> tuple[str, str, str]:
 
 
 def compute_tigrfam_cluster(merged_row: dict[str, str]) -> tuple[str, str, str, str]:
-    """Returns (cluster_value, cluster_source, cluster_status, formula)."""
+    """Collapses TIGRFAM/PGAP/NCBIfam accessions into (cluster_value, cluster_source, cluster_status, formula)."""
     evidence: dict[str, set[str]] = {}
     for tool in TIGRFAM_CLUSTER_PREFERENCE:
         vals = normalize_accessions(merged_row.get(TIGRFAM_CLUSTER_COLUMNS[tool], ""))
@@ -132,10 +91,11 @@ def compute_tigrfam_cluster(merged_row: dict[str, str]) -> tuple[str, str, str, 
 
 
 def compute_cog_crossref(merged_row: dict[str, str]) -> tuple[str, str, str, str]:
-    """Returns (crossref_value, crossref_level, status, formula).
-    crossref_level is 'family_id' when EGGNOG_description names a
-    specific COG number, else 'category_letter' when only the coarser
-    EGGNOG_COG_category is available."""
+    """Compares EGGNOG's COG information with the COG tool; returns (value, level, status, formula).
+
+    Level is 'family_id' when EGGNOG_description names a COG number (regex),
+    else 'category_letter' from EGGNOG_COG_category.
+    """
     cog_id = merged_row.get("COG_id", "")
     cog_letter = merged_row.get("COG_func_letter", "")
     eggnog_desc = merged_row.get("EGGNOG_description", "")
@@ -164,7 +124,7 @@ def compute_cog_crossref(merged_row: dict[str, str]) -> tuple[str, str, str, str
 
 
 def compute_kegg_crossref(merged_row: dict[str, str]) -> tuple[str, str, str]:
-    """Returns (crossref_value, status, formula)."""
+    """Compares EGGNOG_KEGG_ko with the KEGG tool's KO ids; returns (crossref_value, status, formula)."""
     kegg_id = merged_row.get("KEGG_id", "")
     eggnog_ko_raw = merged_row.get("EGGNOG_KEGG_ko", "")
     eggnog_ko = {t.replace("ko:", "").strip() for t in eggnog_ko_raw.split(",")
@@ -181,15 +141,13 @@ def compute_kegg_crossref(merged_row: dict[str, str]) -> tuple[str, str, str]:
 
 
 def compute_cdd_cog_overlap(merged_row: dict[str, str]) -> str:
-    """True only if INTERPRO_CDD_id itself carries a COG-formatted token --
-    on every install checked so far it doesn't (this InterPro build only
-    ever surfaces 'cd#####'-prefixed CDD accessions), so this currently
-    always reports False, but the check stays general."""
+    """Returns "True" when INTERPRO_CDD_id contains a COG-prefixed accession, else "False"."""
     cdd_id = merged_row.get("INTERPRO_CDD_id", "")
     return "True" if any(tok.strip().startswith("COG") for tok in cdd_id.split(";")) else "False"
 
 
 def main() -> None:
+    """Joins labeled genes to merged rows with csv and writes the cluster and cross-reference table."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--labeled-input", required=True, help="labeled-genes.tsv")

@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""verify_report.py -- independently re-derive each figure's numbers from the
-finished scoring outputs and confirm the companion TSVs match.
+"""verify_report.py -- re-derives each figure's numbers from the scoring outputs.
 
-Reviewers will not tolerate mistakes, so every figure is checked: (1) its PNG
-and companion TSV(s) exist and are non-empty; (2) headline aggregates written
-in the TSV are re-computed from the raw scoring tables and must agree. Writes a
-plain-text PASS/FAIL report into the figures folder. Never raises on a data
-mismatch by itself failing the pipeline -- it reports; the caller decides.
+Checks that every figure's PNG and TSVs exist and that headline aggregates match
+values recomputed with pandas from the scoring tables. Writes a PASS/FAIL report
+into the figures folder and exits 3 when a check fails.
 """
 from __future__ import annotations
 
@@ -24,13 +21,17 @@ TOL = 1e-4
 
 
 class Report:
+    """Collects named PASS/FAIL checks and writes them as a text report."""
+
     def __init__(self):
         self.checks: list[tuple[str, bool, str]] = []
 
     def ok(self, name, cond, detail=""):
+        """Records a boolean check."""
         self.checks.append((name, bool(cond), detail))
 
     def approx(self, name, a, b, detail=""):
+        """Records whether two numbers agree within TOL."""
         try:
             cond = abs(float(a) - float(b)) <= TOL
         except (TypeError, ValueError):
@@ -39,9 +40,11 @@ class Report:
 
     @property
     def passed(self):
+        """Returns True when every check passed."""
         return all(c for _, c, _ in self.checks)
 
     def write(self, path: Path, header: str):
+        """Writes the report to path and prints it."""
         lines = [header, "=" * len(header), ""]
         n_pass = sum(c for _, c, _ in self.checks)
         lines.append(f"{n_pass}/{len(self.checks)} checks passed"
@@ -55,6 +58,7 @@ class Report:
 
 
 def _files_ok(rep: Report, outdir: Path, pngs: list[str], tsvs: list[str]):
+    """Checks that PNGs are non-empty and TSVs have rows (pandas)."""
     for f in pngs:
         p = outdir / f
         rep.ok(f"png exists & non-empty: {f}", p.is_file() and p.stat().st_size > 0)
@@ -71,6 +75,7 @@ def _files_ok(rep: Report, outdir: Path, pngs: list[str], tsvs: list[str]):
 
 
 def verify_organism(run_root: Path, organism: str, outdir: Path) -> Report:
+    """Checks one organism's figures: files, tier counts, stage means and component medians."""
     rep = Report()
     genes = L.load_organism_genes(run_root, organism)
 
@@ -123,6 +128,7 @@ def verify_organism(run_root: Path, organism: str, outdir: Path) -> Report:
 
 
 def verify_global(run_root: Path, outdir: Path) -> Report:
+    """Checks the global figures: files, median C3 per size bin and PCA variance total."""
     rep = Report()
     genes = L.load_all_genes(run_root)
 
@@ -159,6 +165,7 @@ def verify_global(run_root: Path, outdir: Path) -> Report:
 
 
 def main() -> None:
+    """Runs the organism or global verification and exits 0 on pass, 3 on failure."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run-root", required=True)
     ap.add_argument("--organism", default=None, help="omit for the global report")

@@ -1,10 +1,7 @@
 """
-API-side client for job_history.py.
-Saves and retrieves job history by SSHing into the cluster and running
-job_history.py there. The job history database lives on the cluster, so
-the API server cannot open it directly.
-Errors here are ignored — if saving history fails, the job itself keeps
-running.
+API-side client for job_history.py, which owns the job history database on the cluster.
+Runs job_history in-process when the API sits beside the database, otherwise over SSH.
+Errors are logged and ignored so a history failure never stops a job.
 """
 import json
 import logging
@@ -20,15 +17,13 @@ _REMOTE_PYTHON = "~/bioinformatics-tools/.venv/bin/python"
 
 
 def _here(connection: SSHConnection, db_path: str | None) -> bool:
-    """Is this API running on the cluster, as the user, with the database in
-    reach? As the desktop app runs it: then the same file is opened directly,
-    with the same permissions, instead of starting a Python on the cluster
-    over SSH for each call (1.8 s before any work, 2026-09-24). A server
-    elsewhere (the web deployment) keeps going over SSH."""
+    """Returns True when this API runs on the cluster as the user with the database in reach,
+    so calls skip SSH and open the file directly."""
     return bool(db_path) and runs_here(connection) and os.path.exists(os.path.expanduser(db_path))
 
 
 def _run(connection: SSHConnection, action: str, payload: dict):
+    """Runs one job_history action, in-process or via SSH, and returns its JSON result or None."""
     if _here(connection, payload.get("db_path")):
         try:
             return job_history.dispatch(action, payload)
@@ -52,7 +47,7 @@ def _run(connection: SSHConnection, action: str, payload: dict):
         LOGGER.warning("job_history %s failed: %s", action, exc)
         return None
     finally:
-        pass  # pooled client: closing it would break concurrent requests (see SSHConnection pool)
+        pass  # pooled client: closing it would break concurrent requests
 
 
 def record_job_created(connection: SSHConnection, db_path: str, job_id: str, workflow: str,
@@ -104,7 +99,7 @@ def list_jobs_and_count(connection: SSHConnection, db_path: str, workflow: str |
                         limit: int = 100, offset: int = 0,
                         owner_username: str | None = None,
                         owner_cluster_username: str | None = None) -> tuple[list[dict], int]:
-    """Single SSH call returning (jobs, total) — avoids the separate count round-trip."""
+    """Returns (jobs, total) in one call."""
     result = _run(connection, "list_and_count", {
         "db_path": db_path,
         "workflow": workflow,

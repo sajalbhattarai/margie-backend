@@ -23,24 +23,24 @@ from pathlib import Path
 csv.field_size_limit(10_000_000)
 
 _OUT_COLS = [
-    # ── Gene identity ──────────────────────────────────────────────────
+    # Gene identity
     "feature_id",
     "organism_name",
-    # ── Annotation result ─────────────────────────────────────────────
+    # Annotation result
     "concordant_label",
     "label_derivation_logic",
-    # ── Localization summary ──────────────────────────────────────────
+    # Localization summary
     "SIGNALP6_prediction",
     "TMBED_topology",
     "PSORTB_localization",
     "ENVELOPE_envelope_type",
     "ENVELOPE_inference_basis",
-    # ── Operon context ────────────────────────────────────────────────
+    # Operon context
     "operon_id",
     "operon_member_count",
     "operon_gene_position_in_operon",
     "operon_member_genes_with_labels_and_confidence_scores_in_position_order",
-    # ── Mechanical confidence ─────────────────────────────────────────
+    # Mechanical confidence
     "confidence_score",
     "confidence_tier",
     "confidence_flag",
@@ -48,34 +48,34 @@ _OUT_COLS = [
     "c2_score_from_operon_probability",
     "c3_score",
     "c4_score",
-    # ── LLM confidence ────────────────────────────────────────────────
+    # LLM confidence
     "llm_assessment_score",
     "llm_c3_pathway_coherence_score",
-    # ── Specialized DB agreement ──────────────────────────────────────
+    # Specialized DB agreement
     "specialized_database_agreement_with_concordant_label",
     "flag_label_disagrees_with_specialized_databases",
-    # ── Operon coherence ──────────────────────────────────────────────
+    # Operon coherence
     "operon_coherence_assessment",
     "flag_operon_possibly_incoherent",
-    # ── Topology ──────────────────────────────────────────────────────
+    # Topology
     "topology_consistency_with_localization_predictions",
-    # ── Composite review flag ─────────────────────────────────────────
+    # Composite review flag
     "flag_needs_review",
-    # ── Cross-genome fingerprint evidence ─────────────────────────────
+    # Cross-genome fingerprint evidence
     "fingerprint_hash",
     "fingerprint_consensus_label",
     "gene_fingerprint_exact_pattern_occurrence_count_in_database",
     "operon_label_ordered_pattern_occurrence_count_in_database",
-    # ── LLM reasoning ─────────────────────────────────────────────────
+    # LLM reasoning
     "llm_reasoning_text",
-    # ── Provenance ────────────────────────────────────────────────────
+    # Provenance
     "full_evidence_source_file",
     "llm_evidence_source_file",
 ]
 
 
 def _make_derivation_logic(row: dict) -> str:
-    """Compact derivation: 'SOURCE [ID] (hierarchy_tier_name)'."""
+    """Returns the label derivation as 'SOURCE [ID] (hierarchy_tier_name)'."""
     source    = (row.get("label_source") or "").strip()
     source_id = (row.get("label_source_id") or "").strip()
     tier      = (row.get("hierarchy_tier_name") or "").strip()
@@ -132,7 +132,7 @@ def main() -> None:
     final_provenance = final_path.name
     llm_provenance   = llm_path.name
 
-    # Load LLM summary keyed by feature_id
+    # LLM summary rows keyed by feature_id (first row wins).
     llm_by_gene: dict[str, dict] = {}
     with open(llm_path, newline="") as fh:
         for row in csv.DictReader(fh, delimiter="\t"):

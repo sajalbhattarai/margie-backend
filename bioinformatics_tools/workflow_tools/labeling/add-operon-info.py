@@ -1,54 +1,12 @@
 #!/usr/bin/env python3
-"""add-operon-info.py — margie_sb phase10 (labeling): operon context.
+"""add-operon-info.py — labeling stage: operon context.
 
-Reads labeled-genes.tsv (assign-canonical-label.py's output, READ-ONLY)
-and consolidated-merged-all-columns.tsv (for the OPERON_* columns
-produced by phase5's UniOP-based operon layer), joins on feature_id, and
-writes its OWN standalone table: identity/decision columns for
-cross-reference, plus operon identity and the operon-level probability.
-Same "one core table, several focused derived views" pattern as
-add-ec-consensus.py -- doesn't modify labeled-genes.tsv.
-
-OPERON IDENTITY (operon_id): one of three states, kept distinct rather
-than collapsed into a single blank/empty meaning:
-  "operon_XXXX"              -- predicted member of a real multi-gene
-                                 operon (>=2 genes).
-  "NOT_IN_AN_OPERON"          -- UniOP ran on this gene and predicted it
-                                 is a standalone singleton, not part of
-                                 any multi-gene operon. A real, negative
-                                 prediction.
-  "NOT_APPLICABLE_NON_CODING" -- UniOP never saw this feature at all,
-                                 since its input is a protein FAA and RNA
-                                 genes (rRNA/tRNA) are never part of that
-                                 input -- every gene with a blank
-                                 OPERON_id in the merged table is an
-                                 rna.* feature. Relabeled here from a
-                                 bare blank specifically so it isn't
-                                 mistaken for "predicted, not in an
-                                 operon" -- this is "prediction doesn't
-                                 apply to this feature type," a different
-                                 fact entirely.
-
-OPERON PROBABILITY: process_operon_raw_results.py (phase5) computes this
-as the geometric mean of all N-1 adjacent-gene pairwise probabilities
-within the operon (not an arithmetic mean -- geometric mean is the right
-choice here because operon membership is a chain of independent-ish
-pairwise calls multiplied together conceptually, so one weak link should
-pull the summary down hard, the way a product would, rather than being
-diluted by averaging). Stored upstream as a descriptive string, e.g.
-"0.810748 (geometric_mean_of_adjacent_pairs, operon_genes=10,
-n_adjacent_pairs=9)" -- parsed here into a clean numeric
-operon_probability_geometric_mean column (the raw string is kept
-alongside for full provenance, e.g. confirming exactly how many adjacent
-pairs went into that number). Empty for singletons (no internal pairs to
-average) and for NOT_APPLICABLE_NON_CODING genes.
-
-Every gene in an operon shares the SAME operon_probability_geometric_mean
-(it's an operon-level summary, not a per-gene score) -- this script does
-not invent a per-gene operon confidence; that distinction matters for
-anyone using this as a confidence signal later (e.g. scoring/phase11):
-the number reflects how confident UniOP is that the WHOLE predicted gene
-cluster is a real operon, not how confident it is about any one member.
+Joins labeled-genes.tsv with the merged table's OPERON_* columns (UniOP) and
+writes identity columns plus operon id, size, position and probability.
+operon_id is "operon_XXXX", "NOT_IN_AN_OPERON" (predicted singleton) or
+"NOT_APPLICABLE_NON_CODING" (RNA features, which UniOP never sees).
+operon_probability_geometric_mean is the operon-level geometric mean of
+adjacent-pair probabilities, parsed from the raw string, which is kept too.
 """
 from __future__ import annotations
 
@@ -72,14 +30,14 @@ _IDENTITY_COLUMNS = [
 
 
 def normalize_operon_id(raw: str) -> str:
+    """Returns the operon id, mapping an empty value to NOT_APPLICABLE_NON_CODING."""
     if raw == "":
         return "NOT_APPLICABLE_NON_CODING"
     return raw
 
 
 def parse_operon_probability(raw: str) -> str:
-    """"0.810748 (geometric_mean_of_adjacent_pairs, ...)" -> "0.810748".
-    Empty string passes through unchanged (singletons / non-coding)."""
+    """Extracts the leading number from "0.810748 (geometric_mean_of_adjacent_pairs, ...)" by regex; empty stays empty."""
     if not raw:
         return ""
     match = _GEOMETRIC_MEAN_PATTERN.match(raw)
@@ -87,6 +45,7 @@ def parse_operon_probability(raw: str) -> str:
 
 
 def main() -> None:
+    """Joins labeled genes to OPERON_* columns with csv and writes the operon table."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--labeled-input", required=True,

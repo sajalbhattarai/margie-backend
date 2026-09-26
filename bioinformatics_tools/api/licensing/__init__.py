@@ -1,8 +1,7 @@
-"""Licensing / license-gate support for the MARGIE analyze page.
+"""License-gate support for the MARGIE analyze page.
 
-This package holds the source-of-truth data (terms.md, licensing_catalog.json)
-and the helpers that load them, compute the current terms version/hash, record
-a user's acceptance, and check whether a user has accepted the current terms.
+Holds the terms and tool catalog (terms.md, licensing_catalog.json) and the
+helpers that version them, record acceptance and check it.
 """
 from .catalog import (  # noqa: F401
     ACK_ITEMS,

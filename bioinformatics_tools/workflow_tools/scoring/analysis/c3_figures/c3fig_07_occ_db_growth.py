@@ -1,18 +1,7 @@
-"""c3fig_07_occ_db_growth.py - how the dynamic OCC database changes as it grows.
+"""c3fig_07_occ_db_growth.py - shows how the OCC database changes as it grows.
 
-Compares a 15-organism OCC database against the 21-organism database to show what
-folding in 6 more organisms actually does to the reliabilities (rho) and the
-per-gene OCC.
-
-Panels
-  (a) structural growth 15 -> 21 (qualifying operons, descriptors, pairs);
-  (b) shared-pair reliability rho_15 vs rho_21 (no pair is ever lost; net upward);
-  (c) per-gene OCC drift on the SAME first-15 genes (median stable, conserved
-      core rises, ~20% of genes move materially);
-  (d) new-organism COVERAGE - the argument for the dynamic DB: a freshly-labeled
-      organism is largely unscoreable until its own operon evidence is folded in.
-
-Usage: c3fig_07_occ_db_growth.py --stats-dir .../c3-genes-comprehensive-stats
+Compares a database built from the first N organisms with the full one: (a) size,
+(b) shared-pair rho, (c) per-gene OCC drift, (d) coverage of the new organisms.
 """
 import argparse
 import sys
@@ -26,6 +15,7 @@ import numpy as np
 
 
 def main():
+    """Builds both databases with c3_occ, scores the genes and draws the 2x2 figure."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--stats-dir", required=True)
     ap.add_argument("--n-first", type=int, default=15)

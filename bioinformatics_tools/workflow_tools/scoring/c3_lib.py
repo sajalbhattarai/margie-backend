@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """Descriptor gate and per-organism loader for the C3 operon-context scorer.
 
-Two responsibilities:
-  * is_uninformative() / clean_descriptor() -- decide whether a gene carries a
-    real function name and normalise that name to its functional identity (strip
-    the leading "SOURCE:" tag and the "raw ## human-readable" duplication). The
-    uninformative gate mirrors the authoritative definition in
-    score-c1-tool-coverage.py; keep the two consistent.
-  * load_organism() -- JOIN one organism's labeled-genes.tsv (coordinates,
-    descriptor, aa_seq) with its labeled-genes-operon-info.tsv (operon_id,
-    member_count, position, probability) on feature_id into one row per gene.
+is_uninformative() and clean_descriptor() decide whether a descriptor names a
+function and normalise it (the gate matches score-c1-tool-coverage.py);
+load_organism() joins labeled-genes.tsv and labeled-genes-operon-info.tsv into
+one pandas row per gene.
 """
 import csv
 import hashlib
@@ -47,9 +42,7 @@ _DB_ID_HYPOTHETICAL_RE = re.compile(
     r'^(?:fig\d+|tigr\d+)[:\s].*(?:hypothetical|conserved hypothetical)', re.IGNORECASE,
 )
 _UPF_ONLY_RE = re.compile(r'^\s*belongs to the upf\d+', re.IGNORECASE)
-# eggNOG describes orthologous groups of no known function with a PSORT
-# localisation guess ("Psort location Cytoplasmic, score 8.87"): where the
-# protein may sit, not what it does -- never a product name.
+# eggNOG "Psort location ..." descriptions give localisation only, not a product.
 _PSORT_ONLY_RE = re.compile(r'^\s*psort location\b', re.IGNORECASE)
 _BARE_DUF_RE = re.compile(r'^\s*(?:pfam:)?\(?duf\d+\)?(?:\s+(?:family|domain))?\s*$', re.IGNORECASE)
 _PROTEIN_DOMAINS_DUF_RE = re.compile(r'^\s*protein containing domains?\s+duf', re.IGNORECASE)
@@ -71,7 +64,7 @@ _LOCUS_OR_TAG_RE = re.compile(r'^\(?(?:duf\d+|upf\d+|[a-z]{1,5}\d{0,4}[a-z]?\d{0
 
 
 def is_uninformative(val: str) -> bool:
-    """True iff ``val`` falls in the UNINFORMATIVE HIT CATEGORY."""
+    """Returns True when the description names no function (word lists and regexes above)."""
     v = (val or "").strip().lower()
     if not v or v in _UNINFORMATIVE:
         return True
@@ -97,12 +90,9 @@ def is_uninformative(val: str) -> bool:
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Descriptor cleaning
-# ─────────────────────────────────────────────────────────────────────────────
-# Leading "SOURCE: " tags that the labeling pipeline prepends to the functional
-# text.  We strip these so the SAME function annotated via different evidence
-# sources groups together, and so is_uninformative() sees the functional text.
+# ─── Descriptor cleaning ─────────────────────────────────────────────────────
+# Leading "SOURCE: " tags are stripped so the same function from different
+# sources groups together.
 _SOURCE_PREFIX_RE = re.compile(
     r'^(?:'
     r'JCVI|NCBIFAM|NCBI Protein Cluster \(PRK\)|PRK|TIGR|TIGRFAM|PGAP|HAMAP|'
@@ -114,8 +104,7 @@ _SOURCE_PREFIX_RE = re.compile(
 
 
 def clean_descriptor(desc: str) -> str:
-    """Return the functional text: strip a leading SOURCE tag and collapse the
-    "raw ## human-readable" duplication (keep the human-readable side)."""
+    """Returns the functional text: the right side of "raw ## readable", without leading SOURCE: tags (regex)."""
     d = (desc or "").strip()
     if not d:
         return ""
@@ -123,7 +112,7 @@ def clean_descriptor(desc: str) -> str:
     if " ## " in d:
         left, right = d.split(" ## ", 1)
         d = right.strip() if right.strip() else left.strip()
-    # strip a single leading SOURCE: tag (may repeat, e.g. "JCVI: PRK: x")
+    # strips leading SOURCE: tags until none remain (e.g. "JCVI: PRK: x")
     prev = None
     while prev != d:
         prev = d
@@ -132,39 +121,32 @@ def clean_descriptor(desc: str) -> str:
 
 
 def sha256_hash(seq: str) -> str:
+    """Returns the SHA-256 hex digest of the upper-cased sequence (hashlib)."""
     return hashlib.sha256((seq or "").strip().upper().encode("utf-8")).hexdigest()
 
 
 def genome_fingerprint(aa_hashes) -> str:
-    """Content identity for a genome: sha256 over its SORTED per-gene aa_hashes.
+    """Returns a genome content fingerprint: SHA-256 over its sorted non-empty per-gene aa_hashes.
 
-    Order-independent and stable across re-annotation (same proteome -> same
-    fingerprint), so it identifies a genome by its CONTENT rather than by the
-    user-chosen, arbitrary organism/file name.  This is the key used to detect
-    whether a candidate genome is already in the OCC reference (for leave-one-out
-    scoring) and to dedupe on add.  Empty hashes are ignored; "" if none.
-
-    Pass an iterable of aa_hash strings, e.g. load_organism(..., compute_hash=
-    True)["aa_hash"]."""
+    Identifies a genome in the OCC reference independent of its name; "" when there are no hashes.
+    """
     hs = sorted(h for h in aa_hashes if h)
     if not hs:
         return ""
     return hashlib.sha256("\n".join(hs).encode("utf-8")).hexdigest()
 
 
-# columns of a genome's pool-stats record (order used by the sidecar TSV)
+# Fields of a genome's pool-stats record, in sidecar TSV order
 POOL_STAT_FIELDS = ("total_genes", "operonic_genes", "singleton_genes",
                     "n_operons", "n_informative_operons", "n_uninformative_operons")
 
 
 def genome_pool_stats(genes) -> dict:
-    """Descriptive pool statistics for ONE genome, from a load_organism() frame.
+    """Counts genes and operons for one genome from a load_organism() DataFrame (pandas groupby).
 
-    An operon is INFORMATIVE (== the OCC 'qualifying' gate in c3_occ) iff its
-    informative members strictly outnumber its uninformative ones; otherwise it
-    is UNINFORMATIVE ('disinformative' -- dominated by hypotheticals). Returns a
-    dict over POOL_STAT_FIELDS: total genes, genes in any operon, non-operonic
-    (singleton) genes, and operon counts split informative / uninformative."""
+    An operon is informative when informative members outnumber uninformative
+    ones (the OCC qualifying gate). Returns a dict over POOL_STAT_FIELDS.
+    """
     total = len(genes)
     op = genes[genes["operon_id"].astype(str).str.startswith("operon_")]
     n_op = n_inf_op = n_unf_op = 0
@@ -182,6 +164,7 @@ def genome_pool_stats(genes) -> dict:
 
 
 def _to_int(v, default=0):
+    """Returns int(float(v)), or default when it cannot be parsed."""
     try:
         return int(float(str(v).strip()))
     except (ValueError, TypeError):
@@ -189,6 +172,7 @@ def _to_int(v, default=0):
 
 
 def _to_float(v, default=float("nan")):
+    """Returns float(v), or default when it cannot be parsed."""
     try:
         return float(str(v).strip())
     except (ValueError, TypeError):
@@ -197,7 +181,7 @@ def _to_float(v, default=float("nan")):
 
 def load_organism(organism: str, labeled_path: Path, operon_path: Path,
                   compute_hash: bool = True) -> pd.DataFrame:
-    """JOIN the two per-organism TSVs on feature_id -> one row per gene."""
+    """Joins labeled-genes.tsv and labeled-genes-operon-info.tsv on feature_id into a pandas DataFrame."""
     # Pass 1: operon-info (small, authoritative for operon membership)
     operon = {}
     with open(operon_path, newline="") as fh:

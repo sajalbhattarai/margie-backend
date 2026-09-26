@@ -1,30 +1,9 @@
 #!/usr/bin/env python3
-"""add-fingerprint-to-final.py — enrich labeled-genes-confidence-final.tsv
-with per-gene fingerprint hit columns from labeled-genes-fingerprint-hash-label.tsv
-and cross-genome frequency counts from the persistent fingerprint databases.
+"""add-fingerprint-to-final.py — writes labeled-genes-final-annotated.tsv.
 
-Reads (all required):
-  labeled-genes-confidence-final.tsv     (phase11/scoring)
-  labeled-genes-fingerprint-hash-label.tsv  (phase12/fingerprint)
-  labeled-genes-operon-fingerprint.tsv   (phase12/run_operon_fingerprint)
-  fingerprint-database.tsv               (cross-genome gene fingerprint pool)
-  operon-fingerprint-database-label-ordered.tsv    (cross-genome operon pool)
-  operon-fingerprint-database-label-composition.tsv
-
-Writes labeled-genes-final-annotated.tsv — the single user-facing output
-that combines identity, localization, operon, scoring, fingerprint evidence,
-cross-genome frequency counts, and ordered operon member details in one
-flat table.
-
-New columns appended (all human-readable names):
-  fingerprint_hash
-  fingerprint_consensus_label
-  gene_fingerprint_exact_pattern_occurrence_count_in_database
-  gene_fingerprint_exact_pattern_organism_count_in_database
-  gene_fingerprint_consensus_label_occurrence_count_in_database
-  operon_label_ordered_pattern_occurrence_count_in_database
-  operon_label_composition_pattern_occurrence_count_in_database
-  operon_member_genes_with_labels_and_confidence_scores_in_position_order
+Appends to labeled-genes-confidence-final.tsv each gene's fingerprint hash and
+label, its cross-genome frequencies from the gene and operon fingerprint
+databases, its operon members in position order, and EC evidence (_NEW_COLUMNS).
 """
 from __future__ import annotations
 
@@ -60,7 +39,7 @@ _NEW_COLUMNS = [
 
 
 def parse_fingerprint(raw: str) -> tuple[str, str]:
-    """Extract (hash, consensus_label) from 'pattern hash: XXXX || label: YYYY'."""
+    """Extracts (hash, consensus_label) from 'pattern hash: XXXX || label: YYYY' by regex."""
     m = _FINGERPRINT_RE.search(raw)
     if m:
         return m.group(1).strip(), m.group(2).strip()
@@ -68,7 +47,7 @@ def parse_fingerprint(raw: str) -> tuple[str, str]:
 
 
 def load_fingerprint_db(path: Path) -> dict[str, dict]:
-    """Returns {hash: {frequency, label_frequency, organism_count}}."""
+    """Reads the gene fingerprint database with csv into {hash: {frequency, label_frequency, organism_count}}."""
     result: dict[str, dict] = {}
     if not path.is_file():
         return result
@@ -87,7 +66,7 @@ def load_fingerprint_db(path: Path) -> dict[str, dict]:
 
 
 def load_operon_fp_db(path: Path) -> dict[str, int]:
-    """Returns {operon_hash: operon_count}."""
+    """Reads an operon fingerprint database with csv into {operon_hash: operon_count}."""
     result: dict[str, int] = {}
     if not path.is_file():
         return result
@@ -100,7 +79,7 @@ def load_operon_fp_db(path: Path) -> dict[str, int]:
 
 
 def parse_operon_hashes(operon_fp_str: str) -> tuple[str, str]:
-    """Extract (label_ordered_hash, label_composition_hash) from the operon fingerprint string."""
+    """Extracts (label_ordered_hash, label_composition_hash) from the operon fingerprint string by regex."""
     label_ordered = ""
     label_composition = ""
     m = _OPERON_HASH_RE["label_ordered"].search(operon_fp_str)
@@ -115,12 +94,9 @@ def parse_operon_hashes(operon_fp_str: str) -> tuple[str, str]:
 def build_member_detail(
     members: list[tuple[int, str, str, str]]
 ) -> str:
-    """
-    members = [(position, feature_id, concordant_label, confidence_score), ...]
-    sorted by position already.
-    Returns a human-readable string like:
-      Position 1: peg.1 [formate dehydrogenase alpha] confidence=0.87
-        → Position 2: peg.2 [formate dehydrogenase beta] confidence=0.89
+    """Joins position-sorted (position, feature_id, label, score) members into one "→"-separated string.
+
+    e.g. "Position 1: peg.1 [label] confidence=0.8700 → Position 2: ..."
     """
     parts = []
     for pos, fid, label, score in members:
@@ -130,6 +106,7 @@ def build_member_detail(
 
 
 def main() -> None:
+    """Loads the per-gene inputs and fingerprint databases with csv and writes the enriched table."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--confidence-final-input", required=True,
@@ -161,7 +138,7 @@ def main() -> None:
             print(f"[add-fingerprint-to-final] ERROR: {label} not found: {p}", file=sys.stderr)
             raise SystemExit(1)
 
-    # Load per-gene fingerprint (hash_label) → hash + consensus label
+    # Per-gene fingerprint hash and consensus label
     fp_by_gene: dict[str, tuple[str, str]] = {}
     with open(args.fingerprint_hash_label_input, newline="") as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
@@ -169,7 +146,7 @@ def main() -> None:
             if fid and fid not in fp_by_gene:
                 fp_by_gene[fid] = parse_fingerprint(row.get("fingerprint", ""))
 
-    # Load operon fingerprint → per-gene operon hashes (label-ordered and label-composition)
+    # Per-gene operon hashes (label-ordered and label-composition)
     operon_hashes_by_gene: dict[str, tuple[str, str]] = {}
     with open(args.operon_fingerprint_input, newline="") as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
@@ -178,7 +155,7 @@ def main() -> None:
             if fid and fp_str and fid not in operon_hashes_by_gene:
                 operon_hashes_by_gene[fid] = parse_operon_hashes(fp_str)
 
-    # Load EC consensus evidence per gene (ec_all_evidence, ec_supporting_tools)
+    # Per-gene EC evidence
     ec_by_gene: dict[str, dict[str, str]] = {}
     with open(args.ec_consensus_input, newline="") as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
@@ -189,13 +166,12 @@ def main() -> None:
                     "ec_supporting_tools": row.get("ec_supporting_tools", ""),
                 }
 
-    # Load cross-genome databases (may not exist yet on first run — tolerated)
+    # Cross-genome databases; missing files load as empty
     gene_fp_db = load_fingerprint_db(Path(args.fingerprint_database))
     operon_fp_label_ordered_db = load_operon_fp_db(Path(args.operon_fp_label_ordered_database))
     operon_fp_label_composition_db = load_operon_fp_db(Path(args.operon_fp_label_composition_database))
 
-    # First pass over confidence_final: build operon-member index
-    # operon_id → sorted list of (position, feature_id, concordant_label, confidence_score)
+    # First pass: operon_id → [(position, feature_id, label, confidence_score)]
     operon_members: dict[str, list[tuple[int, str, str, str]]] = {}
     cf_rows: list[dict] = []
 
@@ -218,11 +194,10 @@ def main() -> None:
                 score = row.get("confidence_score", "")
                 operon_members.setdefault(oid, []).append((pos, fid, label, score))
 
-    # Sort each operon's members by position
     for oid in operon_members:
         operon_members[oid].sort(key=lambda t: t[0])
 
-    # Second pass: write enriched output
+    # Second pass: writes the enriched rows
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 

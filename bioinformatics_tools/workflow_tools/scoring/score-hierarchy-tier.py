@@ -1,34 +1,9 @@
 #!/usr/bin/env python3
-"""score-hierarchy-tier.py — margie_sb phase11 (scoring), step 1: hierarchy
-tier.
+"""score-hierarchy-tier.py — scoring stage, step 1: hierarchy tier.
 
-Reads labeled-genes.tsv (assign-canonical-label.py's output, READ-ONLY)
-and maps each gene's product_descriptor_source to a trust TIER -- the same grouping
-already implicit in assign-canonical-label.py's _EVALUATORS priority
-order, made explicit and numeric here so it can be combined with other
-confidence signals later (EC agreement, etc.) without re-deriving it each
-time.
-
-This is intentionally the FIRST, standalone piece of the eventual
-confidence-scoring step -- verify the tier bucketing alone reads as
-sensible on real data before layering the EC-agreement signal on top in
-a follow-up script. Lives in its own workflow_tools/scoring/ phase
-folder (phase11), separate from labeling (phase10) -- labeling decides
-WHICH tool's text wins; scoring assesses how much to trust a decision
-already made, a different job that will keep growing as more signals
-(EC agreement, eventually others) get folded in.
-
-TIER RATIONALE (mirrors assign-canonical-label.py's explicit ranking):
-  Tier 1 -- PGAP, NCBIFAM, TIGRFAM
-  Tier 2 -- HAMAP, PIRSF, UNIPROT
-  Tier 3 -- KEGG
-  Tier 4 -- EGGNOG
-  Tier 5 -- RAST
-  Tier 6 -- PFAM
-  Tier 7 -- CDD
-  Tier 8 -- COG
-  (no winner) -- product_descriptor_source == "NONE": lower than every real tier --
-            no qualifying evidence existed at all.
+Maps each gene's product_descriptor_source in labeled-genes.tsv to a numeric
+trust tier following assign-canonical-label.py's priority order
+(Tier 1 PGAP/NCBIFAM/TIGRFAM ... Tier 8 COG); "NONE" scores below every tier.
 """
 import argparse
 import csv
@@ -37,8 +12,7 @@ from pathlib import Path
 
 csv.field_size_limit(10_000_000)
 
-# tool_name -> (tier_score, tier_name). Same grouping logic as
-# assign-canonical-label.py's _EVALUATORS order, just bucketed.
+# tool_name -> (tier_score, tier_name), bucketed from assign-canonical-label.py's order.
 HIERARCHY_TIER = {
     "PGAP": (4, "tier1_curated_prokaryote_family"),
     "NCBIFAM": (4, "tier1_curated_prokaryote_family"),
@@ -65,10 +39,12 @@ _IDENTITY_COLUMNS = [
 
 
 def score_hierarchy_tier(product_descriptor_source):
+    """Returns (tier_score, tier_name) for a label source, or the no-winner pair."""
     return HIERARCHY_TIER.get(product_descriptor_source, (_NO_WINNER_SCORE, _NO_WINNER_NAME))
 
 
 def main() -> None:
+    """Streams labeled-genes.tsv with csv and writes each gene's hierarchy tier."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--labeled-input", required=True,

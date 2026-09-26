@@ -1,41 +1,8 @@
 """score_occ.py - CLI for the dynamic Operon Context Confidence (OCC) database.
 
-Operationalises c3_occ.py's incremental reference: the OCC database stores only
-ADDITIVE pan-genome co-occurrence counts, so every newly-labeled organism folds
-in WITHOUT reprocessing the organisms already in it.  This CLI exposes that
-lifecycle - build once, then update per new organism, then score.
-
-Gene identity = clean_descriptor (functional name).  OCC is derived purely from
-pan-genome operon co-occurrence (figs 01-05), INDEPENDENT of C1/C2/C4.  Read-only
-prototype; the production scorer is untouched.
-
-CONVENTIONS (match the c3fig_* scripts)
-  --stats-dir  = .../scoring/c3-genes-comprehensive-stats  (holds _cache/genes.pkl)
-  run_root     = stats_dir.parents[1] (the run dir with <org>/labeling/…)  - the
-                 adjacency channel reads contigs from there.
-  --db         = the persistent OCC database pickle
-                 (default: <stats_dir>/_cache/occ_reference.pkl)
-
-SUBCOMMANDS
-  build   Build the database from scratch from every organism in the cache.
-            score_occ.py build  --stats-dir DIR [--db PATH]
-  update  Fold organism(s) into the database (create it if missing), then save.
-          Default = every organism in the cache not already in the database - so
-          re-running after a new organism is labeled just adds that organism.
-            score_occ.py update --stats-dir DIR [--organisms A B …] [--db PATH]
-  score   Load the database and write per-gene OCC for every gene in the cache.
-            score_occ.py score  --stats-dir DIR [--db PATH] -o OUT.tsv
-  status  Print a summary of the database (organisms, #pairs, params).
-            score_occ.py status --db PATH
-
-TYPICAL DYNAMIC WORKFLOW
-  # first build (all organisms currently labeled)
-  score_occ.py build  --stats-dir .../c3-genes-comprehensive-stats
-  # later, when organism "Klebsiella_pneumoniae" is newly labeled into a run:
-  score_occ.py update --stats-dir <that run>/scoring/c3-genes-comprehensive-stats \
-                      --organisms Klebsiella_pneumoniae
-  # score whenever needed
-  score_occ.py score  --stats-dir .../c3-genes-comprehensive-stats -o per_gene_occ.tsv
+The database stores additive pan-genome co-occurrence counts, so a newly labeled
+organism folds in without reprocessing the others. Subcommands: build, update
+(default: every cached organism not yet in the DB), score (per-gene TSV), status.
 """
 import argparse
 import sys
@@ -47,6 +14,7 @@ import c3_occ as O
 
 
 def _resolve(stats_dir):
+    """Returns (stats_dir, genes cache path, run root) and exits if the cache is missing."""
     stats_dir = Path(stats_dir).resolve()
     cache = stats_dir / "_cache" / "genes.pkl"
     if not cache.is_file():
@@ -56,10 +24,12 @@ def _resolve(stats_dir):
 
 
 def _default_db(stats_dir):
+    """Returns the default database path <stats_dir>/_cache/occ_reference.pkl."""
     return Path(stats_dir) / "_cache" / "occ_reference.pkl"
 
 
 def cmd_build(args):
+    """Builds the OCC database from every organism in the cache and saves it."""
     stats_dir, cache, run_root = _resolve(args.stats_dir)
     db_path = Path(args.db) if args.db else _default_db(stats_dir)
     genes = L.load_cache(cache)
@@ -74,6 +44,7 @@ def cmd_build(args):
 
 
 def cmd_update(args):
+    """Folds the requested (or all missing) organisms into the database and saves it."""
     stats_dir, cache, run_root = _resolve(args.stats_dir)
     db_path = Path(args.db) if args.db else _default_db(stats_dir)
     genes = L.load_cache(cache)
@@ -92,7 +63,7 @@ def cmd_update(args):
         print("[score_occ] nothing to add (all requested organisms already present)")
     else:
         print("[score_occ] added %d organism(s): %s" % (len(added), ", ".join(added)))
-    O.finalize_reference(ref)  # cheap (memoised); leaves the DB ready to score
+    O.finalize_reference(ref)  # memoised; leaves the DB ready to score
     O.save_reference(ref, db_path)
     print("[score_occ] saved -> %s  (now %d organisms, %d adj / %d op pairs)"
           % (db_path, len(ref["organisms_added"]), len(ref["rho_adj"]),
@@ -100,6 +71,7 @@ def cmd_update(args):
 
 
 def cmd_score(args):
+    """Writes per-gene OCC for every cached gene, building a database if none exists."""
     stats_dir, cache, run_root = _resolve(args.stats_dir)
     db_path = Path(args.db) if args.db else _default_db(stats_dir)
     genes = L.load_cache(cache)
@@ -125,6 +97,7 @@ def cmd_score(args):
 
 
 def cmd_status(args):
+    """Prints a summary of the database: organisms, pair counts and parameters."""
     if not args.db:
         sys.exit("[score_occ] status needs --db PATH")
     db_path = Path(args.db)

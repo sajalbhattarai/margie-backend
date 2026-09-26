@@ -41,58 +41,33 @@ RUN_FILE_DIR = '.local/share/bsp/jobs'
 
 
 def run_file_stem(job_id: str | None) -> str:
-    """The sanitized stem naming a run's .log/.rc/.pid on the cluster.
+    """Returns the sanitised stem naming a run's .log/.rc/.pid on the cluster.
 
-    Shared so a reattach looks for exactly the files the launch wrote --
-    see submit_ssh_job and the API's job_status reattach path.
+    Shared so a reattach finds the files the launch wrote.
     """
     return re.sub(r'[^A-Za-z0-9_.-]', '_', str(job_id or 'run'))
 
 
-# A live run's log is never quiet for this long: snakemake logs a status-check
-# cycle roughly every 30s for as long as it has jobs in flight.
+# A live run's log is never quiet this long: snakemake logs a status check about every 30s.
 RUN_STALE_AFTER = 900.0
 
-# How long to wait for the launching shell to echo the detached run's pid.
-# Generous, because it is only a guard against hanging: the pid arrives in
-# milliseconds when it arrives at all, and the run is already going either way.
+# How long to wait for the launching shell to echo the detached run's pid (a hang guard).
 _LAUNCH_ACK_TIMEOUT = 30.0
 
-# ---------------------------------------------------------------------------
-# Hosting the workflow driver in SLURM rather than on the login node.
-#
-# setsid + nohup already stop the driver dying with the SSH session, so closing
-# a laptop is safe. What they cannot survive is the login node itself: a reboot,
-# a maintenance window, or an administrator reaping long-running login-node
-# processes. The driver is not a small process -- it is Snakemake, running for
-# the whole annotation -- and login nodes are explicitly not where that belongs.
-# When it dies, SLURM jobs already queued still finish, but nothing further is
-# ever submitted and the run stalls half-done.
-#
-# Submitting the driver as a job of its own puts it on a compute node under the
-# scheduler's protection. Verified on Negishi: a compute node has /usr/bin/sbatch
-# and a job submitted from one is accepted, so Snakemake's own SLURM executor
-# keeps working from in there.
-#
-# Deliberately unchanged: the log path and the .rc sentinel. Everything
-# downstream -- tail -F, probe_run, is_replayable, the reattach -- keys off
-# those two files and nothing else, so none of it needs to know where the
-# driver is hosted.
+# ---- Workflow driver hosted in SLURM ----
+# The Snakemake driver runs as its own batch job on a compute node, so login-node
+# reboots or reaping cannot stall a run; compute nodes can call sbatch. The log
+# path and .rc sentinel are unchanged, so tailing and reattach work as before.
 DRIVER_PARTITION = 'cpu'
 DRIVER_ACCOUNT = None          # None -> let SLURM pick the default account
-# No cap to respect: the cpu partition is MaxTime=UNLIMITED and the normal QOS
-# sets no MaxWall (only standby does, at 4h). SLURM charges what a job actually
-# uses, not what it asked for, so a generous limit costs nothing but a slightly
-# harder backfill -- and with one CPU that is easy to place. Runs measured so
-# far take one to three hours; this is a wide margin, not a prediction.
+# The cpu partition and normal QOS set no wall-time cap and SLURM charges actual
+# use, so this is a wide margin over the one to three hours runs take.
 DRIVER_TIME = '7-00:00:00'
 DRIVER_CPUS = 2                # Snakemake plus the shell that waits on it
 DRIVER_MEM_MB = 8000
 
-# The six shapes sbatch --time accepts. Anything else makes sbatch refuse the
-# submission outright, and since this value now comes from a user-editable
-# config field ("3 days", "72h", a stray space) that refusal would surface as a
-# failed start with no obvious cause. Validate here and fall back instead.
+# The six --time formats sbatch accepts; a user-edited value is validated here
+# so a typo falls back to the default instead of failing the start.
 _SLURM_TIME_RE = re.compile(
     r'^(?:\d+'                       # minutes
     r'|\d+:\d{1,2}'                  # minutes:seconds
@@ -105,11 +80,7 @@ _SLURM_TIME_RE = re.compile(
 
 
 def _valid_driver_time(value: str | None) -> str | None:
-    """Return *value* if sbatch would accept it as --time, else None.
-
-    None means "caller should use the default" -- a bad value must never be
-    passed through to sbatch, and must never be silently treated as unlimited.
-    """
+    """Returns *value* if sbatch accepts it as --time, else None (use the default)."""
     if value is None:
         return None
     candidate = str(value).strip()
@@ -123,23 +94,13 @@ def _valid_driver_time(value: str | None) -> str | None:
 
 
 def probe_run(job_id: str, connection: SSHConnection) -> dict:
-    """One SSH round-trip answering: is this detached run's log worth tailing?
+    """Checks in one SSH round-trip whether a detached run's log is worth tailing.
 
     Returns {"has_log": bool, "exit_code": str|None, "log_idle": float}, where
-    log_idle is seconds since the log was last written.
-
-    Liveness is read off the LOG, not the process table. The obvious probe --
-    pgrep for the job_id, which is in the driver's command line -- cannot work:
-    the job_id is also in this probe's own command line (the log path it stats),
-    so the probe matches itself and every run, however long dead, reads as
-    alive. The `ps | grep [f]oo` bracket trick does not save it either, because
-    the unbracketed copy in the log path is right there in the same command.
-    Log mtime answers the question being asked anyway -- "will `tail -F` ever
-    produce anything?" -- rather than a proxy for it.
-
-    Anything unparseable reads as "nothing there", the safe answer: callers use
-    this to decide whether to start tailing, and `tail -F` on a file that will
-    never grow never returns.
+    log_idle is seconds since the log was last written. Liveness comes from log
+    mtime, since a pgrep for the job_id would match the probe itself. Anything
+    unparseable reads as "nothing there", because `tail -F` on a file that never
+    grows never returns.
     """
     base = f'$HOME/{RUN_FILE_DIR}/{run_file_stem(job_id)}'
     probe = (
@@ -147,10 +108,7 @@ def probe_run(job_id: str, connection: SSHConnection) -> dict:
         f'mt=$(stat -c %Y {base}.log 2>/dev/null || echo 0); '
         f'sz=$(stat -c %s {base}.log 2>/dev/null || echo 0); '
         f'rc=$(cat {base}.rc 2>/dev/null); '
-        # A driver hosted in SLURM has a fourth state the log cannot show: it
-        # can be sitting in the queue, not yet started, with no log at all. That
-        # is emphatically not a dead run, and without this it read as one -- the
-        # reattach would refuse a job that was simply waiting for a node.
+        # A driver job still queued has no log yet but is not dead.
         f'dj=$(cat {base}.jobid 2>/dev/null); '
         f'ds=$(squeue -h -j "${{dj:-0}}" -o %T 2>/dev/null | head -1); '
         f'echo "$sz|${{rc:--}}|$((now - mt))|${{ds:--}}"'
@@ -159,8 +117,7 @@ def probe_run(job_id: str, connection: SSHConnection) -> dict:
     stdin, stdout, stderr = ssh.exec_command(probe)
     lines = [ln for ln in stdout.read().decode().strip().splitlines() if ln.strip()]
     parts = lines[-1].split('|') if lines else []
-    # Tolerate the 3-field answer too: a run launched before driver jobs
-    # existed, or by an older dane-api, still has to be probeable.
+    # Also accepts the 3-field answer from runs launched before driver jobs existed.
     if len(parts) not in (3, 4):
         LOGGER.warning('Unreadable run probe for %s: %r', job_id, lines)
         return {"has_log": False, "exit_code": None, "log_idle": float('inf'),
@@ -179,28 +136,17 @@ def probe_run(job_id: str, connection: SSHConnection) -> dict:
     }
 
 
-# squeue states meaning the driver job will still produce output. COMPLETING is
-# excluded on purpose: its log is already written and the log checks below judge
-# it correctly, whereas treating it as live would start a tail on a file that is
-# about to stop growing.
+# squeue states in which the driver will still produce output. COMPLETING is
+# excluded: its log is complete and the log checks judge it correctly.
 _DRIVER_PENDING_STATES = ('PENDING', 'CONFIGURING', 'RUNNING', 'RESIZING',
                           'REQUEUED', 'SUSPENDED')
 
 
 def is_replayable(probe: dict) -> bool:
-    """Whether a probe_run() result means `tail -F` will terminate or deliver.
+    """Returns whether a probe_run() result means `tail -F` will terminate or deliver.
 
-    True in three cases: the driver job is still queued or running (so a log is
-    coming, even if there is none yet -- `tail -F` waits for the file, which is
-    exactly what it is for), the run finished (sentinel present, so the replay
-    ends at it and recovers the real exit code), or its log is still being
-    written (so the replay catches up and then follows it live).
-
-    The first case only exists because the driver moved into SLURM. A queued
-    driver has no log and no sentinel, which under the old two-case rule read
-    identically to a run that had died -- so reopening the page during the queue
-    wait refused to reattach, and the job sat there looking abandoned until it
-    happened to be polled again after the node was allocated.
+    True when the driver job is queued or running, the run has finished
+    (sentinel present), or its log is still being written.
     """
     if probe.get("driver_state") in _DRIVER_PENDING_STATES:
         return True
@@ -210,11 +156,8 @@ def is_replayable(probe: dict) -> bool:
 
 
 def driver_job_id(job_id: str, connection: SSHConnection) -> str | None:
-    """The SLURM id of this run's driver job, or None if it has no driver job.
-
-    None is the correct answer for a run launched before the driver moved into
-    SLURM, and for one launched with in_slurm=False. Callers must treat it as
-    "nothing extra to cancel", not as an error.
+    """Returns the SLURM id of this run's driver job, or None if it has none
+    (older runs and in_slurm=False); None means nothing extra to cancel.
     """
     base = f'$HOME/{RUN_FILE_DIR}/{run_file_stem(job_id)}'
     ssh = connection.connect()
@@ -231,23 +174,11 @@ def build_driver_launch(cmd: str, base: str, safe: str, log: str, rcf: str,
                         time_limit: str = DRIVER_TIME,
                         cpus: int = DRIVER_CPUS,
                         mem_mb: int = DRIVER_MEM_MB) -> str:
-    """Shell that writes the driver's two scripts and submits the batch job.
+    """Returns the shell that writes the driver's two scripts and submits the batch job.
 
-    The workflow command goes into a file of its OWN rather than inside a
-    `bash -c '...'`, because it legitimately contains single quotes
-    (MARGIE_LICENSE_ACCEPTED='2026-07-31' ...) and would not survive being
-    wrapped in more of them. Both heredocs are quoted, so nothing in the
-    command is expanded by the shell that writes it -- it is stored verbatim
-    and interpreted only when the batch job runs it.
-
-    nohup is kept even though a batch job has no controlling terminal to be
-    hung up on. It costs nothing and it means the driver script is equally safe
-    if it is ever run outside SLURM again.
-
-    The workflow is NOT backgrounded here. On the login node it had to be, so
-    the SSH call could return; inside a batch job the opposite is true -- if the
-    script exits, SLURM tears the allocation down and takes the run with it. So
-    the script waits, and the job lives exactly as long as the run.
+    The workflow command goes into its own file via a quoted heredoc, since it
+    contains single quotes. The batch script waits on the workflow rather than
+    backgrounding it, so the job lives exactly as long as the run.
     """
     sbatch_directives = [
         f'#SBATCH --job-name=margie-{safe}',
@@ -257,8 +188,7 @@ def build_driver_launch(cmd: str, base: str, safe: str, log: str, rcf: str,
         '#SBATCH --ntasks=1',
         f'#SBATCH --cpus-per-task={cpus}',
         f'#SBATCH --mem={mem_mb}',
-        # The driver's own stdout is noise; the workflow's real output is
-        # redirected to $log below, which is what the GUI tails.
+        # The driver's stdout is noise; the workflow's output goes to $log, which the GUI tails.
         '#SBATCH --output=/dev/null',
         '#SBATCH --error=/dev/null',
     ]
@@ -295,37 +225,17 @@ def submit_ssh_job(
     driver_partition: str | None = None,
     driver_time: str | None = None,
 ):
-    '''Run a workflow command on the login node, DETACHED, and stream its log.
+    '''Runs a workflow command detached and streams its log.
 
-    reattach=True skips the launch entirely and only streams: the run is
-    already going, started by an earlier (now dead) dane-api, and its log and
-    exit sentinel are still on disk under the same job_id. cmd is ignored in
-    that mode. The tail has always started at line 1 precisely so this would
-    replay everything the lost session saw -- until now nothing called it, so a
-    dane-api restart meant a live run's job page went permanently blank: no
-    logs, no SLURM jobs, phase frozen wherever it was when the API died.
+    The command is started with setsid + nohup (or as a SLURM driver job),
+    writing to a log file and its exit status to a sentinel, so closing the GUI
+    never stops the run. reattach=True skips the launch (cmd is ignored) and
+    replays the existing log from line 1.
 
     Yields each output line as it arrives, then a final __EXIT_CODE__: line.
-    The contract is unchanged; how the process is hosted is not.
-
-    Previously this did exec_command(..., get_pty=True) and read the channel
-    directly, which tied the run's lifetime to the SSH session. Because
-    margie.sh traps EXIT and kills the remote dane-api, quitting the GUI closed
-    that session, tore down the PTY, and SIGHUP'd dane_wf -- the Snakemake
-    driver. Already-submitted SLURM jobs kept running, but nothing further was
-    ever submitted, so a run silently stalled half-finished whenever the user
-    closed their laptop. A genome annotation takes hours; that is not a
-    reasonable thing to require.
-
-    Now the command is started with setsid + nohup, writing to a log file, and
-    its exit status to a sentinel. Streaming is a SEPARATE concern: we tail the
-    log. Losing the tail (closed GUI, dropped VPN) loses only the live output --
-    the run continues, and reattaching later replays the log from the top.
     '''
-    # pooled=False: this client is held for the ENTIRE run -- hours -- while the
-    # pooled one is shared with every status poll and file listing the GUI makes
-    # in the meantime, and is evicted on a 600s TTL. A run must not depend on
-    # either. See SSHConnection.connect's docstring.
+    # pooled=False: this client is held for the whole run, independent of the
+    # shared pool (see SSHConnection.connect).
     ssh = connection.connect(pooled=False)
 
     safe = run_file_stem(job_id)
@@ -337,8 +247,7 @@ def submit_ssh_job(
         if reattach:
             LOGGER.info('Reattaching to run %s, replaying log %s', safe, log)
         elif in_slurm:
-            # The driver goes to a compute node under the scheduler, not onto
-            # the login node -- see the DRIVER_* constants for why.
+            # The driver goes to a compute node (see the DRIVER_* constants).
             launch = build_driver_launch(
                 cmd, base, safe, log, rcf, jobidf, driversh,
                 partition=(driver_partition or DRIVER_PARTITION),
@@ -354,10 +263,7 @@ def submit_ssh_job(
                 LOGGER.warning('No SLURM id from the driver submission for %s (%s)',
                                safe, exc)
             if not driver_job.isdigit():
-                # sbatch refused. Unlike a login-node launch there is nothing
-                # running yet, so this IS a failed start and must be reported
-                # as one rather than yielding __LAUNCHED__ and waiting for a
-                # log that will never appear.
+                # sbatch refused: nothing is running, so this is a failed start.
                 err = ''
                 try:
                     _err.channel.settimeout(_LAUNCH_ACK_TIMEOUT)
@@ -370,16 +276,8 @@ def submit_ssh_job(
             LOGGER.info('Driver submitted as SLURM job %s, log %s', driver_job, log)
         else:
             # setsid detaches from the session so no SIGHUP reaches it; nohup
-            # covers the gap before setsid takes effect. The exit code is
-            # written by the same shell that runs the command, so it is
-            # recorded even though nobody is attached.
-            #
-            # The pid is recorded by the launching shell itself. It used to be a
-            # SECOND exec_command issued from here, which bought nothing and
-            # added a failure point squarely between "the run has started" and
-            # "we are watching it": when that call was the one that failed, the
-            # workflow was already running on the cluster but the caller saw
-            # only an exception.
+            # covers the gap before setsid takes effect. The same shell writes
+            # the exit code and records the pid.
             launch = (
                 f'mkdir -p $HOME/.local/share/bsp/jobs && '
                 f'rm -f {rcf} && '
@@ -388,27 +286,9 @@ def submit_ssh_job(
                 f'>/dev/null 2>&1 & echo $! | tee {pidf}'
             )
             _in, _out, _err = ssh.exec_command(launch)
-            # ONE line, with a deadline -- never .read(), and never
-            # recv_exit_status().
-            #
-            # Both of those wait for the channel to reach EOF, and EOF here does
-            # not mean "the pid has been printed". `A && B && nohup setsid ... &`
-            # backgrounds the whole and-list, so a shell sits there waiting for
-            # the workflow with this channel still open on its fd 1 -- confirmed
-            # on a live run: the launcher was 13 minutes old, /proc/<pid>/fd/1
-            # still pointing at the channel pipe. EOF therefore arrives when the
-            # RUN ends, hours later.
-            #
-            # So the generator blocked here forever: it never yielded, never
-            # started the tail, and never parsed a line. The job page showed the
-            # phase frozen at "Submitting via SSH", an empty Slurm Jobs table and
-            # an empty log for the entire run, while the run itself went on
-            # perfectly well. Every run since detached launches were introduced
-            # was affected; the last run with provenance predates them.
-            #
-            # A missed pid is survivable -- the launch shell tees it to $pidf
-            # anyway -- so a timeout here logs and carries on rather than
-            # failing a run that has already started.
+            # Reads one line with a deadline, never .read() or recv_exit_status():
+            # the backgrounded shell keeps the channel open until the run ends.
+            # A missed pid is survivable (it is also written to $pidf).
             pid = ''
             _out.channel.settimeout(_LAUNCH_ACK_TIMEOUT)
             try:
@@ -419,16 +299,12 @@ def submit_ssh_job(
                                safe, _LAUNCH_ACK_TIMEOUT, exc)
             LOGGER.info('Detached run started (pid %s), log %s', pid, log)
 
-        # From here on the workflow IS running on the cluster. Everything after
-        # this point only decides how well we can watch it, so the caller is
-        # told now -- see job_runner.run_ssh_task, which uses this to tell "the
-        # run never started" (a real failure) apart from "we lost sight of a run
-        # that is still going" (not a failure at all).
+        # The workflow is now running; job_runner.run_ssh_task uses this marker to
+        # tell a failed start from a lost view of a running job.
         yield '__LAUNCHED__'
 
-        # Tail from the beginning so a reattach replays everything already
-        # written. -F rather than -f: the log may not exist for a moment after
-        # launch.
+        # Tails from the beginning so a reattach replays everything; -F because
+        # the log may not exist yet.
         tail_cmd = f'tail -n +1 -F {log} 2>/dev/null'
         t_in, t_out, t_err = ssh.exec_command(tail_cmd)
         chan = t_out.channel
@@ -440,29 +316,19 @@ def submit_ssh_job(
             pass
         raise
 
-    # Completion is detected by stat-ing the sentinel over ONE long-lived SFTP
-    # session. The previous version called exec_command() once per poll to `cat`
-    # it -- a new SSH session every second, never closed. sshd's MaxSessions is
-    # 10 by default, so the transport refused new sessions within ~10s, the loop
-    # died, and the generator returned __DETACHED__. job_runner read that as
-    # "stopped watching" and broke out, so streaming ended seconds into every
-    # run: no logs stored, phase frozen at its first value, and no SLURM jobs
-    # ever recorded. Runs before this change stored ~2MB of log; after, zero.
+    # Completion is detected by stat-ing the sentinel over one long-lived SFTP
+    # session, which stays within sshd's MaxSessions limit.
     sftp = None
     try:
         sftp = ssh.open_sftp()
     except Exception as exc:
         LOGGER.warning('Could not open SFTP for completion checks: %s', exc)
 
-    # The run's files are named `$HOME/...` for the shell that writes them. SFTP
-    # has no shell to expand that, so asked for it literally it looks for a
-    # folder called "$HOME" and never finds the sentinel -- the run finishes,
-    # and this loop goes on waiting. SFTP resolves a relative path from the
-    # home directory, which is exactly what `$HOME/` meant.
+    # SFTP does not expand `$HOME`, so the sentinel path is given relative to the home directory.
     rcf_sftp = rcf[len('$HOME/'):] if rcf.startswith('$HOME/') else rcf
 
     def _finished():
-        """Exit code if the run has finished, else None."""
+        """Returns the exit code if the run has finished, else None."""
         if sftp is None:
             return None
         try:
@@ -501,7 +367,7 @@ def submit_ssh_job(
             last_check = now
             got = _finished()
             if got:
-                # Drain whatever the tail has not delivered yet.
+                # Drains whatever the tail has not delivered yet.
                 try:
                     chan.settimeout(1.0)
                     while True:
@@ -520,10 +386,7 @@ def submit_ssh_job(
                     exit_code = 1
                 break
     finally:
-        # ssh is closed here too, unlike everywhere else in this module: this
-        # client is not the pool's (connect(pooled=False) above), so nothing
-        # else can be using it and leaving it open would leak one connection
-        # per run.
+        # This client is not pooled (connect(pooled=False)), so it is closed here.
         for closer in (chan, sftp, ssh):
             try:
                 if closer is not None:
@@ -532,9 +395,8 @@ def submit_ssh_job(
                 pass
 
     if exit_code is None:
-        # The tail ended without a sentinel: the run is still going, we just
-        # stopped watching. Do NOT report an exit code -- that would mark a
-        # live run as finished.
+        # The tail ended without a sentinel: the run is still going, so no exit
+        # code is reported.
         LOGGER.info('Detached from run %s; it continues in the background', safe)
         yield '__DETACHED__'
     else:
@@ -684,15 +546,10 @@ def check_multiple_slurm_jobs(
 
 
 def get_job_genome(log_path: str, connection: SSHConnection) -> str:
-    """Reads a SLURM job's own log file for its "wildcards: genome=<name>"
-    line. Fallback only: job_runner.run_ssh_task now reads this same line
-    directly from the live orchestrator stream (Snakemake's --verbose
-    output, see WILDCARDS_GENOME_RE), since this remote file gets cleaned
-    up shortly after the job finishes and isn't always still around by the
-    time _slurm_status_checker's polling loop gets to it. Returns "" if the
-    file doesn't exist (already cleaned up, or job hasn't started) or has
-    no genome wildcard (e.g. quast_batch/gtdbtk_batch, which process every
-    genome at once).
+    """Reads a SLURM job's log for its "wildcards: genome=<name>" line.
+
+    Fallback for job_runner's live parsing; the file may already be cleaned up.
+    Returns "" if the file is missing or has no genome wildcard (batch rules).
     """
     ssh = connection.connect()
     stdin, stdout, stderr = ssh.exec_command(
@@ -709,19 +566,11 @@ def find_active_jobs_in_workdir(
     username: str,
     connection: SSHConnection,
 ) -> list[dict]:
-    """Lists this user's SLURM jobs (RUNNING or PENDING) whose working
-    directory matches work_dir exactly (trailing-slash-normalized on both
-    sides).
+    """Lists this user's RUNNING or PENDING SLURM jobs whose working directory
+    matches work_dir (trailing slashes normalised).
 
-    Used to check whether a job that looks "running"/"pending" in
-    persisted history (because dane-api restarted and lost live track of
-    it) is actually still active on the cluster -- work_dir is set once
-    at job creation and never changes, and squeue's WorkDir column
-    reflects the directory a job's driver process was launched from.
-
-    Returns a list of {"job_id": ..., "state": ..., "time": ...} dicts --
-    usually 0 or 1 entries; empty means nothing currently active matches
-    this work_dir.
+    Used to check whether a job that looks active in history is still on the
+    cluster. Returns a list of {"job_id": ..., "state": ..., "time": ...} dicts.
     """
     ssh = connection.connect()
     stdin, stdout, stderr = ssh.exec_command(
@@ -750,9 +599,8 @@ def enrich_slurm_jobs_from_logs(
     matches: list[dict],
     connection: SSHConnection,
 ) -> list[dict]:
-    """Adds 'rule' and 'genome' to each match dict from find_active_jobs_in_workdir
-    by scanning snakemake's slurm_logs directory. Single SSH call regardless of
-    how many jobs. No-op if matches is empty."""
+    """Adds 'rule' and 'genome' to each match from find_active_jobs_in_workdir by
+    scanning snakemake's slurm_logs directory in one SSH call. No-op if matches is empty."""
     if not matches:
         return matches
 
@@ -800,9 +648,8 @@ def read_latest_snakemake_log(
     connection: SSHConnection,
     tail_lines: int = 300,
 ) -> str:
-    """Returns the tail of the most recent Snakemake master log from
-    {work_dir}/.snakemake/log/. Used as a fallback when the API restarted
-    and the in-memory log buffer was lost. Returns "" if no log is found."""
+    """Returns the tail of the newest Snakemake log in {work_dir}/.snakemake/log/,
+    a fallback when the in-memory log was lost. Returns "" if none is found."""
     log_glob = shlex.quote(f"{work_dir}/.snakemake/log")
     cmd = (
         f"latest=$(ls -t {log_glob}/*.log 2>/dev/null | head -1); "

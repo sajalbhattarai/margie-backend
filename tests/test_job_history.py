@@ -1,10 +1,6 @@
 """
-Unit tests for bioinformatics_tools.api.services.job_history.
-
-This module runs directly on the cluster account against a real SQLite
-file (see its own module docstring) -- so these tests use a real (temp)
-SQLite database rather than mocking sqlite3, unlike the SSH-exec-based
-utility tests elsewhere in this suite.
+Unit tests for bioinformatics_tools.api.services.job_history, run against a
+real temporary SQLite database rather than a mocked sqlite3.
 """
 import sqlite3
 
@@ -30,10 +26,7 @@ class TestEnsureTableMigration:
         assert "relaunched_from" in cols
 
     def test_pre_existing_old_schema_table_gets_migrated(self, tmp_path):
-        """A table created before selected_tools/relaunched_from existed
-        must gain both columns via ALTER TABLE, without losing existing
-        rows -- CREATE TABLE IF NOT EXISTS alone wouldn't touch an
-        already-existing table's schema at all."""
+        """Checks that an older table gains the new columns via ALTER TABLE and keeps its rows."""
         db_path = str(tmp_path / "old.db")
         conn = sqlite3.connect(db_path)
         conn.execute("""
@@ -70,8 +63,7 @@ class TestEnsureTableMigration:
         assert row["selected_tools"] is None
 
     def test_ensure_table_idempotent(self, tmp_path):
-        """Calling ensure_table twice (e.g. on every record_job_created
-        call, as it already is) must not error on the second pass."""
+        """Checks that calling ensure_table twice does not fail."""
         db_path = str(tmp_path / "twice.db")
         job_history.ensure_table(db_path)
         job_history.ensure_table(db_path)
@@ -102,11 +94,8 @@ class TestRecordJobCreatedRoundTrip:
 
 
 class TestFinalSnapshotPersistence:
-    """logs/slurm_jobs/containers: job_store.finalize()'s one-time snapshot,
-    routed through record_job_updated -- slurm_jobs/containers must
-    round-trip as real Python lists, not JSON-encoded strings, since
-    job_history.py decodes them before returning (so the SSH/JSON
-    transport layer sees proper nested arrays, not double-encoded text)."""
+    """Tests the logs/slurm_jobs/containers snapshot written by job_store.finalize(),
+    which must round-trip as Python lists rather than JSON-encoded strings."""
 
     def test_logs_slurm_jobs_containers_round_trip_as_real_lists(self, tmp_path):
         db_path = str(tmp_path / "snapshot.db")
@@ -127,9 +116,7 @@ class TestFinalSnapshotPersistence:
         assert row["containers"] == [{"name": "quast", "version": "5.0"}]
 
     def test_list_jobs_leaves_out_snapshot_fields_get_job_keeps_them(self, tmp_path):
-        """A list carries neither a run's SLURM jobs nor its containers (nor
-        more than the end of its log): they made a 50-run list megabytes.
-        They decode to [] there, and get_job still has them."""
+        """Checks that list_jobs omits the snapshot lists and trims the log, while get_job keeps them."""
         db_path = str(tmp_path / "snapshot_list.db")
         job_history.record_job_created(
             db_path, "job-4", "margie_sb", "/genomes/e.fasta", "/out/2026-06-21-1200",
@@ -144,9 +131,7 @@ class TestFinalSnapshotPersistence:
         assert row["slurm_jobs"] == snapshot and len(row["logs"]) == 20007
 
     def test_no_snapshot_yet_decodes_to_empty_list(self, tmp_path):
-        """A job that hasn't reached finalize() yet (still running, or
-        created before this feature existed) has NULL slurm_jobs/
-        containers columns -- must decode to [], not crash on json.loads(None)."""
+        """Checks that NULL slurm_jobs/containers columns decode to []."""
         db_path = str(tmp_path / "no_snapshot.db")
         job_history.record_job_created(
             db_path, "job-5", "margie_sb", "/genomes/e.fasta", "/out/2026-06-21-1200",

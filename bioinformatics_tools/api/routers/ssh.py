@@ -45,9 +45,8 @@ LOGGER = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/ssh", tags=["ssh"])
 
-# compute.cluster_default.* defaults, taken straight from the registry that also
-# builds the default config.yaml and renders the Profile form -- one source of
-# truth for what a setting means when the file does not mention it.
+# compute.cluster_default.* defaults from the registry that also builds the
+# default config.yaml and the Profile form.
 _CLUSTER_DEFAULTS: dict[str, object] = {
     p['param'].split('.')[-1]: p.get('default')
     for p in REQUIRED_SYSTEM_PARAMS
@@ -56,17 +55,10 @@ _CLUSTER_DEFAULTS: dict[str, object] = {
 
 
 def _cluster_default(user_config: dict, key: str) -> str | None:
-    """Read compute.cluster_default.<key>, falling back to the registry default.
+    """Reads compute.cluster_default.<key>, falling back to the registry default.
 
-    A config.yaml written before <key> was introduced simply does not contain
-    it. Reading that absence as "unset" pins every existing install to whatever
-    hardcoded constant sits behind the call site, which is how installs kept
-    getting a 7-day driver walltime after driver_walltime was added -- the new
-    setting only reached anyone who happened to re-save their Profile.
-
-    Falling back to the registry instead means a newly added setting takes
-    effect on upgrade with no file surgery, while any value the user has
-    actually written still wins.
+    A key missing from an older config.yaml takes the registry default; a value
+    the user has written always wins.
     """
     value = (user_config.get('compute', {})
                         .get('cluster_default', {})
@@ -81,27 +73,19 @@ def _cluster_default(user_config: dict, key: str) -> str | None:
 # Workflows visible on the frontend but not yet implemented.
 STUB_WORKFLOWS: set[str] = {"custom_microbiome"}
 
-# (job_id, path) -> (mtime, size, total_lines). Wiped on API restart, same
-# as job_store's in-memory state. Avoids re-running wc -l (a full file
-# scan) on every page click for a file whose content hasn't changed --
-# output files don't change once a job completes.
+# (job_id, path) -> (mtime, size, total_lines); saves a wc -l per page view of
+# an unchanged output file. Cleared on API restart.
 _line_count_cache: dict[tuple[str, str], tuple[float, int, int]] = {}
 
 
 def _validate_relative_path(path: str, *, label: str = "file") -> None:
-    """Raise HTTPException(400) if path attempts directory traversal.
-
-    Shared by job_files (subdir), download_file (path), and view_file
-    (path) -- all three take a user-supplied relative path under a job's
-    work_dir.
-    """
+    """Raises HTTPException(400) if a user-supplied path under a job's work_dir attempts traversal."""
     if path and (path.startswith("/") or ".." in path.split("/")):
         raise HTTPException(status_code=400, detail=f"Invalid {label} path")
 
 
 def _cfg_get(cfg: dict, key: str, default=None):
-    """Get a nested config value using dot notation, returning default if any
-    segment is missing."""
+    """Returns a nested config value by dot-notation key, or default if any segment is missing."""
     value = cfg
     for part in key.split('.'):
         if isinstance(value, dict) and part in value:
@@ -112,7 +96,7 @@ def _cfg_get(cfg: dict, key: str, default=None):
 
 
 def _cfg_set(cfg: dict, key: str, value) -> None:
-    """Set a nested config value using dot notation, creating parents."""
+    """Sets a nested config value by dot-notation key, creating parents."""
     parts = key.split('.')
     target = cfg
     for part in parts[:-1]:
@@ -141,19 +125,19 @@ def _expand_remote_home(path: str, home_dir: str) -> str:
 
 
 def _is_user_scoped_db(path: str, username: str) -> bool:
-    """Legacy heuristic: DB/path basename starts with username- prefix."""
+    """Returns True when the path basename starts with the '<username>-' prefix (pre-marker paths)."""
     return posixpath.basename(path).startswith(f"{username}-")
 
 
 def _owner_marker_path(path: str, *, is_dir: bool) -> str:
-    """Companion marker path storing ownership/provenance metadata."""
+    """Returns the companion marker path that stores ownership metadata."""
     if is_dir:
         return f"{path.rstrip('/')}/.margie-owner.json"
     return f"{path}.margie-owner.json"
 
 
 def _read_owner_marker(conn, path: str, *, is_dir: bool) -> dict | None:
-    """Read ownership marker JSON for a path, if it exists and is valid."""
+    """Reads a path's ownership marker JSON, or None if absent or invalid."""
     marker = _owner_marker_path(path, is_dir=is_dir)
     cmd = f"if [ -f {shlex.quote(marker)} ]; then cat {shlex.quote(marker)}; fi"
     exit_code, output = _run_remote_check(conn, cmd)
@@ -169,7 +153,7 @@ def _read_owner_marker(conn, path: str, *, is_dir: bool) -> dict | None:
 
 def _write_owner_marker(current_user: dict, conn, path: str, *, is_dir: bool,
                         source_path: str | None = None) -> None:
-    """Write ownership marker for a user-scoped promoted path."""
+    """Writes the ownership marker for a user-scoped promoted path."""
     marker = _owner_marker_path(path, is_dir=is_dir)
     payload = {
         "scope": "user",
@@ -188,13 +172,9 @@ def _write_owner_marker(current_user: dict, conn, path: str, *, is_dir: bool,
 
 
 def _classify_path_scope(current_user: dict, conn, path: str, *, is_dir: bool) -> str:
-    """Classify path as user/shared using marker-first logic.
+    """Classifies a path as 'user' (owned by this user) or 'shared', marker first.
 
-    Returns one of:
-    - 'user'   : explicitly owned by current user
-    - 'shared' : no marker and no user prefix
-
-    Raises HTTPException if marker exists but belongs to a different user.
+    Raises HTTPException if the marker belongs to a different user.
     """
     marker = _read_owner_marker(conn, path, is_dir=is_dir)
     if marker is not None:
@@ -211,8 +191,8 @@ def _classify_path_scope(current_user: dict, conn, path: str, *, is_dir: bool) -
                 ),
             )
 
-    # Backward-compatible fallback for pre-marker paths. The cluster username
-    # too: the scratch stores (services/user_stores.py) are named after it.
+    # Fallback for pre-marker paths; the cluster username also counts, since the
+    # scratch stores (services/user_stores.py) are named after it.
     if _is_user_scoped_db(path, current_user["username"]):
         return "user"
     cluster_user = current_user.get("cluster_username") or ""
@@ -220,7 +200,7 @@ def _classify_path_scope(current_user: dict, conn, path: str, *, is_dir: bool) -
 
 
 def _versioned_user_db_path(template_db: str, username: str, version: int) -> str:
-    """Build '<dir>/<username>-<stem>-vN<ext>' from a shared template DB path."""
+    """Builds '<dir>/<username>-<stem>-vN<ext>' from a shared template DB path."""
     directory = posixpath.dirname(template_db)
     filename = posixpath.basename(template_db)
     stem, ext = posixpath.splitext(filename)
@@ -229,7 +209,7 @@ def _versioned_user_db_path(template_db: str, username: str, version: int) -> st
 
 
 def _versioned_user_dir_path(template_dir: str, username: str, version: int) -> str:
-    """Build '<dir>/<username>-<name>-vN' from a shared directory path."""
+    """Builds '<dir>/<username>-<name>-vN' from a shared directory path."""
     parent = posixpath.dirname(template_dir.rstrip('/'))
     name = posixpath.basename(template_dir.rstrip('/'))
     target_name = f"{username}-{name}-v{version}"
@@ -237,7 +217,7 @@ def _versioned_user_dir_path(template_dir: str, username: str, version: int) -> 
 
 
 def _find_existing_user_db_versions(conn, template_db: str, username: str) -> list[int]:
-    """List existing version numbers for username-prefixed copies of template_db."""
+    """Lists version numbers of username-prefixed copies of template_db."""
     directory = posixpath.dirname(template_db)
     if not directory:
         directory = "."
@@ -268,7 +248,7 @@ def _find_existing_user_db_versions(conn, template_db: str, username: str) -> li
 
 
 def _find_existing_user_dir_versions(conn, template_dir: str, username: str) -> list[int]:
-    """List existing version numbers for username-prefixed copies of a directory."""
+    """Lists version numbers of username-prefixed copies of a directory."""
     parent = posixpath.dirname(template_dir.rstrip('/'))
     if not parent:
         parent = "."
@@ -296,12 +276,12 @@ def _find_existing_user_dir_versions(conn, template_dir: str, username: str) -> 
 
 
 def _promote_shared_file_to_user_file(current_user: dict, conn, raw_path: str) -> tuple[str, bool]:
-    """Resolve a writable per-user file path, copying shared template on first use."""
+    """Resolves a writable per-user file path, copying the shared template on first use."""
     expanded = _expand_remote_home(raw_path, current_user["home_dir"])
     username = current_user["username"]
 
     if _classify_path_scope(current_user, conn, expanded, is_dir=False) == "user":
-        # Upgrade legacy user-prefixed paths by backfilling marker metadata.
+        # Backfills marker metadata for user-prefixed paths that predate markers.
         if _read_owner_marker(conn, expanded, is_dir=False) is None:
             _write_owner_marker(current_user, conn, expanded, is_dir=False)
         return expanded, False
@@ -341,7 +321,7 @@ def _promote_shared_file_to_user_file(current_user: dict, conn, raw_path: str) -
 
 
 def _promote_shared_dir_to_user_dir(current_user: dict, conn, raw_path: str) -> tuple[str, bool]:
-    """Resolve a writable per-user directory path, creating versioned copy dir on first use."""
+    """Resolves a writable per-user directory path, creating a versioned copy on first use."""
     expanded = _expand_remote_home(raw_path, current_user["home_dir"])
     username = current_user["username"]
 
@@ -378,14 +358,12 @@ def _promote_shared_dir_to_user_dir(current_user: dict, conn, raw_path: str) -> 
 
 
 def _promote_shared_main_db_to_user_db(current_user: dict, user_config: dict, conn) -> tuple[str, bool]:
-    """Resolve a writable per-user main_database path.
+    """Resolves a writable per-user main_database path.
 
-    If main_database already points to a username-prefixed file, keep it.
-    Otherwise treat it as a shared template and switch to a user-specific
-    versioned copy alongside it (reuse highest existing version if present,
-    else create v1 by copying the template).
+    A username-prefixed path is kept; otherwise the path is treated as a shared
+    template and replaced by the highest existing user copy, or a new v1.
 
-    Returns: (resolved_main_db_path, config_changed)
+    Returns (resolved_main_db_path, config_changed).
     """
     raw = user_config.get("main_database")
     if not raw or str(raw).strip() == "":
@@ -401,7 +379,7 @@ def _promote_shared_main_db_to_user_db(current_user: dict, user_config: dict, co
             _write_owner_marker(current_user, conn, expanded, is_dir=False)
         return expanded, False
 
-    # Shared template mode: switch to user-specific path in same directory.
+    # Shared template: switches to a user-specific path in the same directory.
     try:
         ssh_sftp.check_remote_file(expanded, connection=conn)
     except Exception as exc:
@@ -439,11 +417,7 @@ def _promote_shared_main_db_to_user_db(current_user: dict, user_config: dict, co
 
 
 def _resolve_effective_main_db(current_user: dict, conn, user_config: dict, *, persist: bool) -> str:
-    """Resolve main_database and optionally persist config updates.
-
-    During workflow launches we persist the promoted user-scoped DB path so
-    subsequent runs keep using it by default.
-    """
+    """Resolves main_database, optionally persisting the promoted per-user path to the config."""
     main_db, changed = _promote_shared_main_db_to_user_db(current_user, user_config, conn)
     if changed and persist:
         ssh_sftp.write_remote_yaml(_config_path(current_user["home_dir"]), user_config, connection=conn)
@@ -478,10 +452,9 @@ def _assert_remote_writable(conn, path: str, *, label: str, treat_as_file: bool 
 
 
 def _validate_margie_sb_shared_paths(user_config: dict, conn, home_dir: str) -> None:
-    """Fail early if MARGIE_SB shared storage paths are not writable.
+    """Fails early if the MARGIE_SB shared storage paths are not writable.
 
-    New namespaced keys are preferred; legacy top-level keys remain supported
-    as fallback for older configs.
+    Namespaced keys are preferred; top-level keys are still read as a fallback.
     """
     writable_paths = [
         (
@@ -535,8 +508,7 @@ def _validate_margie_sb_shared_paths(user_config: dict, conn, home_dir: str) -> 
     ]
 
     for raw_path, key_name, treat_as_file in writable_paths:
-        # Unset means nothing to check: the scratch stores (user_stores) set
-        # every one before a run; there is no depot fallback to fill in.
+        # Unset means nothing to check: user_stores sets every store before a run.
         if not raw_path:
             continue
         expanded = _expand_remote_home(str(raw_path), home_dir)
@@ -544,14 +516,9 @@ def _validate_margie_sb_shared_paths(user_config: dict, conn, home_dir: str) -> 
 
 
 def _resolve_job_work_dir(job_id: str, current_user: dict, conn) -> str:
-    """Resolves a job's work_dir, falling back to persistent history if the
-    job isn't in the in-memory job_store (e.g. after a dane-api restart) --
-    the same fallback get_job_status already uses, applied here so file
-    browsing/download/view work for resumed/historical jobs too, not just
-    job_status itself.
+    """Resolves a job's work_dir from job_store, falling back to persistent history.
 
-    Raises HTTPException(404) if the job can't be found anywhere (live or
-    history), or HTTPException(400) if found but has no work_dir yet.
+    Raises HTTPException(404) if the job is unknown, or 400 if it has no work_dir yet.
     """
     job = job_store.get(job_id)
     if job is not None:
@@ -626,11 +593,9 @@ _TIER_FONT_COLORS: dict[str, str] = {
 }
 
 
-# ── FINAL publication file coloring — MATCHES the operon-diagram FIGURES
-#    (reportfig_lib.CONF_TIER_COLOR). Every row is tinted edge to edge with its
-#    CONFIDENCE_TIER_HYBRID tier colour so the sheet is scannable; review rows
-#    additionally get a box border. Kept in sync with
-#    workflow_tools/fingerprint/make-final-excel.py. ───────────────────────────
+# FINAL publication file colouring: each row is tinted with its
+# CONFIDENCE_TIER_HYBRID colour, as in the operon figures (reportfig_lib) and
+# workflow_tools/fingerprint/make-final-excel.py; review rows get a border.
 _TIER_BRIGHT = {
     "highest": "1F77FF",   # blue
     "high":    "00B84D",   # green
@@ -652,9 +617,8 @@ def _tint_hex(h: str, toward_white: float = 0.86) -> str:
 
 
 def _norm_col(name: str) -> str:
-    # FINAL_ANNOTATION_WITH_CONFIDENCE supports prefixed headers like:
-    #   "[AN]-NEEDS_REVIEW?"  (legacy)
-    #   "Column-AN: NEEDS_REVIEW?"  (current)
+    # FINAL_ANNOTATION_WITH_CONFIDENCE headers may be prefixed, e.g.
+    # "[AN]-NEEDS_REVIEW?" or "Column-AN: NEEDS_REVIEW?".
     return re.sub(r"^(?:\[[A-Z]+\]-|Column-[A-Z]+:\s*)", "", str(name or "").strip(), flags=re.IGNORECASE).strip().lower()
 
 
@@ -679,10 +643,8 @@ _REVIEW_SIDE = Side(style="medium", color="000000")  # box border on review rows
 
 
 def _row_tint(row: pd.Series) -> tuple[str, str]:
-    """(bg, fg) whole-row colour = the row's CONFIDENCE_TIER_HYBRID tier colour,
-    tinted and applied across the entire row (matches make-final-excel.py). Rows
-    with no scored tier -- empty or NOT_APPLICABLE_NON_CODING (rna / prophage) --
-    get grey. This is the only colouring; no accents."""
+    """Returns the (bg, fg) row colour: the tinted CONFIDENCE_TIER_HYBRID colour,
+    or grey for rows with no scored tier (empty or NOT_APPLICABLE_NON_CODING)."""
     tier = str(_series_get(row, "confidence_tier_hybrid", "CONFIDENCE_TIER_hybrid")).strip().lower()
     if tier not in _TIER_BRIGHT:
         return _ROW_NONCODING_TINT, _ROW_NONCODING_FG
@@ -690,9 +652,7 @@ def _row_tint(row: pd.Series) -> tuple[str, str]:
 
 
 def _apply_review_flag_colors(ws, df: pd.DataFrame) -> None:
-    """Colour each data row edge to edge with its CONFIDENCE_TIER_HYBRID tier
-    colour; rows flagged NEEDS_REVIEW? = yes get a box border around the whole
-    row. Matches make-final-excel.py (no per-cell accents)."""
+    """Tints each data row with its tier colour and boxes rows flagged NEEDS_REVIEW? = yes."""
     n_cols = len(df.columns)
     for offset, (_, row) in enumerate(df.iterrows()):
         r = offset + 2  # row 1 is the header
@@ -712,9 +672,8 @@ def _apply_review_flag_colors(ws, df: pd.DataFrame) -> None:
 
 
 def _apply_tier_row_colors(ws, df: pd.DataFrame) -> None:
-    """Color each data row. For the FINAL publication file (which carries the
-    two-stage confidence columns) use review-flag coloring; otherwise fall
-    back to per-tier row coloring when a tier column exists."""
+    """Colours data rows: review-flag colouring for the FINAL file, else per-tier
+    colouring when a tier column exists."""
     if _has_any_column(df, "final_confidence_operon_context", "ADJUSTED_CONFIDENCE_WITH_OPERON_CONTEXT"):
         _apply_review_flag_colors(ws, df)
         return
@@ -741,11 +700,9 @@ def _apply_tier_row_colors(ws, df: pd.DataFrame) -> None:
 
 
 def _detect_delimiter(path: str, header: str) -> str:
-    """Pick a column delimiter: by extension first, else sniff the header.
+    """Picks a column delimiter from the extension, else by sniffing the header.
 
-    Naive -- no RFC4180 quote-handling. Every sampled real output file is
-    quote-free TSV; a CSV with delimiters embedded in quoted fields would
-    misparse. Acceptable v1 limitation, not silently papered over.
+    Quoted fields containing delimiters are not handled.
     """
     lower = path.lower()
     if lower.endswith(".csv"):
@@ -774,12 +731,9 @@ def _get_available_workflows(cluster_username: str | None = None) -> list[dict]:
         wf_dict['id'] = wf_key.cmd_identifier
         wf_dict['containers'] = [{'name': sif[0], 'version': sif[1]} for sif in wf_key.sif_files]
 
-        # Merges system-wide required params, this workflow's own root-path settings,
-        # and the workflow's other params. System params come first since they're
-        # infra-level. input_path/output_path apply to every workflow; sif_path and
-        # db_root are only included when this workflow actually has a local-folder
-        # sif lookup / a unified db_root fallback to point at (see
-        # workflow_path_params()'s docstring for why that distinction matters).
+        # Merges system-wide params, this workflow's root-path params and its own
+        # params, in that order. sif_path and db_root appear only when the workflow
+        # uses them (see workflow_path_params()).
         path_params = workflow_path_params(
             wf_id,
             include_sif=wf_key.local_sif_only,
@@ -886,12 +840,10 @@ def _ordered_workflow_params(workflow_id: str, params: list[dict]) -> list[dict]
 
 
 def _default_params_for_workflow(workflow_id: str, workflow) -> list[dict]:
-    """Return the per-workflow params that should be materialized in a
-    default config payload.
+    """Returns the per-workflow params to materialise in a default config.
 
-    Keeps this aligned with /workflows metadata shown in Profile: root-path
-    params are injected based on workflow capabilities, then merged with the
-    workflow's own configurable params.
+    Matches the /workflows metadata shown in Profile: root-path params by
+    workflow capability, merged with the workflow's own params.
     """
     path_params = workflow_path_params(
         workflow_id,
@@ -901,7 +853,7 @@ def _default_params_for_workflow(workflow_id: str, workflow) -> list[dict]:
     )
     combined = path_params + (workflow.configurable_params or [])
 
-    # De-duplicate by key while preserving first-seen order.
+    # De-duplicates by key, keeping first-seen order.
     seen: set[str] = set()
     unique: list[dict] = []
     for param in combined:
@@ -914,12 +866,10 @@ def _default_params_for_workflow(workflow_id: str, workflow) -> list[dict]:
 
 
 def _build_default_config_payload(cluster_username: str | None = None) -> dict:
-    """Build the default config.yaml contents.
+    """Builds the default config.yaml contents.
 
-    cluster_username scopes the writable accumulating stores (OCC reference,
-    fingerprint databases, genome pool, historical archive) to this user --
-    see workflow_registry.resolve_user_paths. Passing None keeps the legacy
-    shared paths, which is only correct for callers with no user context.
+    cluster_username scopes the writable stores to this user (see
+    workflow_registry.resolve_user_paths); None keeps the shared paths.
     """
     config: dict = {
         'main_database': '~/.local/share/bioinformatics-tools/my-db.db',
@@ -941,10 +891,8 @@ def _build_default_config_payload(cluster_username: str | None = None) -> dict:
         for param in resolve_user_paths(_ordered_workflow_params(workflow_id, params), cluster_username):
             parts = param['param'].split('.')
 
-            # Params are usually namespaced (e.g. "margie_sb.sif_path").
-            # Strip that prefix so values live under one workflow block:
-            # margie_sb:
-            #   sif_path: ...
+            # Namespaced params ("margie_sb.sif_path") are stored under one
+            # workflow block, e.g. margie_sb: {sif_path: ...}.
             if parts and parts[0] == workflow_id:
                 parts = parts[1:]
             if not parts:
@@ -966,12 +914,7 @@ def _build_default_config_text(config: dict) -> str:
 
 @router.get("/workflows")
 def list_workflows(current_user: dict = Depends(get_current_user)):
-    """Return the list of user-facing workflows with detailed metadata.
-
-    Path defaults are resolved for THIS user, so the Profile form offers
-    /depot/.../users/<their account>/... rather than a shared path they would
-    otherwise write into alongside everyone else.
-    """
+    """Returns the user-facing workflows with metadata, path defaults resolved for this user."""
     return _get_available_workflows(current_user.get("cluster_username"))
 
 
@@ -983,27 +926,18 @@ def health_check():
 
 @router.get("/status")
 def ssh_status(current_user: dict = Depends(get_current_user)):
-    """Check whether the BSP server can reach the user's cluster via SSH.
+    """Checks whether the server can reach the user's cluster over SSH.
 
-    Returns 200 either way -- the UI polls this and a red banner is a better
-    answer than a failed request. But it now reports WHY, and whether the user
-    can do anything about it. Previously every failure collapsed to
-    {"connected": false} with the reason visible only in the server log, so an
-    undecryptable stored key was indistinguishable from an unreachable cluster.
-    That cost real debugging time: the backend knew exactly what was wrong and
-    said so in its log while the UI just showed "no connection".
+    Always returns 200, with the reason for a failure and whether the user can fix it.
     """
     try:
         conn = _build_connection(current_user)
         ssh = conn.connect()
-        # Do NOT close it: the client is pooled and shared across requests.
+        # Not closed: the client is pooled and shared across requests.
         return {"connected": True, "host": current_user["cluster_host"]}
     except HTTPException as exc:
-        # _build_connection -> decrypt_private_key raises this when the stored
-        # key cannot be decrypted, which happens when BSP_ENCRYPTION_KEY has been
-        # regenerated since the account was created. Fernet is authenticated
-        # encryption, so the key material is unrecoverable -- re-registering is
-        # the only fix, and the user needs telling that plainly.
+        # Raised when the stored key cannot be decrypted (BSP_ENCRYPTION_KEY was
+        # regenerated); the key is unrecoverable, so the user must re-register.
         detail = str(getattr(exc, "detail", exc))
         undecryptable = "decrypt" in detail.lower()
         LOGGER.warning("SSH status check failed for user %s: %s",
@@ -1150,12 +1084,8 @@ def run_ssh(content: SlurmSend, current_user: dict = Depends(get_current_user)):
 
 
 def _check_genome_path_exists(genome_path: str, workflow: str, conn) -> None:
-    """Raise HTTPException(400) if genome_path doesn't exist on the cluster,
-    or (for batch-input workflows) the folder has no recognized genome file.
-
-    Shared by run_workflow (fresh submissions) and resume_job/restart_job
-    (re-validating a previously-known-good path, since the remote file
-    could have been deleted or moved since the original run)."""
+    """Raises HTTPException(400) if genome_path is missing on the cluster, or a
+    batch-input folder holds no recognised genome file. Used for new runs and relaunches."""
     wf_key = WORKFLOWS.get(workflow)
     supports_batch_input = bool(wf_key and wf_key.supports_batch_input)
     try:
@@ -1205,22 +1135,15 @@ def _launch_job(
     copy_from_work_dir: str | None = None,
     run_full_operon_map: bool = False,
 ) -> dict:
-    """Shared job-launch sequence: generate job_id/timestamp/output_dir,
-    optionally copy a previous run's output_dir into the new one first
-    (Resume), persist to job_store, build the dane_wf command (adding
-    margie_sb.resume: true when copy_from_work_dir is set, so Snakemake's
-    mtime-only rerun triggers recognize the copied-forward outputs as
-    already done -- see workflow_tools/workflow.py's build_executable), and
-    submit.
+    """Generates job_id and output_dir, optionally copies a previous run's output
+    forward (Resume, with margie_sb.resume: true), records the job and submits dane_wf.
 
-    Does NOT do workflow-id/stub/config/genome-path pre-flight validation --
-    callers (run_workflow, resume_job, restart_job) each do whatever subset
-    of that is appropriate for their entry point before calling this.
+    Pre-flight validation is left to the callers.
     """
     selected_tools_csv = ",".join(selected_tools) if selected_tools is not None else None
     selected_tools_arg = f" {workflow}.selected_tools: {selected_tools_csv}" if selected_tools_csv else ""
-    # Opt-in full-genome operon atlas: top-level flag the smk gate reads
-    # (rc_bool('run_full_operon_map', False)). Runs downstream of the report figures.
+    # Opt-in full-genome operon atlas; the smk reads the top-level
+    # run_full_operon_map flag and runs it after the report figures.
     full_operon_map_arg = " run_full_operon_map: true" if run_full_operon_map else ""
 
     job_id = str(uuid.uuid4())
@@ -1232,9 +1155,7 @@ def _launch_job(
         try:
             ssh_sftp.rewrite_path_references(output_dir, copy_from_work_dir, output_dir, connection=conn)
         except Exception as exc:
-            # Cosmetic cleanup only (confirmed: nothing downstream reads the
-            # stale provenance columns this fixes up) -- never let a failure
-            # here block the resumed job from launching.
+            # Cosmetic provenance cleanup; a failure never blocks the launch.
             LOGGER.warning("Could not rewrite stale path references for resumed job: %s", exc)
 
     job_store.create(
@@ -1247,17 +1168,13 @@ def _launch_job(
     )
     job_store.update(job_id, work_dir=output_dir)
 
-    # The CLI dispatcher (caragols) matches do_<a>_<b> against the SEPARATE
-    # tokens "<a> <b>", not the underscore-joined string -- e.g. do_margie_sb
-    # is invoked as "margie sb", not "margie_sb". workflow itself (and every
-    # config key built from it, e.g. selected_tools_arg/resume_arg) stays
-    # underscore-joined, matching the registry's cmd_identifier.
+    # caragols matches do_<a>_<b> against the separate tokens "<a> <b>", so
+    # do_margie_sb is invoked as "margie sb"; config keys stay underscore-joined.
     dispatch_tokens = workflow.replace('_', ' ')
     resume_arg = f" {workflow}.resume: true" if copy_from_work_dir else ""
-    # Licensing: acceptance was verified in run_workflow (server-side). Pass it
-    # (and the user's entitlement) to the CLI so its own gate does not re-prompt
-    # this non-interactive run, and so it disables the same tools the user isn't
-    # licensed for. See workflow_tools/license_gate.py.
+    # Licence acceptance was verified in run_workflow; it and the user's entitlement
+    # pass to the CLI so its gate does not re-prompt and disables the same tools
+    # (see workflow_tools/license_gate.py).
     from bioinformatics_tools.api import licensing
     _lic_ent = licensing.get_entitlement(current_user["username"])
     _lic_csv = ",".join(_lic_ent.get("licensed_tools") or [])
@@ -1266,20 +1183,10 @@ def _launch_job(
         f"MARGIE_USAGE_TYPE='{_lic_ent.get('usage_type') or ''}' "
         f"MARGIE_LICENSED_TOOLS='{_lic_csv}' "
     )
-    # Invokes dane_wf directly from ~/bioinformatics-tools/.venv (an editable
-    # install -- code changes there are picked up instantly, no reinstall
-    # needed) rather than through `uvx --from`. uvx re-resolves/caches the
-    # local package on its own schedule, independent of whether
-    # ~/bioinformatics-tools (see _ensure_remote_deployment_symlink in
-    # api/main.py) actually points at fresh code -- confirmed adding 3+
-    # minutes per run and still serving a stale build without --refresh.
-    # The venv binary has neither problem: ~0.4s overhead, always current.
-    # Cheap best-effort check (a git fetch + SHA compare) so an already-
-    # provisioned account picks up a new margie_sb deployment without the user
-    # having to do anything -- never blocks the launch, see sync_remote_dane_wf's
-    # docstring. margie is wintermutant's own workflow; deliberately left alone
-    # here so it keeps doing whatever it already does on his deployment, with
-    # no forced branch/ref applied to it by this team's tooling.
+    # Runs dane_wf from the editable install in ~/bioinformatics-tools/.venv rather
+    # than `uvx --from`, which re-resolves slowly and can serve a stale build.
+    # A best-effort git fetch + SHA check first picks up a new margie_sb
+    # deployment (see sync_remote_dane_wf); the margie workflow is left as is.
     if workflow == 'margie_sb':
         try:
             sync_remote_dane_wf(conn)
@@ -1302,10 +1209,7 @@ def _launch_job(
     return {"success": True, "job_id": job_id, "output_dir": output_dir, "message": "Job submitted successfully"}
 
 
-# ---------------------------------------------------------------------------
-# Each user's databases on scratch, and their backups on depot
-# (services/user_stores.py).
-# ---------------------------------------------------------------------------
+# ---- Per-user databases on scratch and their depot backups (services/user_stores.py) ----
 
 STORES_NOT_READY = "stores-not-ready"
 
@@ -1325,17 +1229,16 @@ def _stores_call(fn, *args):
 
 
 def _stores_settle(current_user: dict, conn, user_config: dict) -> None:
-    """Record a copy that has finished, and save the config if it now points elsewhere."""
+    """Records a finished copy, and saves the config if it now points elsewhere."""
     user = current_user["cluster_username"]
     if _stores_call(user_stores.apply_finished, conn, user_config, user):
         ssh_sftp.write_remote_yaml(_config_path(current_user["home_dir"]), user_config, connection=conn)
 
 
 def _margie_sb_stores_ready(current_user: dict, conn, user_config: dict) -> str:
-    """The job database a margie_sb run uses, once every store is on scratch.
+    """Returns the job database for a margie_sb run once every store is on scratch.
 
-    409 with a detail starting "stores-not-ready" when they are not (the page
-    then offers the first-run setup), or while a copy is under way."""
+    Raises 409 "stores-not-ready..." when they are not, or while a copy is under way."""
     user = current_user["cluster_username"]
     _stores_settle(current_user, conn, user_config)
     st = _stores_call(user_stores.status, conn, user_config, user)
@@ -1350,7 +1253,7 @@ def _margie_sb_stores_ready(current_user: dict, conn, user_config: dict) -> str:
 
 
 def _active_run(current_user: dict, conn, user_config: dict) -> bool:
-    """Whether any of this user's runs is still going (checked, not just recorded)."""
+    """Returns whether any of this user's runs is still going (checked live)."""
     main_db = user_config.get("main_database")
     if not main_db:
         return False
@@ -1369,8 +1272,8 @@ def _active_run(current_user: dict, conn, user_config: dict) -> bool:
 
 @router.get("/stores")
 def get_stores(current_user: dict = Depends(get_current_user)):
-    """Where each database is (scratch, version), its latest depot backup, and
-    the copy under way or last done -- with a percentage and a log tail."""
+    """Returns each database's location and version, latest depot backup, and the
+    current or last copy with its percentage and log tail."""
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
     _stores_settle(current_user, conn, user_config)
@@ -1379,7 +1282,7 @@ def get_stores(current_user: dict = Depends(get_current_user)):
 
 @router.get("/stores/progress")
 def get_stores_progress(current_user: dict = Depends(get_current_user)):
-    """Only the copy under way (percent, log tail): cheap enough to poll every second or two."""
+    """Returns only the copy under way (percent, log tail); cheap enough to poll often."""
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
     return {"op": _stores_call(user_stores.progress, conn, user_config)}
@@ -1387,8 +1290,7 @@ def get_stores_progress(current_user: dict = Depends(get_current_user)):
 
 @router.get("/stores/{store_id}/backup-check")
 def check_store_backup(store_id: str, current_user: dict = Depends(get_current_user)):
-    """What backing this database up would take, and whether depot has room --
-    shown in the Yes / No question before any copy starts."""
+    """Returns what backing up this database would take and whether depot has room."""
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
     return _stores_call(user_stores.backup_check, conn, user_config, current_user["cluster_username"], store_id)
@@ -1396,26 +1298,21 @@ def check_store_backup(store_id: str, current_user: dict = Depends(get_current_u
 
 @router.post("/stores/setup")
 def setup_stores(current_user: dict = Depends(get_current_user)):
-    """Copy the databases missing on scratch: from the user's newest depot
-    backup where there is one, from the base copies otherwise."""
+    """Copies the databases missing on scratch, from the user's newest depot
+    backup where there is one, else from the base copies."""
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
     _stores_settle(current_user, conn, user_config)
     return _stores_call(user_stores.start_setup, conn, user_config, current_user["cluster_username"])
 
 
-# ---------------------------------------------------------------------------
-# A genome's interactive map (FINAL_GENOME_VIEWER.html) made again with the
-# viewer this backend has now. A run writes the map once, with the code of its
-# day; a map from an earlier run lacks what was added since (the gene report,
-# operon map downloads, the contig and two-strand views). Same script and
-# Python as the workflow's run_genome_viewer_one_genome rule, run as the user;
-# written beside the old one and moved over it only once it is complete.
-# ---------------------------------------------------------------------------
+# ---- Genome viewer refresh ----
+# Rebuilds FINAL_GENOME_VIEWER.html with this backend's viewer script, as the
+# user, writing beside the old file and moving it over only once complete.
 
 @router.post("/genome-viewer/refresh")
 def refresh_genome_viewer(body: dict | None = None, current_user: dict = Depends(get_current_user)):
-    """body: {folder} -- a genome's results folder. Returns {viewer}: the map's path."""
+    """Rebuilds a genome's viewer. body: {folder}; returns {viewer}: the map's path."""
     folder = str((body or {}).get("folder") or "").strip()
     if not folder:
         raise HTTPException(status_code=400, detail="Which genome folder?")
@@ -1444,14 +1341,10 @@ def refresh_genome_viewer(body: dict | None = None, current_user: dict = Depends
     return {"viewer": f"{folder}/{viewer}"}
 
 
-# ---------------------------------------------------------------------------
-# The AI keys for "Chat with the genome", kept in the user's own home on the
-# cluster when they ask for it, so a key set up once works from any computer
-# they connect from. ~/.config/margie is made 700 before the file is written,
-# so there is never a moment anyone else could read it; the file is 600.
-# It may also be written by hand: JSON {"keys": {...}}, or a provider=key line
-# each (anthropic, openai, gemini, custom).
-# ---------------------------------------------------------------------------
+# ---- AI keys for "Chat with the genome" ----
+# Kept in ~/.config/margie (mode 700, file 600) on the cluster so they work from
+# any computer. The file is JSON {"keys": {...}} or one provider=key line each
+# (anthropic, openai, gemini, custom).
 
 _AI_KEYS_DIR = ".config/margie"
 _AI_KEYS_FILE = "ai-keys.json"
@@ -1460,7 +1353,7 @@ _AI_PROVIDERS = {"anthropic", "openai", "gemini", "custom"}
 
 @router.get("/ai-keys")
 def get_ai_keys(current_user: dict = Depends(get_current_user)):
-    """The keys kept on the cluster, by provider ({} when none)."""
+    """Returns the keys kept on the cluster, by provider ({} when none)."""
     conn = _build_connection(current_user)
     path = f"{current_user['home_dir']}/{_AI_KEYS_DIR}/{_AI_KEYS_FILE}"
     code, out = user_stores._run(conn, f"cat {shlex.quote(path)} 2>/dev/null")
@@ -1470,7 +1363,7 @@ def get_ai_keys(current_user: dict = Depends(get_current_user)):
         data = json.loads(text) if text.strip() else {}
         keys = (data.get("keys") if isinstance(data, dict) else None) or {}
     except json.JSONDecodeError:
-        # Written by hand (in VS Code on the cluster, say): a provider=key line each.
+        # Hand-written form: one provider=key line each.
         for line in text.splitlines():
             name, sep, value = line.strip().partition("=")
             if sep and not line.lstrip().startswith("#"):
@@ -1480,7 +1373,7 @@ def get_ai_keys(current_user: dict = Depends(get_current_user)):
 
 @router.put("/ai-keys")
 def put_ai_keys(body: dict | None = None, current_user: dict = Depends(get_current_user)):
-    """Replace the keys kept on the cluster. body: {keys: {provider: key}}."""
+    """Replaces the keys kept on the cluster. body: {keys: {provider: key}}."""
     keys = (body or {}).get("keys") or {}
     if not isinstance(keys, dict):
         raise HTTPException(status_code=400, detail="Expected {keys: {provider: key}}.")
@@ -1499,7 +1392,7 @@ def put_ai_keys(body: dict | None = None, current_user: dict = Depends(get_curre
 
 @router.delete("/ai-keys")
 def delete_ai_keys(current_user: dict = Depends(get_current_user)):
-    """Forget the keys kept on the cluster."""
+    """Deletes the keys kept on the cluster."""
     conn = _build_connection(current_user)
     path = f"{current_user['home_dir']}/{_AI_KEYS_DIR}/{_AI_KEYS_FILE}"
     user_stores._run(conn, f"rm -f {shlex.quote(path)}")
@@ -1508,8 +1401,7 @@ def delete_ai_keys(current_user: dict = Depends(get_current_user)):
 
 @router.post("/stores/run-here")
 def run_store_copy_here(current_user: dict = Depends(get_current_user)):
-    """The copy waiting in the SLURM queue (databases, backups, tool setup), run
-    on the login node instead, at the person's request."""
+    """Runs the queued SLURM copy job (databases, backups, tool setup) on the login node instead."""
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
     return {"op": _stores_call(user_stores.run_here, conn, user_config)}
@@ -1517,8 +1409,8 @@ def run_store_copy_here(current_user: dict = Depends(get_current_user)):
 
 @router.post("/stores/{store_id}/backup")
 def backup_store(store_id: str, current_user: dict = Depends(get_current_user)):
-    """Copy one database's working version to depot; the working copy moves on
-    to the next version. Not while a run is writing to it."""
+    """Copies one database's working version to depot; the working copy moves to
+    the next version. Refused while a run is writing to it."""
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
     _stores_settle(current_user, conn, user_config)
@@ -1527,15 +1419,12 @@ def backup_store(store_id: str, current_user: dict = Depends(get_current_user)):
     return _stores_call(user_stores.start_backup, conn, user_config, current_user["cluster_username"], store_id)
 
 
-# ---------------------------------------------------------------------------
-# The tools' containers and reference databases: what is there, and setting
-# up what is not (services/tool_assets.py). The setup is the same copy job
-# as the databases above, so it shares their progress (GET /stores/progress).
-# ---------------------------------------------------------------------------
+# ---- Tool containers and reference databases (services/tool_assets.py) ----
+# Setup uses the same copy job as the stores and shares GET /stores/progress.
 
 @router.get("/assets")
 def get_assets(current_user: dict = Depends(get_current_user)):
-    """Each container and reference database: where the run looks for it,
+    """Returns each container and reference database: where the run looks for it,
     whether it is there, and where it could be set up from."""
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
@@ -1547,9 +1436,8 @@ def get_assets(current_user: dict = Depends(get_current_user)):
 def get_assets_plan(builds: bool = True, optional: bool = False, accept: str = "",
                     sif_to: str = "", db_to: str = "",
                     current_user: dict = Depends(get_current_user)):
-    """What setting up would do -- item by item, the size of the copies, the
-    room on scratch -- asked before the Yes / No. accept=* lists the
-    licence-gated builds too, marked, for the page to ask about."""
+    """Returns the setup plan: items, copy sizes and room on scratch.
+    accept=* also lists the licence-gated builds, marked."""
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
     accepted = set(tool_assets.GATED) if accept == "*" else {t.strip() for t in accept.split(",") if t.strip()}
@@ -1559,10 +1447,10 @@ def get_assets_plan(builds: bool = True, optional: bool = False, accept: str = "
 
 @router.post("/assets/setup")
 def setup_assets(body: dict | None = None, current_user: dict = Depends(get_current_user)):
-    """Set up the missing containers and databases. body: {builds: bool,
-    optional: bool, accept: [tool, ...], sif_to, db_to} -- accept names the
-    licence-gated tools whose statement the user accepted for this build;
-    sif_to / db_to, the folders the user chose for them (else the defaults)."""
+    """Sets up the missing containers and databases.
+
+    body: {builds, optional, accept: [tool, ...], sif_to, db_to}; accept names the
+    licence-gated tools the user accepted, sif_to / db_to the chosen folders."""
     body = body or {}
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
@@ -1575,7 +1463,7 @@ def setup_assets(body: dict | None = None, current_user: dict = Depends(get_curr
 
 @router.get("/assets/build-recipes")
 def get_build_recipes(current_user: dict = Depends(get_current_user)):
-    """Where margie-build is on the cluster (the lab's copy, the user's clone), if anywhere."""
+    """Returns where margie-build is on the cluster (shared copy or user clone), if anywhere."""
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
     return _stores_call(tool_assets.build_recipes, conn, user_config, current_user["home_dir"])
@@ -1583,8 +1471,7 @@ def get_build_recipes(current_user: dict = Depends(get_current_user)):
 
 @router.post("/assets/build-recipes")
 def clone_build_recipes(body: dict | None = None, current_user: dict = Depends(get_current_user)):
-    """Clone margie-build into the user's home (only needed where the cluster has
-    no copy), and point margie_sb.build_repo at it. body: {url}."""
+    """Clones margie-build into the user's home and points margie_sb.build_repo at it. body: {url}."""
     conn = _build_connection(current_user)
     user_config = _stores_user_config(current_user, conn)
     found = _stores_call(tool_assets.clone_recipes, conn, user_config, current_user["home_dir"], (body or {}).get("url"))
@@ -1593,9 +1480,8 @@ def clone_build_recipes(body: dict | None = None, current_user: dict = Depends(g
 
 
 def _check_margie_sb_assets(genome_data: GenomeSend, genome_path: str, user_config: dict, conn, current_user: dict) -> None:
-    """Refuse a run that needs a container or database that is not there --
-    it would otherwise fail at that tool, hours in. A folder this account
-    cannot read, or a look that fails, never stops a run."""
+    """Refuses a run whose containers or databases are missing. An unreadable
+    folder or a failed check never stops a run."""
     from bioinformatics_tools.api import licensing
     all_keys = {tool['key'] for tool in MARGIE_SB_PHASED_TOOLS}
     if genome_data.selected_tools is not None:
@@ -1625,9 +1511,8 @@ def _check_margie_sb_assets(genome_data: GenomeSend, genome_path: str, user_conf
 @router.post("/run_workflow")
 def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_current_user)):
     """Submit a genome analysis workflow by name."""
-    # License gate (server-side enforcement — the analyze page also gates in the
-    # UI, but a run must never proceed without a recorded acceptance of the
-    # current licensing terms).
+    # Server-side licence gate: a run never proceeds without a recorded
+    # acceptance of the current terms.
     from bioinformatics_tools.api import licensing
     if not licensing.has_accepted_current_terms(current_user["username"]):
         raise HTTPException(
@@ -1681,18 +1566,14 @@ def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_curre
         )
 
     if genome_data.workflow == 'margie_sb':
-        # The growing databases live on the user's scratch (user_stores): a
-        # run needs its copies there first -- the page sets them up, with a
-        # progress bar, when this says so -- and never starts during a copy.
+        # A run needs the user's store copies on scratch first and never starts during a copy.
         main_db = _margie_sb_stores_ready(current_user, conn, user_config)
         _validate_margie_sb_shared_paths(user_config, conn, current_user["home_dir"])
     else:
-        # Shared template DB -> per-user DB promotion (persisted), so concurrent
-        # users stop writing to one SQLite file.
+        # Promotes a shared template DB to a per-user DB so users do not share one SQLite file.
         main_db = _resolve_effective_main_db(current_user, conn, user_config, persist=True)
 
-    # Resolves genome path / output dir, falling back to the user's global config
-    # defaults (input_path / output_path) when the request didn't specify one.
+    # Falls back to the config's input_path / output_path when the request omits them.
     genome_path = genome_data.genome_path or user_config.get(genome_data.workflow, {}).get('input_path')
     if not genome_path or str(genome_path).strip() == '':
         raise HTTPException(
@@ -1703,13 +1584,9 @@ def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_curre
 
     _check_genome_path_exists(genome_path, genome_data.workflow, conn)
 
-    # A subset of a folder: stage those genomes into a folder of their own and
-    # run that instead. A workflow annotates everything it is pointed at, so
-    # narrowing the run means narrowing the folder -- there is no per-genome
-    # flag anywhere in the chain to set.
-    #
-    # An empty list is a mistake worth reporting rather than quietly running
-    # the whole folder, which is the opposite of what was asked.
+    # A subset of a folder is staged into its own folder and run from there,
+    # since a workflow annotates everything it is pointed at. An empty list is
+    # rejected rather than running the whole folder.
     if genome_data.genomes is not None:
         if not genome_data.genomes:
             raise HTTPException(status_code=400, detail="No genomes were selected.")
@@ -1731,11 +1608,8 @@ def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_curre
             len(genome_data.genomes), genome_path,
         )
 
-    # Validates phase/tool selection, if given -- catch typos here rather than
-    # have them silently no-op as an unrecognized run_<tool> config key.
-    # `is not None` (not a truthiness check) matters here: an explicit empty
-    # list means "run nothing", which must NOT be treated the same as
-    # omitting the field entirely ("run everything").
+    # Validates the tool selection so typos fail here. An explicit empty list
+    # means "run nothing", unlike None ("run everything").
     if genome_data.selected_tools is not None:
         if not genome_data.selected_tools:
             raise HTTPException(
@@ -1751,8 +1625,7 @@ def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_curre
                 detail=f"Unknown tool key(s) in selected_tools: {sorted(unknown)}. "
                        f"Available: {sorted(valid_tool_keys)}",
             )
-        # Refuse tools the user is not licensed for (mirrors the CLI gate and the
-        # greyed-out tools in the analyze UI -- defence in depth).
+        # Refuses tools the user is not licensed for (mirrors the CLI gate and the UI).
         _ent = licensing.get_entitlement(current_user["username"])
         _disabled = licensing.disabled_tool_ids(
             _ent.get("usage_type"), _ent.get("licensed_tools")
@@ -1771,10 +1644,7 @@ def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_curre
 
     base_dir = (genome_data.output_dir or user_config.get(genome_data.workflow, {}).get('output_path') or current_user['home_dir']).rstrip('/')
 
-    # run_full_operon_map: enable if EITHER the request asks for it OR it is
-    # persisted in the user's per-workflow config (Profile settings). The saved
-    # config is the reliable channel -- it reaches the backend server-side and
-    # does not depend on the analysis-page checkbox making it into the payload.
+    # run_full_operon_map is on if the request or the saved per-workflow config asks for it.
     saved_full_operon_map = bool(
         user_config.get(genome_data.workflow, {}).get('run_full_operon_map', False))
     effective_full_operon_map = bool(genome_data.run_full_operon_map) or saved_full_operon_map
@@ -1790,19 +1660,10 @@ def run_workflow(genome_data: GenomeSend, current_user: dict = Depends(get_curre
 
 
 def _job_from_history_row(row: dict) -> dict:
-    """Shape a persisted api_jobs row like an in-memory job_store entry, so
-    the front-end's job page can render it the same way whether the job is
-    still live or was resumed after a dane-api restart.
+    """Shapes a persisted api_jobs row like a live job_store entry.
 
-    logs/slurm_jobs/containers are only ever a final snapshot, taken once
-    by job_store.finalize() at job completion/failure -- never persisted
-    incrementally (that would mean an SSH round-trip per log line), so a
-    job that's still mid-run when dane-api restarts has none of this yet,
-    and a job that died without ever reaching finalize() (e.g. dane-api
-    itself crashed) never gets one at all. sub_jobs/report/progress/
-    steps_done/total remain pure live-session detail, never persisted.
-    job_history_client already JSON-decodes slurm_jobs/containers back
-    into real lists before this row ever reaches here.
+    logs/slurm_jobs/containers exist only if job_store.finalize() ran; sub_jobs,
+    report and progress are never persisted.
     """
     return {
         "job_id": row["job_id"],
@@ -1826,18 +1687,12 @@ def _job_from_history_row(row: dict) -> dict:
     }
 
 def _load_job_for_action(job_id: str, current_user: dict, conn) -> dict:
-    """Resolve a job_id to enough info to relaunch it (genome_path, workflow,
-    work_dir, selected_tools, status), whether it's still live in job_store
-    or only in persisted history. Raises 404/403 the same way get_job_status
+    """Resolves a job_id to its launch details (genome_path, workflow,
+    work_dir, selected_tools, status) from job_store or persisted history.
+    Raises 404/403 the same way get_job_status
     does.
 
-    Deliberately separate from get_job_status itself: that endpoint also
-    does SLURM-reconciliation (still_active/status_note) this lookup
-    doesn't need, and from _resolve_job_work_dir (file-serving endpoints
-    only need work_dir; resume/restart need the full launch-relevant
-    shape). Minor duplication of the job_store-then-history-fallback
-    pattern across these three is accepted -- collapsing them would couple
-    endpoints with different response-shape needs."""
+    Unlike get_job_status it skips SLURM reconciliation."""
     job = job_store.get(job_id)
     if job is not None:
         if job.get("user_id") != current_user["user_id"]:
@@ -1867,21 +1722,14 @@ def _load_job_for_action(job_id: str, current_user: dict, conn) -> dict:
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 _POTENTIALLY_STALE_STATUSES = {"pending", "running", "snakemake"}
 
-# A run that is still being submitted (status "running", phase "Submitting via
-# SSH") has no .rc sentinel, no driver process yet, and no SLURM jobs -- which
-# is byte-for-byte the same signature the reconcilers otherwise read as
-# "interrupted / driver stopped". That race mislabelled brand-new jobs as
-# cancelled on the history page while they were still on their way to the
-# cluster. Give a freshly-touched row this grace window before ever calling it
-# dead: submission has time to spawn the driver and queue its SLURM jobs, at
-# which point the normal alive-checks keep it running on their own merits.
+# A row that is still being submitted has no .rc sentinel, driver or SLURM jobs
+# yet, so it looks interrupted; rows younger than this grace window are never
+# judged dead.
 _SUBMIT_GRACE_SECONDS = 300
 
 
 def _row_age_seconds(row: dict) -> float | None:
-    """Seconds since this history row was last touched, or None if it has no
-    parseable timestamp. Prefers updated_at (bumped when the row entered the
-    submitting state) and falls back to created_at."""
+    """Returns seconds since the row was last touched (updated_at, else created_at), or None."""
     stamp = row.get("updated_at") or row.get("created_at")
     if not stamp:
         return None
@@ -1895,30 +1743,23 @@ def _row_age_seconds(row: dict) -> float | None:
 
 
 def _within_submit_grace(row: dict) -> bool:
-    """True while a row is too young to be judged interrupted -- it is almost
-    certainly still submitting (no driver/SLURM visible yet)."""
+    """Returns True while a row is too young to be judged interrupted."""
     age = _row_age_seconds(row)
     return age is not None and age < _SUBMIT_GRACE_SECONDS
-# States that mean "this job still occupies the cluster". COMPLETING belongs
-# here: a job tearing down is emphatically not finished, and leaving it out
-# made a workflow read as dead whenever a poll happened to land while its
-# whole current batch was in that state -- which for short rules is most of
-# the time. CONFIGURING/COMPLETED_* are the other transient squeue states.
+# squeue states in which a job still occupies the cluster; COMPLETING and
+# CONFIGURING count as active.
 _ACTIVE_SLURM_STATES = ("RUNNING", "PENDING", "COMPLETING", "CONFIGURING",
                         "RESIZING", "SUSPENDED", "REQUEUED")
 
-# Guards the rehydrate-and-reattach below: the job page polls every 10s and
-# FastAPI runs sync endpoints in a threadpool, so without this two overlapping
-# polls both see an empty job_store and both start a watcher on the same run.
+# Stops two overlapping polls (sync endpoints run in a threadpool) from both
+# reattaching a watcher to the same run.
 _REATTACH_LOCK = threading.Lock()
 
 
 def _has_active_workdir_jobs(conn, work_dir: str, cluster_username: str) -> bool:
-    """True if squeue reports any RUNNING/PENDING/etc job under work_dir.
+    """Returns True if squeue reports any active job under work_dir.
 
-    Best-effort: an SSH/squeue failure here must never cause a live run to
-    be misdiagnosed as dead, so it counts as "can't tell, assume alive"
-    rather than "not found".
+    An SSH or squeue failure counts as alive, so a live run is never marked dead.
     """
     try:
         matches = ssh_slurm.find_active_jobs_in_workdir(work_dir, cluster_username, connection=conn)
@@ -1930,28 +1771,15 @@ def _has_active_workdir_jobs(conn, work_dir: str, cluster_username: str) -> bool
 
 def _try_reattach(job_id: str, row: dict, conn, main_db: str | None,
                   current_user: dict) -> dict | None:
-    """Take a still-running job back over after a dane-api restart.
+    """Resumes watching a detached run after a dane-api restart.
 
-    A workflow run is detached (setsid + nohup), so it survives the API that
-    started it. Its in-memory job_store entry does not. Everything needed to
-    resume watching is still on the cluster -- the log under
-    ~/.local/share/bsp/jobs/<job_id>.log and the .rc exit sentinel beside it --
-    and the tail has always replayed from line 1, so re-reading it re-derives
-    every SLURM job, container and progress line the dead session had parsed.
-
-    Returns the rehydrated live job dict, or None if this run cannot or should
-    not be reattached (already finished, or another thread got there first).
+    Replays the job log from ~/.local/share/bsp/jobs/<job_id>.log, which
+    re-derives its SLURM jobs, containers and progress. Returns the live job
+    dict, or None if the run is not replayable or another thread claimed it.
     """
-    # Checked BEFORE claiming the job, because `tail -F` on a log that will
-    # never grow never returns, and would park one of the runner's four
-    # workers for the lifetime of the process.
-    #
-    # Replay is right in exactly two cases: the run is still going (its log is
-    # still being written), or it finished while the API was down (exit
-    # sentinel present) -- in which case the replay recovers the whole run AND
-    # its real exit code, instead of leaving a finished job stuck at "running"
-    # forever. A run with neither was interrupted; the squeue path below
-    # reports that instead. See ssh_slurm.is_replayable.
+    # Checked before claiming: `tail -F` on a log that never grows would block a
+    # worker forever. Replay suits a run still writing its log or one with an
+    # exit sentinel (see ssh_slurm.is_replayable).
     try:
         probe = ssh_slurm.probe_run(job_id, connection=conn)
     except Exception as exc:
@@ -1971,15 +1799,10 @@ def _try_reattach(job_id: str, row: dict, conn, main_db: str | None,
             selected_tools=row.get("selected_tools"),
             relaunched_from=row.get("relaunched_from"),
         )
-        # create() would re-INSERT a history row that already exists, so
-        # persistence is attached afterwards instead: subsequent status/phase
-        # changes still reach the user's history, no duplicate row is written.
+        # create() would insert a duplicate history row, so persistence is attached afterwards.
         job_store.attach_persistence(job_id, main_db, conn)
-        # Carry the row's own status/phase over. create() starts every job at
-        # "pending", and this one is not pending -- it has been running since
-        # before the restart. Without this the first poll after a restart
-        # would report a live job as pending, and the front-end would drop the
-        # Emergency Stop button for it.
+        # Carries the row's status/phase over; create() would start it at
+        # "pending" and the UI would drop its Emergency Stop button.
         job_store.update(job_id, work_dir=row.get("work_dir"),
                          status=row.get("status") or "running",
                          phase=row.get("phase") or "Reattaching to running job")
@@ -1996,11 +1819,10 @@ def get_job_status(
     log_tail: int | None = None,
     current_user: dict = Depends(get_current_user),
 ):
-    """A job's status and log (_job_status). A page following a run asks for
-    only the log it does not have: log_offset=N, from character N on, or
-    log_tail=N, the last N characters; logs_size is then the whole log's
-    length. Without them, the whole log, as before -- a long run's is tens of
-    MB, and a page polling that every few seconds kept the server busy."""
+    """Returns a job's status and log (_job_status).
+
+    log_offset=N returns the log from character N, log_tail=N the last N
+    characters, with logs_size the full length; neither returns the whole log."""
     result = _job_status(job_id, current_user)
     if log_offset is None and log_tail is None:
         return result
@@ -2011,17 +1833,11 @@ def get_job_status(
 
 
 def _job_status(job_id: str, current_user: dict) -> dict:
-    """Get status of a running job. Falls back to persistent history (e.g.
-    after a dane-api restart wiped the in-memory job_store) before giving
-    up. Returns 403 if the in-memory job belongs to a different user --
-    history rows can't make that check since they live in each user's own
-    main_database already, with no cross-user data to separate.
+    """Returns a running job's status, falling back to persistent history.
 
-    For a non-terminal history row (nothing live is tracking it anymore,
-    so its persisted status could be stale), also checks squeue to see
-    whether it's genuinely still active on the cluster -- adds
-    still_active/status_note to the response, purely additive, so this
-    never changes the existing status field or breaks older clients."""
+    Returns 403 if the live job belongs to another user. For a non-terminal
+    history row, adds still_active/status_note from squeue.
+    """
     job = job_store.get(job_id)
     if job is not None:
         if job.get("user_id") != current_user["user_id"]:
@@ -2048,12 +1864,8 @@ def _job_status(job_id: str, current_user: dict) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # A non-terminal row means this run was still going when dane-api lost
-    # track of it. Take it back over rather than settling for a squeue
-    # snapshot: replaying its log restores the logs, SLURM jobs, containers
-    # and progress the dead session had parsed, and from here on it updates
-    # live again. The squeue path below stays as the fallback for runs with
-    # no replayable log.
+    # A non-terminal row was still going when dane-api lost track of it: it is
+    # reattached by replaying its log, with the squeue check below as fallback.
     if row["status"] not in _TERMINAL_STATUSES:
         live = _try_reattach(job_id, row, conn, main_db, current_user)
         if live is not None:
@@ -2096,20 +1908,15 @@ def _job_status(job_id: str, current_user: dict) -> dict:
                     for m in enriched
                 ]
         elif _within_submit_grace(row):
-            # No active SLURM jobs yet, but this row was touched moments ago:
-            # it is still being submitted, not interrupted. Leave its status
-            # alone -- marking it cancelled here is the very bug that made
-            # not-yet-submitted jobs show up as cancelled.
+            # No active SLURM jobs yet, but the row is fresh: still being submitted.
             result["still_active"] = True
             result["status_note"] = (
                 "This run is still being submitted to the cluster -- "
                 "live updates will appear once its jobs are queued."
             )
         else:
-            # Persisted status said non-terminal but there are no active jobs
-            # and the row is old enough that submission would have surfaced
-            # them by now. Normalize so this job no longer appears as running
-            # forever.
+            # No active jobs and the row is past the grace window: marked
+            # interrupted so it no longer appears as running.
             result["status"] = "cancelled"
             result["phase"] = "Interrupted (no active jobs)"
             try:
@@ -2133,39 +1940,16 @@ def _job_status(job_id: str, current_user: dict) -> dict:
 
 
 def _reconcile_running(conn, main_db: str, rows: list[dict], cluster_username: str) -> None:
-    """Correct rows that claim to be running but are not.
+    """Corrects rows that claim to be running but are not.
 
-    Workflow runs are detached (setsid + nohup) so they survive the GUI closing.
-    The cost is that nothing writes a terminal status if the driver dies without
-    reaching its exit sentinel -- a killed or wedged run then reads as "running"
-    on the history page forever. One such row sat at "Submitting via SSH" after
-    its driver was stopped.
+    A run is alive if its .rc sentinel is absent and a driver process exists, its
+    driver SLURM job is active, or any worker job under its work_dir is active
+    (the driver often exits long before its workers). A present sentinel decides
+    the status from its exit code; otherwise the run is interrupted.
 
-    A run is considered alive if ANY of these hold:
-      * its .rc sentinel is absent AND a driver process for it exists,
-      * its own SLURM job id is still queued/running, or
-      * ANY worker sub-job squeue reports under this work_dir is still
-        queued/running.
-    The last check matters because the driver's own SLURM job is often gone
-    long before its workers are: it can finish submitting and exit while
-    dozens of Snakemake rule jobs it queued keep running for hours. Checking
-    only the driver (as this used to) reads that completely healthy run as
-    interrupted the moment the driver itself is no longer in squeue, which is
-    exactly what happened after a laptop woke up from sleep to find every
-    still-running job's history row stamped "cancelled" while squeue showed
-    them all alive.
-    If the sentinel exists, the run finished and its exit code decides the
-    status. If neither, it is interrupted.
-
-    Deliberately read-mostly: only rows already marked running are touched, so a
-    healthy run is never disturbed. Failures here are logged and ignored -- a
-    history listing must not break because reconciliation could not run.
+    Only rows marked running are touched, and failures are logged and ignored.
     """
-    # EVERYTHING here is inside the try. This line was outside it, so an
-    # unexpected row shape raised straight out of the function and 500'd
-    # list_jobs -- which presented as an empty history page, i.e. reconciliation
-    # destroyed the very listing it was meant to correct. A best-effort helper
-    # must never be able to fail its caller.
+    # Everything stays inside the try so a bad row cannot break list_jobs.
     try:
         pending = [r for r in rows
                    if isinstance(r, dict) and (r.get("status") or "").lower() == "running"]
@@ -2176,21 +1960,12 @@ def _reconcile_running(conn, main_db: str, rows: list[dict], cluster_username: s
             jid = row.get("job_id") or row.get("id")
             if not jid:
                 continue
-            # Keep matching strict: substring matches produced false positives
-            # and left finished jobs marked as running.
+            # Strict matching: substring matches left finished jobs marked running.
             escaped = re.escape(jid)
             stem = ssh_slurm.run_file_stem(jid)
-            # drv: legacy fallback for runs whose driver still lives directly on
-            # the login node (in_slurm=False). dj/ds: the current path -- the
-            # driver's OWN SLURM job id (written to <stem>.jobid by
-            # build_driver_launch) and its live squeue state. Checking squeue by
-            # job NAME here used to compare against the bare job_id, but the
-            # driver's job name is "margie-<stem>" (see build_driver_launch) and
-            # it runs on a compute node, not the login node -- so neither that
-            # name check nor this pgrep ever matched a SLURM-hosted driver, and
-            # every such run older than the submit grace window was stamped
-            # "cancelled" here on its very next history-page view even though it
-            # was still running fine on the cluster.
+            # drv: driver process on the login node (in_slurm=False).
+            # dj/ds: the driver's own SLURM job id (<stem>.jobid from
+            # build_driver_launch) and its squeue state.
             probe = (
                 f'rc=$(cat $HOME/.local/share/bsp/jobs/{jid}.rc 2>/dev/null); '
                 f'drv=$(pgrep -u $USER -f "dane_wf.*{escaped}" 2>/dev/null | wc -l); '
@@ -2214,18 +1989,12 @@ def _reconcile_running(conn, main_db: str, rows: list[dict], cluster_username: s
             elif drv_n > 0 or ds.strip() in _ACTIVE_SLURM_STATES:  # genuinely still going
                 continue
             elif _within_submit_grace(row):    # too young -- still submitting
-                # A run mid-submission has no sentinel, no driver and no SLURM
-                # jobs yet: identical to an interrupted run. Don't call a
-                # freshly-touched row dead, or a job still on its way to the
-                # cluster shows up as cancelled in history.
+                # Mid-submission looks identical to interrupted, so a fresh row is left running.
                 continue
             elif row.get("work_dir") and _has_active_workdir_jobs(
                 conn, row["work_dir"], cluster_username):
-                # The driver itself is gone, but its workers aren't: a driver
-                # that finished submitting and exited looks identical to a
-                # stopped one from the drv/ds check above alone. Sub-jobs
-                # sharing this work_dir are the real signal of whether the
-                # run is still occupying the cluster.
+                # The driver has exited, but active workers under this work_dir
+                # show the run is still going.
                 continue
             else:                              # no sentinel, no driver, no jobs
                 status, phase = "cancelled", "Interrupted (driver stopped)"
@@ -2248,9 +2017,8 @@ def list_jobs(
     page_size: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
 ):
-    """List this user's persistent job history, optionally filtered to one
-    workflow, paginated most-recent-first. A brand new user with no history
-    at all gets an empty list, not an error."""
+    """Lists this user's job history, optionally for one workflow, most recent first.
+    A user with no history gets an empty list."""
     empty_response = {"jobs": [], "page": page, "page_size": page_size, "total_jobs": 0, "total_pages": 1}
 
     conn = _build_connection(current_user)
@@ -2273,7 +2041,7 @@ def list_jobs(
         owner_username=current_user["username"],
         owner_cluster_username=current_user["cluster_username"],
     )
-    # Verify anything claiming to be running before reporting it as such.
+    # Verifies anything claiming to be running before reporting it.
     _reconcile_running(conn, main_db, rows, current_user["cluster_username"])
     total_pages = max((total_jobs + page_size - 1) // page_size, 1)
 
@@ -2288,12 +2056,9 @@ def list_jobs(
 
 @router.post("/cancel_job/{job_id}")
 def cancel_job(job_id: str, current_user: dict = Depends(get_current_user)):
-    """Emergency stop - cancel all SLURM jobs, kill remote process, and mark job as cancelled.
+    """Emergency stop: cancels the run's SLURM jobs, kills the remote process and marks the job cancelled.
 
-    Falls back to persistent history when the job isn't in the in-memory
-    job_store -- e.g. after a dane-api restart -- the same fallback
-    _resolve_job_work_dir already uses, so Emergency Stop still works for
-    jobs the status page can still show via that fallback.
+    Falls back to persistent history when the job is not in job_store.
     """
     conn = _build_connection(current_user)
     job = job_store.get(job_id)
@@ -2324,11 +2089,7 @@ def cancel_job(job_id: str, current_user: dict = Depends(get_current_user)):
             raise HTTPException(status_code=404, detail="Job not found")
         slurm_ids = [sj["job_id"] for sj in (row.get("slurm_jobs") or [])]
 
-    # The DRIVER goes first, and it is a SLURM job now rather than a login-node
-    # process. Cancelling the children first would be pointless: Snakemake is
-    # still alive at that moment and simply resubmits them. Killing the thing
-    # that submits, then the things it submitted, is the only order that ends
-    # the run.
+    # The driver is cancelled first; otherwise Snakemake would resubmit its children.
     driver = None
     try:
         driver = ssh_slurm.driver_job_id(job_id, connection=conn)
@@ -2343,13 +2104,9 @@ def cancel_job(job_id: str, current_user: dict = Depends(get_current_user)):
         ssh_slurm.cancel_slurm_jobs(slurm_ids, connection=conn)
         LOGGER.info("Cancelled %d SLURM jobs for job %s", len(slurm_ids), job_id)
 
-    # Belt-and-braces sweep. slurm_ids is only what the GUI parsed from the log,
-    # so a worker submitted since the last poll -- or one orphaned when the
-    # driver died without cancelling its children -- would survive the stop and
-    # keep holding a node (exactly the leftover worker seen running hours after
-    # its run ended). Every worker shares the run's work_dir, so cancel any
-    # still-active job there that the tracked list missed. The driver lives in
-    # $HOME, not work_dir, so this never touches it or another run.
+    # Sweeps any active job under the run's work_dir that the parsed slurm_ids
+    # missed (new or orphaned workers). The driver lives in $HOME, so it and
+    # other runs are untouched.
     work_dir = job.get("work_dir") if job is not None else row.get("work_dir")
     swept_ids: list[str] = []
     if work_dir:
@@ -2365,16 +2122,13 @@ def cancel_job(job_id: str, current_user: dict = Depends(get_current_user)):
             ssh_slurm.cancel_slurm_jobs(swept_ids, connection=conn)
             LOGGER.info("Cancelled %d untracked work_dir jobs for %s", len(swept_ids), job_id)
 
-    # Only for runs with no driver job -- ones started before the driver moved
-    # into SLURM, which really do have a dane_wf on the login node. Skipped
-    # otherwise because this is a pkill by name across the whole account: with
-    # two runs in flight it would kill the other user-visible run too, and for
-    # a driver on a compute node it cannot reach it anyway.
+    # Only for runs with no driver job (driver on the login node): the pkill
+    # matches by name across the account and would hit other runs.
     if not driver:
         ssh_slurm.kill_remote_process("dane_wf", connection=conn)
         LOGGER.info("Killed remote dane_wf process for job %s", job_id)
 
-    # Mark job as cancelled (this will also stop the status checker daemon, if any)
+    # Marks the job cancelled, which also stops any status checker daemon.
     if job is not None:
         job_store.cancel(job_id)
     else:
@@ -2390,12 +2144,8 @@ def cancel_job(job_id: str, current_user: dict = Depends(get_current_user)):
 
 
 def _main_db_for(current_user: dict, conn) -> tuple[str, dict]:
-    """Fetch main_database from the user's config, raising HTTPException(400)
-    if the config or that field is missing. Shared pre-flight for resume_job/
-    restart_job (run_workflow does the same check inline as part of its
-    richer missing_fields validation, which these two intentionally don't
-    repeat in full -- they're relaunching an already-known-good prior
-    submission, not validating a fresh one)."""
+    """Returns main_database and the user config, raising HTTPException(400) if either is missing.
+    Pre-flight for resume_job/restart_job."""
     try:
         user_config = ssh_sftp.read_remote_yaml(_config_path(current_user["home_dir"]), connection=conn)
     except Exception:
@@ -2408,18 +2158,14 @@ def _main_db_for(current_user: dict, conn) -> tuple[str, dict]:
 
 
 def _base_output_dir_from(path: str) -> str:
-    """Strip a trailing /YYYY-MM-DD-HHMM timestamp segment off a previous
-    job's work_dir/output_dir, recovering the base directory run_workflow
-    originally built it from (see its own timestamp = ...strftime('%Y-%m-%d-%H%M'))."""
+    """Strips a trailing /YYYY-MM-DD-HHMM segment from a job's work_dir, giving the base output dir."""
     return re.sub(r'/\d{4}-\d{2}-\d{2}-\d{4}$', '', path)
 
 
 @router.post("/resume_job/{job_id}")
 def resume_job(job_id: str, current_user: dict = Depends(get_current_user)):
-    """Resume a failed (or stale-but-no-longer-active) job: copy its
-    work_dir into a new timestamped folder, then relaunch the same
-    genome_path/workflow/selected_tools there with margie_sb.resume: true
-    so Snakemake's mtime-based rebuild skips whatever already completed."""
+    """Resumes a failed or stale job: copies its work_dir into a new timestamped
+    folder and relaunches with margie_sb.resume: true, so completed steps are skipped."""
     conn = _build_connection(current_user)
     original = _load_job_for_action(job_id, current_user, conn)
 
@@ -2432,10 +2178,7 @@ def resume_job(job_id: str, current_user: dict = Depends(get_current_user)):
                 detail=f"Cannot resume a job with status '{status}' -- only failed/cancelled jobs, "
                        "or non-terminal jobs no longer actually active on the cluster, can be resumed.",
             )
-        # status looks non-terminal (pending/running/snakemake) -- this
-        # could be a stale label left over from before a dane-api restart
-        # (see get_job_status's still_active reconciliation), so actually
-        # check the cluster before trusting it.
+        # A non-terminal status may be stale after a dane-api restart, so the cluster is checked.
         still_active = True
         if work_dir:
             try:
@@ -2445,7 +2188,7 @@ def resume_job(job_id: str, current_user: dict = Depends(get_current_user)):
                 still_active = any(m["state"] in ("RUNNING", "PENDING") for m in matches)
             except Exception as exc:
                 LOGGER.warning("SLURM active-check failed while resuming job %s: %s", job_id, exc)
-                still_active = True  # fail safe: don't resume something we couldn't confirm is dead
+                still_active = True  # fail safe: never resume a run not confirmed dead
         if still_active:
             raise HTTPException(
                 status_code=400,
@@ -2487,9 +2230,8 @@ def resume_job(job_id: str, current_user: dict = Depends(get_current_user)):
 
 @router.post("/restart_job/{job_id}")
 def restart_job(job_id: str, current_user: dict = Depends(get_current_user)):
-    """Restart a job from scratch: same genome_path/workflow/selected_tools
-    as a brand-new job/timestamp, with no copying -- functionally "Start
-    New Analysis" auto-filled from a prior job. Works from any status."""
+    """Restarts a job from scratch with the same genome_path/workflow/selected_tools
+    in a new timestamped folder. Works from any status."""
     conn = _build_connection(current_user)
     original = _load_job_for_action(job_id, current_user, conn)
 
@@ -2557,12 +2299,10 @@ def download_file(
     format: str = Query("raw", pattern="^(raw|excel)$"),
     current_user: dict = Depends(get_current_user),
 ):
-    """Download a file from a job's working directory via SFTP.
+    """Downloads a file from a job's working directory via SFTP.
 
-    format=raw (default) streams the file unmodified. format=excel reads
-    the whole delimited text file into memory and converts it to .xlsx
-    before sending -- only sensible for the TSV/CSV outputs the viewer
-    already supports, not arbitrary binary files.
+    format=raw streams the file unmodified; format=excel converts a TSV/CSV
+    output to .xlsx in memory.
     """
     _validate_relative_path(path)
 
@@ -2575,8 +2315,8 @@ def download_file(
     if format == "excel":
         xlsx_filename = re.sub(r"\.(tsv|csv)$", "", filename, flags=re.IGNORECASE) + ".xlsx"
 
-        # Serve pre-generated .xlsx (from make-final-excel.py) when available.
-        # Read eagerly so FileNotFoundError is caught here, not inside StreamingResponse.
+        # Serves the pre-generated .xlsx from make-final-excel.py when present,
+        # read eagerly so FileNotFoundError is caught here.
         if re.search(r"\.(tsv|csv)$", path, re.IGNORECASE):
             xlsx_remote_path = re.sub(r"\.(tsv|csv)$", ".xlsx", remote_path, flags=re.IGNORECASE)
             try:
@@ -2637,10 +2377,8 @@ def view_file(
     page_size: int = Query(100, ge=1, le=500),
     current_user: dict = Depends(get_current_user),
 ):
-    """Read a paginated slice of a delimited text file from a job's
-    working directory, for in-browser viewing without downloading the
-    whole file. Cost scales with page position, not file size -- see
-    ssh_sftp.read_remote_file_page."""
+    """Returns a paginated slice of a delimited text file in a job's work_dir.
+    Cost scales with page position, not file size (see ssh_sftp.read_remote_file_page)."""
     _validate_relative_path(path)
 
     conn = _build_connection(current_user)
@@ -2722,14 +2460,10 @@ def all_genomes(path: str, current_user: dict = Depends(get_current_user)):
 
 
 def _resolve_browse_path(path: str, current_user: dict) -> str:
-    """Expand a leading ~ to the user's home and normalize the path.
+    """Expands a leading ~ to the user's home and normalises the path.
 
-    Shared by /browse and /browse_view. There is deliberately no allowlist
-    or traversal jail here: both endpoints act over the user's OWN SSH
-    credentials, so the cluster's filesystem permissions are the access
-    boundary -- a user who isn't in a depot's Unix group simply gets a
-    permission error from the cluster (surfaced as 403 below), exactly as
-    they would from a shell on the login node.
+    No allowlist: both /browse endpoints use the user's own SSH credentials, so
+    cluster permissions are the boundary (denials surface as 403).
     """
     import posixpath
 
@@ -2739,9 +2473,7 @@ def _resolve_browse_path(path: str, current_user: dict) -> str:
 
 
 def _permission_status(exc: Exception) -> int:
-    """Map a cluster filesystem error to 403 when it's a permission denial
-    (paramiko surfaces these as OSError/IOError with errno EACCES, not
-    always the PermissionError subclass), else 500."""
+    """Returns 403 for a permission denial (paramiko raises OSError with EACCES), else 500."""
     import errno as _errno
     if isinstance(exc, PermissionError):
         return 403
@@ -2754,15 +2486,10 @@ def _permission_status(exc: Exception) -> int:
 
 @router.get("/browse")
 def browse(path: str, current_user: dict = Depends(get_current_user)):
-    """List a remote directory on the user's cluster for file-explorer
-    navigation. Returns typed entries (directories first, then files, each
-    alphabetical) plus the parent path so the front-end can render
-    breadcrumbs and an "up" control.
+    """Lists a remote directory for the file explorer: directories first, then
+    files, alphabetically, plus the parent path for breadcrumbs.
 
-    Listing runs over the user's own SSH credentials, so visibility is
-    exactly what their cluster account can already see -- no extra
-    traversal guard is needed here (unlike the job-relative endpoints,
-    which restrict to a single job's work_dir).
+    Runs with the user's own SSH credentials, so no traversal guard is needed.
     """
     import posixpath
 
@@ -2796,11 +2523,10 @@ _FINAL_SUMMARIES: dict = {}
 
 @router.get("/final_summary")
 def final_summary(path: str, current_user: dict = Depends(get_current_user)):
-    """A FINAL confidence table's report numbers (services/final_summary.py),
-    counted here instead of in the browser: the table is 10-30 MB, the
-    numbers a few hundred bytes. Read from disk when this API runs on the
-    cluster as the user, else streamed over SFTP. Kept until the file
-    changes (same size and time)."""
+    """Returns a FINAL confidence table's report numbers (services/final_summary.py).
+
+    Read from disk when this API runs on the cluster as the user, else over SFTP;
+    cached until the file's size or mtime changes."""
     import os
     from bioinformatics_tools.api.services import final_summary as fs
     from bioinformatics_tools.utilities.ssh_connection import runs_here
@@ -2831,24 +2557,21 @@ def final_summary(path: str, current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail=f"Path not found on cluster: '{path}'")
     except Exception as exc:
         raise HTTPException(status_code=_permission_status(exc), detail=f"Could not read {path}: {exc}")
-    # A few genomes' worth is plenty: drop the oldest past 64.
+    # Keeps at most 64 entries, dropping the oldest.
     while len(_FINAL_SUMMARIES) > 64:
         _FINAL_SUMMARIES.pop(next(iter(_FINAL_SUMMARIES)))
     return _FINAL_SUMMARIES[key]
 
 
-# Cap for the in-browser file viewer: read at most this many bytes so a huge
-# output file can't blow up memory or the response. The UI flags truncation.
+# Byte cap for the in-browser file viewer; the UI flags truncation.
 _VIEW_MAX_BYTES = 1_000_000
 
 
 @router.get("/browse_view")
 def browse_view(path: str, current_user: dict = Depends(get_current_user)):
-    """Return the head of an arbitrary text file from the user's cluster for
-    the file explorer's in-browser View button. Reads at most
-    _VIEW_MAX_BYTES; binary files (detected via a NUL byte) are refused
-    rather than dumped as mojibake. Same credential/permission model as
-    /browse.
+    """Returns the head of a text file on the cluster for the explorer's View button.
+
+    Reads at most _VIEW_MAX_BYTES and refuses binary files (a NUL byte).
     """
     conn = _build_connection(current_user)
     path = _resolve_browse_path(path, current_user)
@@ -2897,11 +2620,9 @@ def browse_view(path: str, current_user: dict = Depends(get_current_user)):
 
 @router.post("/browse_save")
 def browse_save(payload: dict, current_user: dict = Depends(get_current_user)):
-    """Write edited text back to a file on the user's cluster from the file
-    explorer's in-browser editor. Refuses to save over a directory, and
-    refuses truncated content (the viewer only loaded part of a large file,
-    so saving it would silently discard the rest). Same credential/permission
-    model as /browse and /browse_view.
+    """Writes edited text back to a file on the cluster from the explorer's editor.
+
+    Refuses directories and truncated content, which would discard the unread part.
     """
     path = payload.get("path", "").strip()
     content = payload.get("content", "")

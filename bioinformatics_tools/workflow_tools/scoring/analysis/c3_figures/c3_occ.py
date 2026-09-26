@@ -1,102 +1,9 @@
 """c3_occ.py - Operon Context Confidence (OCC) factor.
 
-A dynamic, per-candidate-gene factor that reads a gene's operon neighbourhood and
-returns an INDEPENDENT reliability score in [0, 1], derived purely from the
-pan-genome operon co-occurrence studies (figs 01-05).  It does NOT use C1/C2/C4.
-Prototype - NOT wired into the production scorer.
-
-------------------------------------------------------------------------------
-DERIVATION (granular, biology-faithful)
-------------------------------------------------------------------------------
-Gene identity = clean_descriptor (functional name), lower-cased.  Everything is
-organism-agnostic: statistics are pooled across all genomes by descriptor.
-
-GATE - which operons provide valid context.
-  For an operon with n_inf informative and n_unf uninformative members, the
-  operon is CONSIDERED iff  n_inf > n_unf  (strict informative majority).
-  * all-hypothetical operons are dropped (they would confuse the statistics);
-  * informative-minority / tie operons are dropped;
-  * uninformative members inside a qualifying operon are allowed but contribute
-    NO positive evidence (they carry no descriptor statistics).
-  The gate is applied BOTH when building the pan-genome statistics and when
-  scoring a candidate.
-
-PAN-GENOME PRIMITIVES (built only from qualifying operons), per descriptor pair
-(a, b), a != b:
-  present(d)   = # genomes where d is an informative member of a qualifying operon
-  copres(a,b)  = |present(a) & present(b)|          (both functions available)
-  adj(a,b)     = # genomes where a,b are IMMEDIATE operon neighbours
-  coop(a,b)    = # genomes where a,b share an operon (any distance)
-  => always  adj <= coop <= copres.
-
-STEP 1 - recurrence-aware conditional co-occurrence (the "probability").
-  Raw adj/copres can be a deceptive 1.0 at tiny support; figs 03/04 showed
-  recurrence is what earns trust.  So use the Jeffreys lower confidence bound:
-      pi_adj(a,b) = BetaInv(delta; adj + 1/2, copres - adj + 1/2)
-      pi_op (a,b) = BetaInv(delta; coop + 1/2, copres - coop + 1/2)
-  delta = 0.05 (a 95% lower bound).  Behaviour: 20/20 -> 0.91, 2/2 -> 0.43,
-  1/1 -> 0.23, 1/15 -> 0.01.  Deep, conserved partnerships score high; thin or
-  coincidental ones collapse to ~0.
-
-STEP 2 - enrichment safeguard (not-by-chance), from fig 01's configuration null.
-      E(a,b)   = deg(a) * deg(b) / (2 M)     (expected co-occurrences by chance)
-      lift     = observed(a,b) / E(a,b)
-      w(a,b)   = lift / (lift + lambda)      (lambda = 1)
-  For genuine partnerships lift is enormous so w ~ 1; only near-chance links are
-  damped.  Computed separately for the adjacency and co-operon channels.
-
-STEP 3 - link reliability (per pair, two channels):
-      rho_adj(a,b) = pi_adj(a,b) * w_adj(a,b)
-      rho_op (a,b) = pi_op (a,b) * w_op (a,b)
-
-STEP 4 - per-gene aggregation (noisy-OR over the neighbourhood).
-  For candidate g with informative immediate neighbours N (adjacency channel) and
-  non-adjacent informative co-members C (co-operon channel):
-      OCC(g) = 1 - PROD_{n in N} (1 - rho_adj(g, n))
-                 * PROD_{c in C} (1 - rho_op (g, c))
-  Semantics: the confidence that g's operon placement is corroborated by at least
-  one genuinely conserved partnership, compounded over all partners.  A single
-  rock-solid partner drives OCC -> 1; coincidental links (rho ~ 0) leave it
-  untouched; an isolated / all-hypothetical-neighbour gene gets OCC = 0.
-
-  Uninformative candidate embedded in a qualifying operon: it has no descriptor,
-  so it INHERITS the operon's coherence = mean OCC of the informative members
-  (guilt-by-association with a demonstrably real operon).
-
-APPLICATION to a base score (recommended; final integration deferred to caller).
-  OCC is centred at a neutral pivot occ0 and shifts the base score's log-odds:
-      logit(p') = logit(p_base) + beta * (OCC - occ0)
-  OCC > occ0 boosts confidence, OCC < occ0 reduces it, OCC = occ0 leaves it
-  unchanged.  beta (gain) and occ0 (pivot, e.g. dataset median OCC) are knobs.
-------------------------------------------------------------------------------
-DYNAMIC REFERENCE DATABASE (incremental, per newly-labeled organism)
-------------------------------------------------------------------------------
-The reference stores only ADDITIVE pan-genome counts (present-sets, adj/coop
-organism-sets and instance counts, degrees, M totals, #qualifying operons).
-None of these depend on any cross-organism ordering, so a freshly labeled
-organism folds in WITHOUT reprocessing the ones already in the database:
-
-    ref = new_reference()                 # or load_reference(path)
-    update_reference(ref, genes, run_root)          # add all new organisms
-    #   ... later, when organism #22 is labeled ...
-    update_reference(ref, genes22, run_root, organisms=["org22"])
-    finalize_reference(ref)               # derive rho_adj / rho_op ONCE
-    save_reference(ref, path)
-
-  * update_reference is CHEAP (counts only, ~1.2 s/organism) and idempotent
-    (organisms_added guards against double-counting).
-  * finalize_reference derives the per-pair reliabilities from the counts; it
-    is a PURE function of the counts and is memoised over the few distinct
-    (k, n) integer pairs, so it is ~0.1 s regardless of database size.
-  * PATTERN: accumulate organisms with update_reference, then finalize ONCE
-    just before scoring - do not finalize after every organism.
-  * EXACTNESS: folding organisms in one-at-a-time yields bit-for-bit identical
-    reliabilities to a from-scratch build_reference() over all of them (adding
-    an organism changes M and the copres of touched descriptors, so rho shifts
-    globally - but finalize recomputes every pair, keeping it exact).
-  * build_reference() is the batch convenience wrapper (new + update-all +
-    finalize) and is kept for backward compatibility.
-------------------------------------------------------------------------------
+Scores each gene in [0, 1] from pan-genome operon co-occurrence of its operon
+partners, pooled by clean_descriptor and restricted to operons with an
+informative majority. The reference holds additive counts, so organisms fold in
+incrementally; finalize_reference() derives the per-pair reliabilities.
 """
 import csv
 import re
@@ -116,11 +23,12 @@ DEFAULTS = dict(
 
 
 def _norm(d):
+    """Returns the lower-cased, stripped descriptor ("" for None)."""
     return (d or "").strip().lower()
 
 
 def build_contig_map(run_root, organisms):
-    """(organism, feature_id) -> contig id, parsed from gene_id."""
+    """Returns {(organism, feature_id): contig id}, parsed from gene_id in labeled-genes.tsv."""
     rx = re.compile(r"^(.*)_(\d+)([+-])(\d+)$")
     m = {}
     for org in organisms:
@@ -140,6 +48,7 @@ def build_contig_map(run_root, organisms):
 
 
 def _key(a, b):
+    """Returns the unordered pair as a sorted tuple."""
     return (a, b) if a < b else (b, a)
 
 
@@ -147,12 +56,9 @@ REF_VERSION = 2   # bump when the counts schema changes
 
 
 def new_reference(params=None):
-    """Create an empty, dynamic OCC reference (a growable "database").
+    """Returns an empty OCC reference holding additive pan-genome counts.
 
-    Holds only the ADDITIVE pan-genome counts; the per-pair reliabilities
-    (rho_adj / rho_op) are derived from them by finalize_reference().  Because
-    every field is additive across organisms, a newly labeled organism can be
-    folded in with update_reference() WITHOUT reprocessing the existing ones."""
+    rho_adj / rho_op are filled later by finalize_reference()."""
     p = dict(DEFAULTS)
     if params:
         p.update(params)
@@ -176,7 +82,7 @@ def new_reference(params=None):
 
 
 def _accumulate_organism(ref, org, org_genes, contig):
-    """Fold ONE organism's qualifying operons into ref's additive counts."""
+    """Adds one organism's qualifying operons to ref's additive counts."""
     uninf = {f: bool(u) for f, u in
              zip(org_genes["feature_id"], org_genes["uninformative"])}
     cln = {f: _norm(c) for f, c in
@@ -186,7 +92,7 @@ def _accumulate_organism(ref, org, org_genes, contig):
         if not str(oid).startswith("operon_"):
             continue
         recs = sub.sort_values("start").to_dict("records")
-        # informative-majority gate
+        # Keeps only operons with a strict informative majority.
         inf_recs = [r for r in recs if not uninf[r["feature_id"]]
                     and cln[r["feature_id"]]]
         n_inf = len(inf_recs)
@@ -195,12 +101,12 @@ def _accumulate_organism(ref, org, org_genes, contig):
             continue
         ref["n_qualifying_operons"] += 1
 
-        # present (informative members of a qualifying operon)
+        # Records which organisms carry each informative descriptor.
         inf_descs = {cln[r["feature_id"]] for r in inf_recs}
         for d in inf_descs:
             ref["present"][d].add(org)
 
-        # --- co-operon channel: unique informative descriptor pairs ---------
+        # Co-operon channel: every unique informative descriptor pair.
         dl = sorted(inf_descs)
         for i in range(len(dl)):
             for j in range(i + 1, len(dl)):
@@ -211,7 +117,7 @@ def _accumulate_organism(ref, org, org_genes, contig):
                 ref["deg_op"][dl[j]] += 1
                 ref["M_op"] += 1
 
-        # --- adjacency channel: consecutive informative genes (same contig) -
+        # Adjacency channel: consecutive informative genes on the same contig.
         for a, b in zip(recs[:-1], recs[1:]):
             fa, fb = a["feature_id"], b["feature_id"]
             if contig.get((org, fa)) != contig.get((org, fb)):
@@ -230,15 +136,10 @@ def _accumulate_organism(ref, org, org_genes, contig):
 
 
 def update_reference(ref, genes, run_root, organisms=None, skip_existing=True):
-    """Fold one or more organisms into the reference IN PLACE (the dynamic path).
+    """Folds organisms into the reference in place and returns it un-finalized.
 
-    genes       : DataFrame with at least the organisms to add.
-    organisms   : which organisms to add; default = every organism in ``genes``
-                  not already present in the reference.
-    skip_existing : silently skip organisms already added (idempotent); set
-                  False to raise instead.
-    Leaves the reference un-finalized (rho tables stale) -> call
-    finalize_reference() before scoring.  Returns ref."""
+    organisms defaults to every organism in genes not yet in ref; organisms
+    already present are skipped, or raise when skip_existing is False."""
     all_orgs = sorted(genes["organism"].unique())
     if organisms is not None:
         all_orgs = [o for o in all_orgs if o in set(organisms)]
@@ -262,9 +163,10 @@ def update_reference(ref, genes, run_root, organisms=None, skip_existing=True):
 
 
 def finalize_reference(ref):
-    """Derive the per-pair reliabilities rho_adj / rho_op from the current
-    counts.  Pure function of the counts, so it can be re-run cheaply after
-    every update_reference().  Returns ref."""
+    """Derives rho_adj / rho_op from the counts and returns ref.
+
+    rho = Jeffreys lower bound BetaInv(delta; k+1/2, copres-k+1/2) times the
+    enrichment weight lift/(lift+lambda), with lift = observed / (deg_a*deg_b/2M)."""
     delta = ref["params"]["delta"]
     lam = ref["params"]["lam"]
     use_w = ref["params"]["use_enrichment"]
@@ -273,6 +175,7 @@ def finalize_reference(ref):
     _lb_cache = {}
 
     def _lb(k, n):
+        """Returns the memoised Jeffreys lower bound for k of n (scipy.stats.beta)."""
         if n <= 0:
             return 0.0
         k = min(k, n)
@@ -284,6 +187,7 @@ def finalize_reference(ref):
         return v
 
     def _w(inst, da, db, deg, M):
+        """Returns the not-by-chance weight from the configuration-model lift."""
         if not use_w or M <= 0:
             return 1.0
         E = deg[da] * deg[db] / (2.0 * M)
@@ -311,7 +215,7 @@ def finalize_reference(ref):
 
 
 def save_reference(ref, path):
-    """Persist the reference database (counts + derived tables) to disk."""
+    """Pickles the reference (counts and derived tables) to path."""
     import pickle
     from pathlib import Path
     path = Path(path)
@@ -322,7 +226,7 @@ def save_reference(ref, path):
 
 
 def load_reference(path):
-    """Load a reference database previously written by save_reference()."""
+    """Loads a pickled reference and checks its schema version."""
     import pickle
     with open(path, "rb") as fh:
         ref = pickle.load(fh)
@@ -333,11 +237,7 @@ def load_reference(path):
 
 
 def build_reference(genes, run_root, params=None):
-    """Convenience batch build = new + update(all organisms) + finalize.
-
-    Produces exactly the same reliabilities as folding the organisms in one at a
-    time via update_reference(); use the incremental path for the dynamic
-    database, this one for a from-scratch build."""
+    """Builds and finalizes a reference from every organism in genes in one go."""
     ref = new_reference(params)
     update_reference(ref, genes, run_root)
     finalize_reference(ref)
@@ -345,27 +245,24 @@ def build_reference(genes, run_root, params=None):
 
 
 def rho_adj(a, b, ref):
+    """Returns the adjacency-channel reliability of a descriptor pair (0 if unseen)."""
     if not a or not b or a == b:
         return 0.0
     return ref["rho_adj"].get(_key(_norm(a), _norm(b)), 0.0)
 
 
 def rho_op(a, b, ref):
+    """Returns the co-operon-channel reliability of a descriptor pair (0 if unseen)."""
     if not a or not b or a == b:
         return 0.0
     return ref["rho_op"].get(_key(_norm(a), _norm(b)), 0.0)
 
 
 def occ_for_gene(descriptor, adjacent_descs, cooperon_descs, ref, detail=False):
-    """Dynamic OCC for one informative candidate gene.
+    """Returns the noisy-OR OCC, 1 - prod(1 - rho), over a gene's operon partners.
 
-    descriptor      : candidate clean_descriptor (informative).
-    adjacent_descs  : informative descriptors of the candidate's IMMEDIATE
-                      operon neighbours (in the genome being scored).
-    cooperon_descs  : informative descriptors of the candidate's NON-adjacent
-                      operon co-members.
-    Returns OCC in [0, 1] (or, if detail=True, a dict with the OCC plus the
-    partner count, best partner and best link reliability).
+    adjacent_descs are immediate neighbours, cooperon_descs the other co-members;
+    detail=True returns a dict with partner count and best partner/rho/channel.
     """
     d = _norm(descriptor)
     if not d:
@@ -405,12 +302,9 @@ def occ_for_gene(descriptor, adjacent_descs, cooperon_descs, ref, detail=False):
 
 
 def compute_all_genes(genes, run_root, params=None, ref=None):
-    """Compute OCC for every gene that sits in a qualifying operon.
+    """Returns a per-gene OCC DataFrame for every gene in a qualifying operon.
 
-    Returns a DataFrame: organism, feature_id, clean_descriptor, operon_id,
-    uninformative, n_inf_context, n_partners, best_partner, best_rho,
-    best_channel, occ, plus a fitted neutral pivot in .attrs["occ0"].
-    A prebuilt ``ref`` (from build_reference) may be supplied to avoid rebuilding.
+    The median informative OCC is stored in .attrs["occ0"]; ref is built if not given.
     """
     import pandas as pd
     if ref is None:
@@ -439,14 +333,13 @@ def compute_all_genes(genes, run_root, params=None, ref=None):
         if n_inf <= n_unf or n_inf == 0:
             continue  # operon does not qualify -> OCC undefined
 
-        # position index for adjacency lookup
         member_occ = {}
         for idx, r in enumerate(recs):
             fid = r["feature_id"]
             d = cln[(org, fid)]
             if uninf[(org, fid)] or not d:
                 continue
-            # immediate informative neighbours
+            # Immediate informative neighbours on the same contig.
             adj = []
             for nb in (recs[idx - 1] if idx > 0 else None,
                        recs[idx + 1] if idx + 1 < len(recs) else None):
@@ -471,7 +364,7 @@ def compute_all_genes(genes, run_root, params=None, ref=None):
                              best_partner=det["best_partner"], best_rho=det["best_rho"],
                              best_channel=det["best_channel"], occ=det["occ"]))
 
-        # uninformative members inherit operon coherence = mean informative OCC
+        # Uninformative members inherit the mean OCC of the informative members.
         coherence = float(np.mean(list(member_occ.values()))) if member_occ else 0.0
         for r in recs:
             fid = r["feature_id"]
@@ -491,7 +384,7 @@ def compute_all_genes(genes, run_root, params=None, ref=None):
 
 
 def apply_occ(base_prob, occ, occ0, beta=1.0):
-    """Recommended log-odds application: shift base_prob by OCC around pivot occ0."""
+    """Returns base_prob shifted in log-odds by beta * (occ - occ0)."""
     p = min(max(float(base_prob), 1e-6), 1 - 1e-6)
     logit = np.log(p / (1 - p)) + beta * (float(occ) - float(occ0))
     return 1.0 / (1.0 + np.exp(-logit))

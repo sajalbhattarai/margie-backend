@@ -1,13 +1,7 @@
-"""Load licensing terms + catalog, record acceptances, and check acceptance.
+"""Loads the licensing terms and tool catalog, records acceptances and checks them.
 
-Data files (same directory):
-  - terms.md               versioned acceptance terms (first line carries the version)
-  - licensing_catalog.json per-tool license metadata + provenance
-
-Environment overrides:
-  - LICENSE_RECORDS_DIR   base dir for the signed record copies
-                          (default: /depot/lindems/data/margie/licensing-records)
-  - MARGIE_OPERATOR       operator identifier used in the record path (default: lindems)
+Reads terms.md (version on its first line) and licensing_catalog.json from this directory.
+LICENSE_RECORDS_DIR and MARGIE_OPERATOR override where record copies are written.
 """
 from __future__ import annotations
 
@@ -28,8 +22,7 @@ _CATALOG_PATH = _HERE / "licensing_catalog.json"
 _DEFAULT_RECORDS_DIR = "/depot/lindems/data/margie/licensing-records"
 _VERSION_RE = re.compile(r"terms_version:\s*([0-9A-Za-z._-]+)")
 
-# The acknowledgments the user must check. Keep ids stable — they are stored in
-# each acceptance record. Text mirrors terms.md ("Your acknowledgments").
+# Acknowledgments the user must check; ids are stored in each record, text mirrors terms.md.
 ACK_ITEMS = [
     {
         "id": "lawful_use",
@@ -58,8 +51,7 @@ ACK_ITEMS = [
 ]
 _REQUIRED_ACK_IDS = {item["id"] for item in ACK_ITEMS}
 
-# How the user intends to use MARGIE. Drives whether commercial_restricted tools
-# are gated. Keep ids stable — stored in each acceptance record.
+# Usage types; commercial use gates the commercial_restricted tools. Ids are stored in each record.
 USAGE_ACADEMIC = "academic"
 USAGE_COMMERCIAL = "commercial"
 USAGE_TYPES = [
@@ -75,7 +67,7 @@ _COMMERCIAL_TIER = "commercial_restricted"
 
 
 def gated_tool_ids() -> dict[str, set[str]]:
-    """Tool ids grouped by the two gated tiers ({'blocked': {...}, 'commercial_restricted': {...}})."""
+    """Returns tool ids grouped by the two gated tiers, 'blocked' and 'commercial_restricted'."""
     catalog = load_catalog()
     out: dict[str, set[str]] = {_BLOCKED_TIER: set(), _COMMERCIAL_TIER: set()}
     for t in catalog.get("tools", []):
@@ -86,15 +78,10 @@ def gated_tool_ids() -> dict[str, set[str]]:
 
 
 def disabled_tool_ids(usage_type: str | None, licensed_ids: Iterable[str] | None) -> set[str]:
-    """Tool ids the user is NOT entitled to run, given their usage type and the
-    tools they have licensed themselves.
+    """Returns the tool ids the user may not run, given usage type and own licenses.
 
-    - ``blocked`` tools (Phobius, SignalP 4/6, MEROPS): disabled unless the user
-      has licensed that specific tool — this holds for everyone, academic or
-      not, because "blocked" means you must obtain your own copy.
-    - ``commercial_restricted`` tools (TMbed, TCDB, KEGG): free for academic /
-      non-profit use; for commercial use, disabled unless the user has licensed
-      that specific tool.
+    Blocked tools are disabled for everyone without their own license; commercial_restricted
+    tools are disabled only for commercial use without one.
     """
     licensed = set(licensed_ids or [])
     gated = gated_tool_ids()
@@ -105,8 +92,7 @@ def disabled_tool_ids(usage_type: str | None, licensed_ids: Iterable[str] | None
 
 
 def get_entitlement(username: str) -> dict:
-    """Return {usage_type, licensed_tools} from the user's CURRENT-terms
-    acceptance (usage_type=None, licensed_tools=[] if they haven't accepted)."""
+    """Returns {usage_type, licensed_tools} from the user's current-terms acceptance, or empty values."""
     current = load_terms()["version"]
     with get_db() as db:
         row = db.execute(
@@ -125,10 +111,7 @@ def get_entitlement(username: str) -> dict:
 
 def save_depot_record(username: str, record: dict, terms_text: str,
                       timestamp: str | None = None) -> str | None:
-    """Best-effort mirror of an acceptance record to the depot records dir.
-    Returns the path, or None on any failure (never raises) — used by the CLI
-    gate, which must not fail a run just because the shared record dir is
-    unreachable."""
+    """Copies an acceptance record to the depot records dir; returns the path or None, never raises."""
     ts = timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     try:
         return _write_record_file(
@@ -145,9 +128,7 @@ def _local_records_dir() -> Path:
 
 def save_local_record(username: str, record: dict, terms_text: str,
                       timestamp: str | None = None) -> str | None:
-    """Best-effort per-acceptance archive under the user's own data dir, so there
-    is always a durable, timestamped local copy of each acceptance (in addition
-    to the shared/depot copy). Never raises."""
+    """Writes a timestamped copy of an acceptance under the user's data dir; never raises."""
     ts = timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     try:
         return _write_record_file(
@@ -167,7 +148,7 @@ def _operator() -> str:
 
 
 def load_terms() -> dict:
-    """Return {version, text, sha256} for the current terms.md."""
+    """Returns {version, text, sha256} for the current terms.md."""
     text = _TERMS_PATH.read_text(encoding="utf-8")
     first_line = text.splitlines()[0] if text else ""
     m = _VERSION_RE.search(first_line)
@@ -177,12 +158,12 @@ def load_terms() -> dict:
 
 
 def load_catalog() -> dict:
-    """Return the parsed licensing_catalog.json."""
+    """Returns the parsed licensing_catalog.json."""
     return json.loads(_CATALOG_PATH.read_text(encoding="utf-8"))
 
 
 def build_terms_payload() -> dict:
-    """The full payload the frontend needs to render the gate."""
+    """Builds the payload the frontend uses to render the license gate."""
     terms = load_terms()
     catalog = load_catalog()
     tools = catalog.get("tools", [])
@@ -201,7 +182,7 @@ def build_terms_payload() -> dict:
 
 
 def has_accepted_current_terms(username: str) -> bool:
-    """True if the user has an acceptance row matching the CURRENT terms version."""
+    """Returns True if the user has an acceptance row for the current terms version."""
     current = load_terms()["version"]
     with get_db() as db:
         row = db.execute(
@@ -212,14 +193,9 @@ def has_accepted_current_terms(username: str) -> bool:
 
 
 def revoke_current_acceptance(username: str) -> int:
-    """Delete the current-terms acceptance row(s) for a user so the license
-    gate re-prompts them on the analyze page.
+    """Deletes the user's current-terms acceptance rows and returns how many were removed.
 
-    Only the app-side gate state is cleared; the immutable depot record of
-    the original acceptance is intentionally left in place as legal history
-    (an acceptance genuinely happened, even if the user later revokes going
-    forward). Returns the number of rows removed (0 if the user hadn't
-    accepted the current terms)."""
+    The depot record of the acceptance is kept as legal history."""
     current = load_terms()["version"]
     with get_db() as db:
         cur = db.execute(
@@ -233,14 +209,11 @@ def _write_record_file(
     *, username: str, record: dict, terms_text: str, timestamp: str,
     base_dir: Path | None = None,
 ) -> str:
-    """Write the exact terms copy + machine-readable record under a records dir.
+    """Writes terms.txt and record.json to <base_dir>/<timestamp>/<operator>/<username>/.
 
-    Layout: <base_dir>/<timestamp>/<operator>/<username>/{terms.txt,record.json}
-    Returns the directory path as a string. Best-effort: raises on failure so the
-    caller can decide whether to still record the DB row.
+    Returns the directory path; raises on failure so the caller decides what to do.
     """
     operator = _operator()
-    # sanitize username for a path segment
     safe_user = re.sub(r"[^A-Za-z0-9._-]", "_", username) or "user"
     dest = (base_dir or _records_dir()) / timestamp / operator / safe_user
     dest.mkdir(parents=True, exist_ok=True)
@@ -260,10 +233,9 @@ def record_acceptance(
     usage_type: str,
     licensed_tools: list[str] | None = None,
 ) -> dict:
-    """Validate + persist an acceptance. Returns {terms_version, accepted_at, depot_record_path}.
+    """Validates and stores an acceptance; returns its version, time and depot record path.
 
-    Raises ValueError if not all required acknowledgments were accepted, or if
-    usage_type is not one of USAGE_TYPES.
+    Raises ValueError when an acknowledgment is missing or usage_type is unknown.
     """
     if not _REQUIRED_ACK_IDS.issubset(set(accepted_items)):
         missing = _REQUIRED_ACK_IDS - set(accepted_items)
@@ -289,14 +261,11 @@ def record_acceptance(
         "accepted_acknowledgments": accepted_items,
         "usage_type": usage_type,
         "licensed_tools": licensed_tools,
-        # Exact snapshot of the per-tool license details shown to the user, so
-        # the depot record holds precisely what was displayed and accepted.
+        # Snapshot of the per-tool license details exactly as shown.
         "license_catalog": catalog,
     }
 
-    # Write the exact copy to the depot records dir. If that fails we still
-    # record the DB row (with a null path) so the acceptance is not lost, but
-    # we surface the error path so operators can tell a copy is missing.
+    # A failed depot copy still stores the DB row (null path) and reports the error.
     depot_path = None
     depot_error = None
     try:

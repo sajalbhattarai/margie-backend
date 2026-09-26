@@ -1,28 +1,10 @@
 #!/usr/bin/env python3
-"""score-c2-operon-probability.py — margie_sb phase11 (scoring), metric
-C2: raw pairwise operon probability (per gene).
+"""score-c2-operon-probability.py — scoring stage, metric C2: pairwise operon probability.
 
-C2 is the gene's own raw UniOP pairwise operon probability -- its local
-operon-bond strength. (The operon-level geometric-mean aggregation is C3's
-job, Operon Context Confidence.)
-
-A gene in the middle of an operon has TWO adjacency probabilities (to its
-upstream and its downstream neighbour); a gene at either end of the operon has
-one.  C2 = the MEAN of the gene's available raw pairwise probabilities.  These
-per-pair values come from operon/operon_results.tsv
-(OPERON_upstream_pairwise_probability / OPERON_downstream_pairwise_probability);
-the operon-info file only carries the operon-level geometric mean, which C2
-does not use.
-
-C2 rules:
-  - "NOT_APPLICABLE_NON_CODING" (RNA features)  -> no score at all ("").
-  - "NOT_IN_AN_OPERON" (singleton)              -> neutral 0.5 (being a
-    singleton isn't evidence against the label, just a different context).
-  - in an operon, with >=1 raw pairwise prob    -> mean of those probs.
-  - in an operon but no pairwise prob available -> neutral 0.5.
-
-Output (labeled-genes-c2-operon-probability.tsv): identity columns,
-c2_score_from_operon_probability, c2_operon_id, c2_formula.
+C2 is the mean of the gene's raw UniOP pairwise probabilities to its upstream
+and downstream neighbours, read from operon/operon_results.tsv. Singletons and
+operon members without a pairwise value get a neutral 0.5; RNA features get no
+score. The raw UniOP value is reported separately so 0.5 fallbacks stand out.
 """
 import argparse
 import csv
@@ -45,7 +27,7 @@ _EMPTY_TOKENS = {"", "NA", "N/A", "None", "none", "nan", "NaN"}
 
 
 def load_pairwise_probs(operon_results_path):
-    """feature_id -> [raw pairwise probabilities] (upstream and/or downstream)."""
+    """Reads operon_results.tsv with csv into {feature_id: [upstream/downstream pairwise probabilities]}."""
     probs = {}
     p = Path(operon_results_path)
     if not p.is_file():
@@ -75,12 +57,8 @@ def load_pairwise_probs(operon_results_path):
 def compute_c2(operon_id, pairwise_probs):
     """Returns (c2_text, raw_uniop_text, formula_text) for one gene.
 
-    raw_uniop_text is the EXACT UniOP operon probability (the mean of the gene's
-    raw pairwise probabilities) when one exists, and is BLANK when the gene has no
-    UniOP probability at all -- a singleton, an operon member with no pairwise
-    probability, or a non-coding feature.  C2 itself substitutes the neutral value
-    0.5 in those cases, so reporting the raw value separately means a reader can
-    always tell a genuine UniOP probability from the 0.5 neutral fallback."""
+    raw_uniop_text is blank whenever C2 uses the neutral fallback.
+    """
     if operon_id == "NOT_APPLICABLE_NON_CODING":
         return "", "", "non-coding feature, C2 not applicable"
     if operon_id == "NOT_IN_AN_OPERON":
@@ -104,6 +82,7 @@ def compute_c2(operon_id, pairwise_probs):
 
 
 def main() -> None:
+    """Streams the operon-info table with csv and writes the C2 table."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--operon-input", required=True,

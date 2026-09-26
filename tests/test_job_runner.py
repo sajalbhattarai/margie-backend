@@ -1,17 +1,13 @@
 """
-Unit tests for bioinformatics_tools.api.services.job_runner's log-parsing
-regexes -- no SSH/SLURM involved, pure string matching.
+Unit tests for the log-parsing regexes in bioinformatics_tools.api.services.job_runner.
 """
 from bioinformatics_tools.api.services.job_runner import (
     SLURM_SUBMIT_RE, RULE_NAME_FROM_LOG_PATH_RE, SEQUENTIAL_GENOME_RE)
 
 
 class TestSlurmSubmitRegex:
-    """SLURM_SUBMIT_RE only extracts (slurm_id, log_path) now -- genome
-    attribution needs the full path to read that job's own log file later
-    (ssh_slurm.get_job_genome), so rule-name resolution from the path is a
-    separate regex (RULE_NAME_FROM_LOG_PATH_RE) applied to group(2), mirroring
-    the actual two-step extraction in run_ssh_task."""
+    """Tests SLURM_SUBMIT_RE (slurm_id, log_path) and RULE_NAME_FROM_LOG_PATH_RE applied
+    to the log path, the two-step extraction used in run_ssh_task."""
 
     def test_captures_slurm_id_and_full_log_path(self):
         line = (
@@ -29,12 +25,8 @@ class TestSlurmSubmitRegex:
         assert group_name is None
 
     def test_grouped_rule_captures_only_the_short_group_name(self):
-        """run_<tool> and load_<tool>_to_db share one SLURM submission per
-        genome (see margie_sb.smk's group: directives) -- the displayed
-        name must be the group's own short name ("rasttk"), not the
-        snakemake-generated concatenation of every rule in the group
-        ("load_rasttk_to_db_run_rasttk"), which read as if only the load
-        step ran when the run step's real work happens in the same job."""
+        """Checks that a grouped job shows the group's short name ("rasttk"), not the
+        concatenated rule names Snakemake generates."""
         log_path = "/path/.snakemake/slurm_logs/group_rasttk_load_rasttk_to_db_run_rasttk/39608085.log"
         rule_name, group_name = RULE_NAME_FROM_LOG_PATH_RE.search(log_path).groups()
         assert rule_name is None
@@ -47,8 +39,7 @@ class TestSlurmSubmitRegex:
         assert group_name == "kegg"
 
     def test_displayed_name_resolution_prefers_rule_over_group(self):
-        """Mirrors the `ungrouped_rule_name or group_name` expression used
-        at the actual call site in run_ssh_task."""
+        """Mirrors the `rule_name or group_name` expression in run_ssh_task."""
         ungrouped_path = "/p/.snakemake/slurm_logs/rule_run_quast_batch/1.log"
         grouped_path = "/p/.snakemake/slurm_logs/group_rasttk_load_rasttk_to_db_run_rasttk/2.log"
 
@@ -59,9 +50,7 @@ class TestSlurmSubmitRegex:
         assert (rule_name or group_name) == "rasttk"
 
     def test_real_full_line_with_uuid_jobid_prefix(self):
-        """The orchestrator's own internal jobid is a UUID for group jobs
-        (GroupJob.jobid), not a small int -- confirmed directly against a
-        real dane-api log. SLURM_SUBMIT_RE must not assume it's numeric."""
+        """Checks a real log line where the Snakemake jobid of a group job is a UUID."""
         line = (
             "[2026-06-23 04:53:32] INFO bioinformatics_tools.workflow_tools.workflow: "
             "[snakemake] Job f2bd3300-d2be-5a07-91a9-b299cb448c4f has been submitted "
@@ -76,10 +65,7 @@ class TestSlurmSubmitRegex:
 
 
 class TestSequentialGenomeRegex:
-    """margie_sb's sequential per-organism orchestrator (workflow.py's
-    _run_pipeline_batch_sequential) prints one marker line per genome
-    transition -- see this module's own SEQUENTIAL_GENOME_RE comment for
-    why that's needed alongside STEPS_PROGRESS_RE."""
+    """Tests the per-genome marker line printed by workflow.py's _run_pipeline_batch_sequential."""
 
     def test_matches_marker_line(self):
         line = "=== SEQUENTIAL: genome 3/12 (Genus_species) phase4-8 starting ==="

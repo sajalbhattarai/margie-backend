@@ -1,29 +1,10 @@
 #!/usr/bin/env python3
-"""filter-no-stat.py — Stage 3 of margie_sb's consolidation pipeline.
+"""filter-no-stat.py — stage 3 of consolidation.
 
-Reads merge-all-columns.py's output (not the original per-tool files) and
-produces a clean, stat-free, location-free, provenance-free view: just
-identity, ids/descriptions, and core localization/topology calls.
-
-Two different simplifications happen here, by tool shape:
-
-  - Annotation-database tools (COG, KEGG, eggNOG, PFAM, TIGRFAM, PGAP,
-    MEROPS, TCDB, dbCAN, UniProt, every interpro_<db>, GeneProp): their
-    _id/_description columns are copied through as-is. merge-all-columns.py
-    already keyed multi-hit values by accession ("PF00712.25: ...;
-    PF02768.21: ..."), and that pairing stays -- you still need it to know
-    which description belongs to which id when there's more than one hit.
-
-  - Topology/localization tools (TMBED, Phobius, DeepSig): merge-all-
-    columns.py keyed their multi-segment values by coordinate range
-    ("0-24: inside; 25-50: transmembrane_helix; ..."). Here those
-    coordinates get stripped entirely -- this view only answers "which
-    kinds of region does this protein have," not "score" or "where."
-    Repeated labels collapse to one entry, in first-occurrence order.
-
-PSORTb/SignalP4/SignalP6/Operon are always exactly one row per gene in
-merge-all-columns.py already (no coordinate-keying ever applied to them),
-so their one core prediction column is copied through directly.
+Reduces merge-all-columns.py's table to identity, id/description columns and
+core localisation/topology calls. Annotation id/description columns pass
+through with their accession keys; topology columns (TMBED, Phobius, DeepSig)
+lose their coordinate keys and keep distinct labels in first-seen order.
 """
 from __future__ import annotations
 
@@ -36,10 +17,9 @@ csv.field_size_limit(10_000_000)
 
 
 def dedup_labels_from_keyed_string(value: str) -> str:
-    """'0-24: inside; 25-50: transmembrane_helix; 51-61: inside' -> 'inside; transmembrane_helix'
+    """Strips "key: " prefixes from a "; "-joined string and keeps distinct labels in order.
 
-    Strips the "key: " prefix from each "; "-separated entry and keeps
-    only the first occurrence of each distinct label.
+    '0-24: inside; 25-50: transmembrane_helix; 51-61: inside' -> 'inside; transmembrane_helix'
     """
     if not value:
         return ""
@@ -55,17 +35,15 @@ def dedup_labels_from_keyed_string(value: str) -> str:
 
 
 def coalesce_phobius_topology(row: dict[str, str]) -> str:
-    """Phobius splits topology across two columns (segment_type:
-    DOMAIN/TRANSMEM, segment_label: CYTOPLASMIC/NON CYTOPLASMIC -- only
-    populated for DOMAIN rows). Use the label when present, else the type,
-    matching TMBED's single-column shape, then dedup like any other
-    coordinate-keyed topology column."""
+    """Combines Phobius segment_type and segment_label into one deduplicated topology string.
+
+    Each segment uses its label when present, else its type.
+    """
     type_val = row.get("PHOBIUS_segment_type", "")
     label_val = row.get("PHOBIUS_segment_label", "")
     if not type_val and not label_val:
         return ""
-    # Both columns are coordinate-keyed the same way ("idx: value; ..."),
-    # built from the same ordered segment list -- zip entry-by-entry.
+    # Both columns share the same ordered segment keys, so entries pair by index.
     type_parts = type_val.split("; ") if type_val else []
     label_parts = label_val.split("; ") if label_val else []
     combined: list[str] = []
@@ -82,11 +60,8 @@ def coalesce_phobius_topology(row: dict[str, str]) -> str:
 
 
 # ─── Column plan ────────────────────────────────────────────────────────────────
-#
-# Each entry: (output_column_name, source_column_name_in_merged_tsv, kind)
-#   kind == "copy"        -- passthrough, no transform
-#   kind == "dedup"       -- strip coordinate/accession keys, dedup labels
-#   kind == "phobius"     -- special two-column coalesce + dedup
+# Entries are (output column, source column, kind); kind is "copy",
+# "dedup" (strip keys, dedup labels) or "phobius" (two-column coalesce).
 
 IDENTITY_COLUMNS: list[tuple[str, str, str]] = [
     ("feature_id", "feature_id", "copy"),
@@ -140,6 +115,7 @@ ENVELOPE_COLUMNS: list[tuple[str, str, str]] = [
 
 
 def build_column_plan(header: set[str]) -> list[tuple[str, str, str]]:
+    """Returns the output column plan restricted to columns present in the merged header."""
     plan: list[tuple[str, str, str]] = list(IDENTITY_COLUMNS)
     for prefix in ANNOTATION_ID_DESCRIPTION_TOOLS:
         id_col, desc_col = f"{prefix}_id", f"{prefix}_description"
@@ -156,6 +132,7 @@ def build_column_plan(header: set[str]) -> list[tuple[str, str, str]]:
 
 
 def transform_value(row: dict[str, str], source_col: str, kind: str) -> str:
+    """Returns one output cell for a row according to the plan entry's kind."""
     if kind == "copy":
         return row.get(source_col, "")
     if kind == "dedup":
@@ -166,6 +143,7 @@ def transform_value(row: dict[str, str], source_col: str, kind: str) -> str:
 
 
 def main() -> None:
+    """Streams the merged TSV through the column plan with csv and writes the filtered TSV."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", required=True, help="merge-all-columns.py's output TSV")

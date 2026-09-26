@@ -1,52 +1,10 @@
 #!/usr/bin/env python3
-"""score-confidence-tier.py — margie_sb phase11 (scoring), step 2:
-combined confidence tier.
+"""score-confidence-tier.py — scoring stage, step 2: combined confidence tier.
 
-Reads score-hierarchy-tier.py's output (labeled-genes-hierarchy-tier.tsv)
-and add-ec-consensus.py's output (labeled-genes-ec-consensus.tsv, from
-phase10/labeling), joins on feature_id, and combines the two INDEPENDENT
-confidence signals into one named confidence_tier -- how much trust the
-winning tool's curation tier (hierarchy_tier_score) deserves, corroborated
-or contradicted by what independent EC evidence says (ec_agreement_score).
-
-Both READ-ONLY inputs -- this script never modifies either upstream
-table, same "one core table, several focused derived views" pattern used
-throughout this pipeline.
-
-EC_AGREEMENT_SCORE mapping (see add-ec-consensus.py for the full
-agreement-classification reasoning):
-  full_consensus      -> +2  every independent tool that reported an EC
-                              agrees -- strong corroboration.
-  majority_consensus  -> +1  a shared core exists, but one tool reports
-                              something extra unconfirmed.
-  single_source       ->  0  real evidence, but nothing independent to
-                              check it against -- neutral, not a penalty.
-  no_evidence         ->  0  silence isn't evidence against the label --
-                              most non-enzymatic genes legitimately have
-                              no EC at all. Neutral, not a penalty.
-  conflicting         -> -2  independent sources actively disagree with
-                              EACH OTHER, regardless of how trusted the
-                              winning tool's TEXT is. This is the one
-                              status that overrides the combined score
-                              entirely below.
-
-CONFIDENCE_TIER (combined_score = hierarchy_tier_score + ec_agreement_score):
-  flagged_for_review  -- ec_agreement_status == "conflicting", ALWAYS,
-                          overriding combined_score. Independent evidence
-                          disagreeing is worth a reviewer's attention no
-                          matter how curated the winning tool is.
-  high                -- combined_score >= 5 (e.g. tier4 hierarchy +
-                          full_consensus, or tier4 + majority_consensus).
-  moderate            -- combined_score in [2, 4].
-  low                 -- combined_score < 2, OR hierarchy_tier_score was
-                          already "no_qualifying_winner" (-1) to begin
-                          with, regardless of any EC signal.
-
-A single hierarchy-tier winner is not uniformly trustworthy -- among
-genes won by the same tool, the underlying EC evidence can range from
-full independent agreement to active conflict. This script turns that
-split into an actionable per-gene flag instead of treating every winner
-from one tool as equally reliable.
+combined_score = hierarchy_tier_score + ec_agreement_score, where EC status maps
+full_consensus +2, majority_consensus +1, single_source/no_evidence 0,
+conflicting -2. Tiers: flagged_for_review whenever EC status is conflicting;
+high at >= 5; moderate at 2-4; low below 2 or without a qualifying winner.
 """
 import argparse
 import csv
@@ -76,7 +34,7 @@ _IDENTITY_COLUMNS = [
 
 
 def score_confidence_tier(hierarchy_tier_score, ec_agreement_status):
-    """Returns (combined_score, confidence_tier)."""
+    """Returns (combined_score, confidence_tier) from the hierarchy score and EC status."""
     ec_score = EC_AGREEMENT_SCORE.get(ec_agreement_status, 0)
     combined_score = hierarchy_tier_score + ec_score
 
@@ -92,6 +50,7 @@ def score_confidence_tier(hierarchy_tier_score, ec_agreement_status):
 
 
 def main() -> None:
+    """Joins hierarchy tiers to EC status with csv and writes the confidence tier table."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--hierarchy-tier-input", required=True,

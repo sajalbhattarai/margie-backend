@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Update the depot-hosted OCC reference with one organism (idempotent).
+"""Adds one organism to the depot-hosted OCC reference (idempotent).
 
-This runs before per-organism C3 scoring so scoring always reads the latest
-cross-organism operon database from depot.
+Runs before per-organism C3 scoring so scoring reads the current cross-organism
+operon database.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import c3_occ  # noqa: E402
 
 
 def _read_organism_from_labeled(labeled_path: Path) -> str:
+    """Returns organism_name from the first row of labeled-genes.tsv (csv)."""
     with labeled_path.open(newline="") as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
             return (row.get("organism_name") or "").strip()
@@ -28,6 +29,7 @@ def _read_organism_from_labeled(labeled_path: Path) -> str:
 
 
 def main() -> None:
+    """Loads the organism's genes and, under an fcntl lock, adds them to the OCC reference and writes a token file."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--organism", required=True, help="Genome stem / organism name")
     ap.add_argument("--labeled-input", required=True, help="labeling/labeled-genes.tsv")
@@ -62,8 +64,7 @@ def main() -> None:
         raise SystemExit(1)
 
     run_root = labeled_path.parents[2]
-    # compute_hash=True -> per-gene aa_hash, so we can fingerprint the genome by
-    # CONTENT and record it in the members sidecar (identity for leave-one-out).
+    # compute_hash=True adds per-gene aa_hash for the genome content fingerprint.
     genes = L.load_organism(organism, labeled_path, operon_info_path, compute_hash=True)
     if genes.empty:
         print(f"[update-occ-reference] ERROR: no genes loaded for organism {organism}", file=sys.stderr)
@@ -87,12 +88,10 @@ def main() -> None:
         c3_occ.finalize_reference(ref)
         c3_occ.save_reference(ref, reference_path)
 
-        # record this genome's content fingerprint -> token so scoring can find
-        # and leave-one-out an already-present genome by content (not by name).
+        # Records the content fingerprint so scoring can leave this genome out by content.
         fingerprint = L.genome_fingerprint(genes["aa_hash"])
         c3_occ.record_member(reference_path, fingerprint, organism)
-        # record whole-genome pool stats (gene / operon tallies) for figure
-        # provenance -- aggregated (minus the reported genome) at figure time.
+        # Records gene/operon tallies used for figure provenance.
         c3_occ.record_pool_stats(reference_path, fingerprint, organism,
                                  L.genome_pool_stats(genes))
 

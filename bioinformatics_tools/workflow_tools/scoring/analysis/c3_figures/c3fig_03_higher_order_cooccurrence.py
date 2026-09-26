@@ -1,40 +1,9 @@
 #!/usr/bin/env python3
-"""Figure 57 - Higher-order operon modules: co-occurrence & the trust-decay curve.
+"""Figure 57 - higher-order operon modules: co-occurrence and the trust-decay curve.
 
-THE QUESTION (scaling the pairwise operon co-occurrence up)
------------------------------------------------------------
-fig 01 measured how reliably TWO genes co-occur in an operon.  The natural
-question is: what about THREE genes together, four, five, ...?  Which SETS of
-genes always appear in one operon, how are they spaced, and - crucially - how
-does the trustworthiness of the "they always operon-together" claim decay as the
-set grows?  That decay curve tells us how far the partnership count can be pushed
-before it stops being reliable.
-
-DEFINITIONS  (identical spirit to fig 01; gene identity = clean_descriptor)
----------------------------------------------------------------------------
-* k-module = a set of k informative descriptors that occur as k CONSECUTIVE
-  operon members (sorted by start, same contig, same operon) in >=1 genome.
-  Its canonical key is the sorted descriptor tuple (orientation-independent).
-* genomes_together(S) = # genomes with such a consecutive run of exactly S.
-* co-present(S) = # genomes where ALL k descriptors are present (operonic OR
-  not - a member that dropped to a singleton is still "present").
-* conditional co-occurrence  =  genomes_together / co-present   in [0,1]
-      1.0  ==  wherever all k functions exist, they are always one operon run.
-* weakest-link intergenic gap = MAX of the k-1 internal gaps of a run (the gap
-  most likely to break the module).
-
-Panels
-------
-(a) The pool of trustable modules THINS with k: distinct modules, multi-genome
-    (>=2) modules, and "always-together" modules (cond = 1 across >=3 genomes).
-(b) The weakest internal gap WIDENS with k: per-module median max-internal-gap.
-(c) THE TRUST-DECAY CURVE: flagship reliability - the conditional co-occurrence
-    of the most-recurrent size-k modules falls as k grows (even the best-
-    conserved module assembles fully in fewer genomes).
-(d) The flagship module at each size k (the gene set, its genome count, its
-    conditional co-occurrence and spacing) - the ribosomal super-operon extended.
-
-Read-only analysis; does NOT modify the scoring pipeline.
+Counts k consecutive informative operon members (k = 2..7) across genomes and
+their conditional co-occurrence (genomes together / genomes with all k present).
+Panels: (a) module pool per k, (b) weakest internal gap, (c) trust decay, (d) flagships.
 """
 import csv
 import re
@@ -52,15 +21,17 @@ csv.field_size_limit(10_000_000)
 
 SUB = "01-operon-context-confidence"
 KS = [2, 3, 4, 5, 6, 7]
-# small set = cool / trustable  ->  large set = warm / fragile
+# Cool colours for small sets, warm for large ones.
 KCOLOR = {2: L.BLUE, 3: L.CYAN, 4: L.GREEN, 5: L.AMBER, 6: L.ORANGE, 7: L.RED}
 
 
 def _norm(d):
+    """Returns the lower-cased, stripped descriptor."""
     return (d or "").strip().lower()
 
 
 def _build_contig_map(run_root, organisms):
+    """Returns {(organism, feature_id): contig id}, parsed from gene_id in labeled-genes.tsv."""
     rx = re.compile(r"^(.*)_(\d+)([+-])(\d+)$")
     m = {}
     for org in organisms:
@@ -79,11 +50,9 @@ def _build_contig_map(run_root, organisms):
 
 
 def compute_modules(genes, run_root):
-    """Enumerate consecutive informative k-runs within operons.
+    """Enumerates consecutive informative k-runs within operons on one contig.
 
-    Returns:
-        present : descriptor -> set(genome) present (informative genes, any locus)
-        mods    : {k: {key: [n_instances, set(genomes_together), [max_gaps]]}}
+    Returns present {descriptor: genomes} and mods {k: {key: [n_instances, genomes, max_gaps]}}.
     """
     g = genes.copy()
     organisms = sorted(g["organism"].unique())
@@ -121,6 +90,7 @@ def compute_modules(genes, run_root):
 
 
 def _module_frame(present, mods_k):
+    """Returns one row per k-module with genome counts, conditional co-occurrence and gap."""
     rows = []
     for key, (inst, orgs, gaps) in mods_k.items():
         members = set(key)
@@ -135,17 +105,18 @@ def _module_frame(present, mods_k):
 
 
 def make(genes, operons, outdir):
+    """Aggregates modules per k and draws the four panels and TSVs."""
     run_root = outdir.parents[3]
     present, mods = compute_modules(genes, run_root)
     frames = {k: _module_frame(present, mods[k]) for k in KS}
 
-    # ---- per-k aggregates --------------------------------------------------
+    # ---- per-k aggregates ----
     agg = []
     for k in KS:
         f = frames[k]
         multi = f[f["co_present"] >= 2]
         always = f[(f["co_present"] >= 3) & (f["conditional"] >= 0.999)]
-        # flagship reliability: conditional of the most-recurrent modules
+        # Flagship reliability is the conditional of the most recurrent modules.
         recur = multi.sort_values("genomes_together", ascending=False)
         top10 = recur.head(10)["conditional"].to_numpy()
         agg.append({
@@ -164,7 +135,7 @@ def make(genes, operons, outdir):
     fig, axes = plt.subplots(2, 2, figsize=(15.8, 12.6))
     axA, axB, axC, axD = axes.ravel()
 
-    # ---- (a) thinning of the trustable pool -------------------------------
+    # ---- (a) thinning of the trustable pool ----
     x = np.arange(len(KS))
     w = 0.26
     axA.bar(x - w, A["n_modules"], w, color="#9e9e9e", edgecolor="black",
@@ -188,7 +159,7 @@ def make(genes, operons, outdir):
     L.boldticks(axA)
     axA.grid(False)
 
-    # ---- (b) weakest-link gap widens --------------------------------------
+    # ---- (b) weakest-link gap widens ----
     box_data = [frames[k]["median_max_gap"].to_numpy() for k in KS]
     bp = axB.boxplot(box_data, patch_artist=True, showfliers=False, widths=0.62)
     for patch, k in zip(bp["boxes"], KS):
@@ -210,7 +181,7 @@ def make(genes, operons, outdir):
     L.boldticks(axB)
     axB.grid(False)
 
-    # ---- (c) THE TRUST-DECAY CURVE ----------------------------------------
+    # ---- (c) THE TRUST-DECAY CURVE ----
     kx = np.array(KS)
     axC.fill_between(kx, A["flagship_top10_min"], A["flagship_top10_max"],
                      color=L.BLUE, alpha=0.16,
@@ -235,7 +206,7 @@ def make(genes, operons, outdir):
     L.boldticks(axC)
     axC.grid(False)
 
-    # ---- (d) the flagship module at each size -----------------------------
+    # ---- (d) the flagship module at each size ----
     flag = []
     for k in KS:
         multi = frames[k][frames[k]["co_present"] >= 2]
@@ -274,7 +245,7 @@ def make(genes, operons, outdir):
                  fontsize=13, fontweight="bold", y=1.004)
     fig.tight_layout(h_pad=2.6, w_pad=3.0)
 
-    # ---- TSVs --------------------------------------------------------------
+    # ---- TSVs ----
     L.write_tsv(A, outdir / "fig03_ksize_summary.tsv")
     allrows = []
     for k in KS:

@@ -1,5 +1,5 @@
 """
-Custom MARGIE snakemake workflow built by SB.
+Custom MARGIE Snakemake workflow.
 """
 import os
 import sys

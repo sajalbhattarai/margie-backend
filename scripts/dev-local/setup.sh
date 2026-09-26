@@ -40,11 +40,10 @@ for a in "$@"; do
 done
 
 say()  { printf '  %s\n' "$*"; }
-# In a dry run, say what would happen and report "not done", so the line that
-# follows with && (the "done it" message) is skipped.
+# In a dry run, prints the action and returns 1 so the following && message is skipped.
 act()  { if [[ $DRY == yes ]]; then say "would: $*"; return 1; else "$@"; fi; }
 
-# ---------------------------------------------------------------- undo
+# ---- undo ----
 if [[ $MODE == undo ]]; then
     echo "Removing the local dev cluster:"
     if [[ -f "$AUTH" ]] && grep -q " $TAG\$" "$AUTH"; then
@@ -61,10 +60,10 @@ if [[ $MODE == undo ]]; then
     exit 0
 fi
 
-# ---------------------------------------------------------------- setup
+# ---- setup ----
 echo "Setting up this computer as its own cluster:"
 
-# 1. sshd. Turning it on needs an administrator, so this only checks.
+# 1. sshd: only checked, since turning it on needs an administrator.
 if ! nc -z -G 2 127.0.0.1 22 2>/dev/null; then
     echo "  Remote Login is off. Turn it on in System Settings > General > Sharing > Remote Login," >&2
     echo "  allowing only your own account, then run this again." >&2
@@ -72,7 +71,7 @@ if ! nc -z -G 2 127.0.0.1 22 2>/dev/null; then
 fi
 say "Remote Login: on"
 
-# 2. A key kept only for this, allowed into your own account.
+# 2. A dedicated key, allowed into the user's own account.
 if [[ ! -f "$KEY" ]]; then
     act ssh-keygen -q -t ed25519 -N '' -C "$TAG" -f "$KEY" && say "made $KEY"
 else
@@ -89,7 +88,7 @@ if [[ $DRY == no || -f "$KEY.pub" ]]; then
     fi
 fi
 
-# 3. dane_wf: ~/bioinformatics-tools is this checkout. Never replaces a real folder.
+# 3. dane_wf: links ~/bioinformatics-tools to this checkout, never replacing a real folder.
 if [[ -L "$LINK" && "$(readlink "$LINK")" == "$REPO" ]]; then
     say "$LINK -> this checkout (already)"
 elif [[ -e "$LINK" && ! -L "$LINK" ]]; then
@@ -101,7 +100,7 @@ else
 fi
 [[ -x "$REPO/.venv/bin/dane_wf" ]] || { echo "  no .venv/bin/dane_wf in $REPO: run 'uv sync' there first" >&2; exit 1; }
 
-# 4. SLURM: the stand-ins, on the PATH non-interactive SSH commands see.
+# 4. SLURM: puts the stand-ins on the PATH that non-interactive SSH commands see.
 if [[ -f "$ENVFILE" ]] && grep -q "# >>> $TAG" "$ENVFILE"; then
     say "SLURM stand-ins already on PATH ($ENVFILE)"
 else
@@ -110,7 +109,7 @@ else
         say "SLURM stand-ins on PATH ($ENVFILE)"; fi
 fi
 
-# 5. Prove it the way the API will use it: over SSH, with that key.
+# 5. Checks the setup over SSH with that key, as the API will use it.
 if [[ $DRY == no ]]; then
     out="$(ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$USER@localhost" \
         'command -v sbatch && test -x "$HOME/bioinformatics-tools/.venv/bin/dane_wf" && echo ready' 2>&1 || true)"

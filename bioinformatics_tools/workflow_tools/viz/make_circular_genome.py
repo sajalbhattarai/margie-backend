@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
-"""make_circular_genome.py -- a confidence-coloured circular genome map built
-ENTIRELY from a FINAL_ANNOTATION_WITH_CONFIDENCE.tsv.
+"""make_circular_genome.py -- draws a confidence-coloured circular genome map with
+matplotlib from FINAL_ANNOTATION_WITH_CONFIDENCE.tsv.
 
-Everything is read from the FINAL table, nothing recomputed except GC% (from the
-per-gene nucleotide sequence the table already carries):
+Everything comes from the FINAL table; only GC% is computed, from the per-gene
+nucleotide sequences:
   * replicon / contig identity   <- parsed from gene_id  (<accession>_<start><strand><len>)
   * gene arc                      <- RAST_start / RAST_end / RAST_strand
   * ring colour                   <- CONFIDENCE_TIER
   * review track                  <- NEEDS_REVIEW?
   * GC ring                       <- RAST_na_sequence (windowed)
 
-Layout: each replicon (or, for a draft assembly, each contig) is an arc whose
-angular width is proportional to its length (with a small floor so tiny
-replicons stay visible); a fixed gap wedge separates adjacent arcs. A single
-complete chromosome is one near-full circle with one gap at the origin. An
-incomplete genome is the SAME picture with more arcs and more gaps -- the gaps
-ARE the unassembled/unknown regions.
+Each replicon or contig is an arc proportional to its length (with a floor for
+tiny ones), separated by gap wedges that stand for unassembled regions.
 
 Usage: make_circular_genome.py <FINAL.tsv> <out.png>
 """
@@ -33,27 +29,11 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection, PatchCollection
 from matplotlib.patches import Wedge
 
-plt.rcParams["font.family"] = "sans-serif"   # Arial/Calibri-style (DejaVu/Liberation Sans)
+plt.rcParams["font.family"] = "sans-serif"
 plt.rcParams["font.sans-serif"] = ["Arial", "Liberation Sans", "DejaVu Sans"]
 csv.field_size_limit(10 ** 8)
 
-# confidence tier -> colour. Okabe-Ito (colour-vision-deficiency safe): the five
-# tiers are DISTINCT hues, not a green->red ramp (which collapses under
-# deuteranopia). Validated worst-all-pairs CVD deltaE = 16 (target >= 12).
-# Confidence tiers are ORDERED (highest > high > medium > fair > low), so they
-# get a sequential single-hue ramp, not a categorical rainbow. The previous
-# green/blue/yellow/orange/red set failed every ordinal check: lightness was
-# non-monotone (L 0.678, 0.679, 0.877, 0.765, 0.670 -- it went up then back
-# down), highest and high differed in lightness by 0.001 so they were identical
-# in grayscale, the yellow sat at 1.41:1 on white, and the hue spread was 141
-# degrees. Rank encoded as hue reads as five unrelated categories.
-#
-# This ramp is validated (dataviz validate_palette.js --ordinal, light mode):
-# monotone lightness, every adjacent gap >= 0.06, 10 degree hue spread, light
-# end 2.66:1 against the surface. Darker = higher confidence, so a well
-# annotated genome reads solid and a poor one washes out.
-#
-# Keep this in sync with TIER_COL in gen_genome_viewer.py.
+# Confidence tier -> colour, kept in sync with TIER_COL in gen_genome_viewer.py.
 TIER = [
     ("highest", "#1F77FF"),   # blue
     ("high", "#00B84D"),      # green
@@ -63,24 +43,13 @@ TIER = [
     ("NOT_APPLICABLE_NON_CODING", "#bdbdbd"),
 ]
 TCOL = dict(TIER)
-# Review flags are a RESERVED STATUS colour, never a tier step -- an alarm must
-# not be confusable with a ranking. Grey worked against the old rainbow only by
-# being the one unsaturated thing on the figure; against a single-hue blue ramp
-# it reads as just another neutral and the flags stop announcing themselves.
-# This red shares no hue with the ramp, so flagged regions are unmistakable.
-# Matches FLAG in gen_genome_viewer.py.
+# Review-flag colour, separate from the tier colours; matches FLAG in gen_genome_viewer.py.
 REVIEW_COL = "#b32b1e"
-GAP_DEG = 4.0                 # angular gap between replicons/contigs (the "unknown" wedge)
-GAP_BUDGET_DEG = 40.0         # TOTAL angle spent on gaps, however many contigs there are.
-                              # A fixed per-contig gap only works for a finished genome: a
-                              # 420-contig draft assembly would want 420*4 = 1680 deg of gap
-                              # alone, the sequence budget goes negative, every arc falls to
-                              # the floor, and the drawing wraps the circle nine times over.
+GAP_DEG = 4.0                 # angular gap between replicons/contigs
+GAP_BUDGET_DEG = 40.0         # total gap angle, so many-contig drafts still fit in 360 deg
 MIN_SPAN_DEG = 4.0            # floor so a tiny plasmid/contig is still visible
-MAX_LABELLED = 12             # past this the map is a SHAPE, not an index -- per-contig
-                              # captions become an unreadable wall and the clickable
-                              # FINAL_GENOME_VIEWER.html is where identities belong
-TICK_MIN_SPAN_DEG = 2.0       # don't hang Mb ticks off a hairline arc
+MAX_LABELLED = 12             # above this many contigs, no per-contig captions
+TICK_MIN_SPAN_DEG = 2.0       # no Mb ticks on arcs narrower than this
 START_DEG = 90.0             # 12 o'clock origin, genome runs clockwise
 INK = "#000000"
 
@@ -94,13 +63,13 @@ GC_AMP = 0.13                        # GC deviation amplitude
 GC_SCALE = 0.09                      # GC deviation (frac) mapped to full amplitude
 
 
-# Gene callers name their own columns after themselves -- RAST_start from
-# RASTtk, PRODIGAL_start from Prodigal -- so a column asked for by one caller's
-# name is matched by what follows it.
+# Gene-call columns carry the caller's prefix (RAST_start, PRODIGAL_start), so
+# they are matched by the part after the prefix.
 GENE_CALLERS = ("rast", "rasttk", "prodigal")
 
 
 def col(row, name):
+    """Returns a row value by column name, ignoring "Column-X: " prefixes (regex) and the gene-caller prefix."""
     want = name.strip().lower()
     head, _, rest = want.partition("_")
     alt = rest if head in GENE_CALLERS and rest else ""
@@ -116,21 +85,25 @@ def col(row, name):
 
 
 def contig_of(gene_id):
+    """Returns the contig part of a "<contig>_<start><strand><len>" gene_id (regex)."""
     return re.sub(r"_[0-9]+[+-][0-9]+$", "", gene_id)
 
 
 def gc(seq):
+    """Returns the GC fraction of a sequence, or None when empty."""
     seq = seq.upper()
     n = len(seq)
     return (seq.count("G") + seq.count("C")) / n if n else None
 
 
 def xy(r, deg):
+    """Returns the (x, y) point at radius r and angle deg."""
     a = deg * pi / 180.0
     return r * cos(a), r * sin(a)
 
 
 def main():
+    """Reads the FINAL table with csv and draws gene, review, GC and backbone rings with matplotlib."""
     final, out = sys.argv[1], sys.argv[2]
     rows = [r for r in csv.DictReader(open(final, newline=""), delimiter="\t")]
     organism = col(rows[0], "organism_name")
@@ -152,15 +125,12 @@ def main():
     order = sorted(contigs, key=lambda c: -contigs[c]["len"])   # largest first
     total_len = sum(contigs[c]["len"] for c in order)
     n_gap = len(order)
-    # Gaps share a FIXED total budget, so the sequence budget stays positive at any
-    # contig count: a finished genome keeps the full 4 deg wedge, a fragmented draft
-    # gets proportionally thinner ones and the gaps still read as ~11% of the circle.
+    # Gaps share a fixed total budget, so the sequence angle stays positive.
     gap_deg = min(GAP_DEG, GAP_BUDGET_DEG / n_gap)
     span_total = 360.0 - n_gap * gap_deg                        # angle available for sequence
 
-    # angular span per contig, proportional to length but with a floor for tiny ones.
-    # The floor is capped at half the per-contig share, so even if EVERY contig is
-    # floored the leftover stays positive and the arcs still close at exactly 360.
+    # Span per contig proportional to length, with a floor capped at half the
+    # per-contig share so the arcs still close at 360.
     min_span = min(MIN_SPAN_DEG, 0.5 * span_total / n_gap)
     floored = [c for c in order if span_total * contigs[c]["len"] / total_len < min_span]
     fixed = len(floored) * min_span
@@ -176,6 +146,7 @@ def main():
         cur -= spans[c]
 
     def ang(c, pos):
+        """Returns the angle of a position on contig c (clockwise)."""
         s0, span = layout[c]
         return s0 - span * (pos / contigs[c]["len"])           # clockwise: decreasing angle
 
@@ -252,12 +223,9 @@ def main():
     for c in order:
         L = contigs[c]["len"]
         if spans[c] < TICK_MIN_SPAN_DEG:
-            continue          # hairline arc: a tick is noise, not a coordinate
+            continue          # hairline arc
         step = 1_000_000 if L > 3_000_000 else 500_000
-        # Same threshold as the replicon captions: on a draft assembly every
-        # contig restarts its coordinates at zero, so the numerals degenerate
-        # into a ring of "0.0" that says nothing. Ticks alone carry the scale
-        # there; the centre block carries the total.
+        # Tick numerals only when replicons are captioned; draft contigs all restart at 0.
         show_nums = L >= 250_000 and len(order) <= MAX_LABELLED
         p = 0
         while p <= L:
@@ -269,12 +237,8 @@ def main():
                 ax.text(xt, yt, f"{p/1e6:.1f}", ha="center", va="center", fontsize=7.5, color="#000000")
             p += step
 
-    # Replicon labels: only for a finished-ish genome (>1 replicon but few enough to
-    # caption). A draft assembly's contig names carry no information a reader can use
-    # at this scale -- they are looked up by CLICKING the accompanying
-    # FINAL_GENOME_VIEWER.html, which carries per-gene and per-operon identity.
-    # Printing all of them here buries the map: the anti-collision loop pushes captions
-    # out to absurd radii and bbox_inches="tight" then shrinks the figure to a dot.
+    # Replicon captions only for 2..MAX_LABELLED replicons; draft contigs are
+    # identified in FINAL_GENOME_VIEWER.html instead.
     if 1 < len(order) <= MAX_LABELLED:
         placed = []                                            # (angle, radius) already used
         for c in order:
@@ -293,8 +257,7 @@ def main():
     n_flag = sum(1 for r in rows if col(r, "NEEDS_REVIEW?").strip().lower() == "yes")
     ax.text(0, 0.05, f"{total_len/1e6:.2f} Mb · {len(rows):,} genes", ha="center", va="center",
             fontsize=13, color="#000000")
-    # a genome carved into hundreds of pieces is a draft assembly -- call those contigs,
-    # not replicons, since only a handful of them are real replicating molecules
+    # many pieces means a draft assembly, so they are called contigs
     unit = "contig" if len(order) > MAX_LABELLED else "replicon"
     ax.text(0, -0.05, f"{len(order)} {unit}{'s' if len(order) > 1 else ''} · "
             f"{n_flag:,} flagged for review", ha="center", va="center", fontsize=11.5, color="#000000")

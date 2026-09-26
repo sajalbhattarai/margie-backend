@@ -1,38 +1,8 @@
 """
-Each user's own copy of MARGIE's growing databases, on scratch, and their
-backups on depot.
-
-The databases a margie_sb run reads AND appends to -- the job database, the
-OCC operon reference, the gene and operon fingerprint databases, the genome
-pool -- used to be written in place on depot, or promoted to a per-user copy
-beside the shared one, also on depot. Depot is shared and small; scratch is
-not. So now:
-
-  * The BASE copies on depot, under databases/margie-generated-databases/
-    (margie-thesis-22-prokaryotes-base.db and the rest, below), are only ever
-    read. Every new user starts from them.
-  * On a user's first run, each base is copied to
-        /scratch/<cluster>/<cluster-user>/margie-2026/<store>/<cluster-user>-<name>-v1<ext>
-    and runs write there. (If the user already has a backup on depot -- say
-    scratch was purged -- the newest backup is copied instead, as the next
-    version, so no work is lost.)
-  * "Back up" copies the working version vN to depot as
-        databases/margie-generated-databases/<store>/<cluster-user>-<name>-vN<ext>
-    beside the base -- only when the user says yes, after being told the size
-    and how much room depot has left -- and the working copy on scratch
-    becomes vN+1 (a rename:
-    instant, nothing lost). Nothing is ever deleted: each backup is a new
-    file, and earlier backups stay until someone removes them by hand.
-
-The cluster username names everything -- it is what the files are owned by
-on the cluster, and it does not change if someone makes a new web account.
-
-The copies run as a SLURM job (charged to the account and partition in the
-config), not on a login node: tens of GB of disk traffic is not login-node
-work. Without an account they fall back to the login node, detached. Either
-way it is one small bash script driven by a plan file, so the copy outlives
-the request that started it. rsync reports its progress; GET /stores turns that into a
-percentage for the progress bar and a log tail for the details under it.
+Manages each user's working copies of MARGIE's growing databases on scratch and their backups on depot.
+Base copies on depot are only read; a user's first run copies the base (or newest backup) to
+<scratch>/margie-2026/<store>/<user>-<name>-vN, and "Back up" copies vN to depot and renames the working copy to vN+1.
+Copies run as a SLURM job (or detached on the login node) driven by a plan file; nothing is ever deleted.
 """
 
 from __future__ import annotations
@@ -49,21 +19,16 @@ from bioinformatics_tools.utilities import ssh_sftp
 LOGGER = logging.getLogger(__name__)
 
 DEPOT = '/depot/lindems/data/margie'
-# The base copies, one folder per database; each user's backups go beside them.
+# Base copies, one folder per database; each user's backups go beside them.
 GENERATED = f'{DEPOT}/databases/margie-generated-databases'
-# The folder under the user's scratch that holds every store (and the
-# outputs that used to go to depot too).
+# Folder under the user's scratch that holds every store and run output folder.
 ROOT_NAME = 'margie-2026'
-# MARGIE's own bookkeeping inside that folder: what is where, and the copy under way.
+# Bookkeeping folder inside it: the store manifest and the copy under way.
 STATE_DIR = '.margie'
 
-# ---------------------------------------------------------------------------
-# The stores. kind 'file': one file (plus companion files that travel with
-# it). kind 'dir': a folder, copied whole.
-#
-# config: the config.yaml keys that point at the store -- for a 'dir', each
-# maps to a file inside it ('' = the folder itself).
-# ---------------------------------------------------------------------------
+# ---- Stores ----
+# kind 'file' is one file plus companions; kind 'dir' is a folder copied whole.
+# config maps config.yaml keys to the store (for a 'dir', to a file inside it; '' is the folder).
 STORES: list[dict] = [
     {
         'id': 'job_db',
@@ -98,7 +63,7 @@ STORES: list[dict] = [
         'note': 'The gene fingerprint database and the four operon fingerprint databases beside it.',
         'kind': 'dir',
         'base': f'{GENERATED}/fingerprint-database',
-        # Only the databases themselves, not the backups and locks beside them.
+        # Only the database files, not the backups and locks beside them.
         'base_files': [
             'fingerprint-database.tsv',
             'fingerprint-database-metadata.json',
@@ -126,7 +91,7 @@ STORES: list[dict] = [
         'note': 'Genomes ANI and AAI compare against; every annotated genome joins it.',
         'kind': 'dir',
         'base': f'{GENERATED}/genome-pool',
-        # Its genomes only, not the backups kept beside them.
+        # Only the genome folders, not the backups beside them.
         'base_files': ['fna', 'faa'],
         'depot_sub': 'genome-pool',
         'sub': 'genome-pool',
@@ -135,7 +100,7 @@ STORES: list[dict] = [
     },
 ]
 
-# Written by runs but not databases: a folder each on scratch, never backed up.
+# Run output folders on scratch; never backed up.
 OUTPUT_DIRS = {
     'margie_sb.scoring_results_historical.path': 'scoring-archive',
     'margie_sb.final_tables_depot.path': 'final-tables',
@@ -146,29 +111,28 @@ STORE_BY_ID = {s['id']: s for s in STORES}
 
 
 def backup_root(cfg: dict | None) -> str:
-    """Where backups go: margie_sb.backup_root if set (Settings, behind Unlock),
-    else beside the bases on depot."""
+    """Returns margie_sb.backup_root if set, else the base folder on depot."""
     chosen = _cfg_get(cfg or {}, 'margie_sb.backup_root')
     return chosen.strip().rstrip('/') if isinstance(chosen, str) and chosen.strip() else GENERATED
 
 
 def backup_dir(store: dict, cfg: dict | None) -> str:
+    """Returns the store's backup folder."""
     return f"{backup_root(cfg)}/{store['depot_sub']}"
 
 
 class StoreError(Exception):
-    """A request that cannot be done now; the message says why, for the page."""
+    """A request that cannot be done now; the message and HTTP status go to the page."""
 
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
 
 
-# ---------------------------------------------------------------------------
-# Remote helpers
-# ---------------------------------------------------------------------------
+# ---- Remote helpers ----
 
 def _run(conn, command: str, timeout: float = 60.0) -> tuple[int, str]:
+    """Runs a shell command over SSH; returns (exit code, stdout + stderr)."""
     ssh = conn.connect()
     _, stdout, stderr = ssh.exec_command(command, timeout=timeout)
     code = stdout.channel.recv_exit_status()
@@ -177,6 +141,7 @@ def _run(conn, command: str, timeout: float = 60.0) -> tuple[int, str]:
 
 
 def _cfg_get(cfg: dict, dotted: str):
+    """Returns the value at a dotted config key, or None."""
     cur = cfg
     for part in dotted.split('.'):
         if not isinstance(cur, dict) or part not in cur:
@@ -186,6 +151,7 @@ def _cfg_get(cfg: dict, dotted: str):
 
 
 def _cfg_set(cfg: dict, dotted: str, value) -> None:
+    """Sets a dotted config key, creating intermediate dicts."""
     parts = dotted.split('.')
     cur = cfg
     for part in parts[:-1]:
@@ -196,10 +162,8 @@ def _cfg_set(cfg: dict, dotted: str, value) -> None:
 
 
 def scratch_root(conn, cfg: dict) -> str:
-    """margie_sb.stores_root if set, else /scratch/<cluster>/<user>/margie-2026.
-
-    RCAC's scratch is /scratch/<cluster short name>/<user>; the short name is
-    the login node's domain (login07.negishi.rcac.purdue.edu -> negishi).
+    """Returns margie_sb.stores_root if set, else /scratch/<cluster>/<user>/margie-2026.
+    The cluster short name comes from the login node's domain (login07.negishi... -> negishi).
     """
     chosen = _cfg_get(cfg, 'margie_sb.stores_root')
     if isinstance(chosen, str) and chosen.strip():
@@ -211,23 +175,22 @@ def scratch_root(conn, cfg: dict) -> str:
     return f'/scratch/{cluster}/{user}/{ROOT_NAME}'
 
 
-# ---------------------------------------------------------------------------
-# Names
-# ---------------------------------------------------------------------------
+# ---- Names ----
 
 def versioned(store: dict, user: str, version: int) -> str:
-    """<user>-<name>-v<N><ext> -- the same form on scratch and on depot."""
+    """Returns <user>-<name>-v<N><ext>, the name used on scratch and depot."""
     return f"{user}-{store['name']}-v{version}{store.get('ext', '') if store['kind'] == 'file' else ''}"
 
 
 def _version_of(store: dict, user: str, name: str) -> int | None:
+    """Parses the version from a versioned name, or None."""
     ext = re.escape(store.get('ext', '')) if store['kind'] == 'file' else ''
     m = re.fullmatch(rf"{re.escape(user)}-{re.escape(store['name'])}-v(\d+){ext}", name)
     return int(m.group(1)) if m else None
 
 
 def _backups(conn, store: dict, user: str, cfg: dict | None = None) -> list[int]:
-    """Versions of this user's backups of the store on depot, oldest first."""
+    """Returns the versions of this user's backups of the store, oldest first."""
     try:
         entries = ssh_sftp.list_remote_dir(backup_dir(store, cfg), connection=conn)
     except Exception:
@@ -243,10 +206,7 @@ def _backups(conn, store: dict, user: str, cfg: dict | None = None) -> list[int]
     return sorted(found)
 
 
-# ---------------------------------------------------------------------------
-# State: <root>/.margie/stores.json holds each store's working version;
-# <root>/.margie/op.* is the copy under way (or the last one).
-# ---------------------------------------------------------------------------
+# ---- State: <root>/.margie/stores.json holds working versions; op.* is the current or last copy ----
 
 def _state_path(root: str, name: str) -> str:
     return f'{root}/{STATE_DIR}/{name}'
@@ -274,9 +234,8 @@ def working_path(store: dict, root: str, user: str, version: int) -> str:
 
 
 def _probe(conn, root: str, user: str, cfg: dict | None = None) -> dict:
-    """Everything the page needs, in one trip to the cluster: which working
-    copies exist, the backups on depot, and the copy under way (its status,
-    the tail of its log, and whether its script is still alive)."""
+    """Collects the manifest, working copies, backups and copy status in one cluster round-trip
+    (plus a small second one for the working copies)."""
     manifest_path = _state_path(root, 'stores.json')
     status_path = _state_path(root, 'op.status')
     log_path = _state_path(root, 'op.log')
@@ -303,7 +262,7 @@ def _probe(conn, root: str, user: str, cfg: dict | None = None) -> dict:
         manifest = json.loads('\n'.join(sections.get('manifest', [])) or '{}')
     except json.JSONDecodeError:
         manifest = {}
-    # The working copies, now that we know their versions (a second, small trip).
+    # Checks the working copies named by the manifest.
     wanted = {}
     for st in STORES:
         v = (manifest.get(st['id']) or {}).get('version') if isinstance(manifest, dict) else None
@@ -332,7 +291,7 @@ def _probe(conn, root: str, user: str, cfg: dict | None = None) -> dict:
 
 
 def _op_from(sections: dict, root: str) -> dict:
-    """The copy under way or last done: its status file, and progress read from its log."""
+    """Builds the current or last copy's state from its status file, SLURM state and log progress."""
     op: dict = {}
     for line in sections.get('status', []):
         k, _, v = line.partition('=')
@@ -340,10 +299,8 @@ def _op_from(sections: dict, root: str) -> dict:
             op[k] = v
     if not op:
         return {}
-    # A 'running' op whose script is gone (the node rebooted, it was killed)
-    # is failed, not running forever. Its pid means something only on the
-    # login node it runs on, and this connection may have landed on another:
-    # there, a log that has stopped growing for five minutes is the sign.
+    # A running op whose script is gone is failed: checked by squeue, by pid on the same
+    # login node, or by a log idle for five minutes on another node.
     squeue = [l.strip() for l in sections.get('squeue', []) if l.strip()]
     job = next((l[4:] for l in squeue if l.startswith('job=')), '')
     slurm_line = next((l for l in squeue if not l.startswith('job=')), '')
@@ -351,12 +308,11 @@ def _op_from(sections: dict, root: str) -> dict:
     if job:
         op['job'] = job
         op['slurm_state'] = slurm_state
-        # Why a job waits (Resources, Priority, QOSMaxJobsPerUserLimit...): shown
-        # beside "Waiting for a SLURM slot", with the choice to run it here.
+        # Pending reason (Resources, Priority, ...) shown beside the queued state.
         if slurm_state == 'PENDING' and slurm_reason and slurm_reason != 'None':
             op['slurm_reason'] = slurm_reason
     if op.get('state') in ('queued', 'running') and job:
-        # A SLURM job: squeue knows whether it is still there.
+        # A SLURM job missing from squeue has ended.
         if not slurm_state:
             op['state'] = 'failed'
             op['message'] = op.get('message') or 'The copy job ended before it finished.'
@@ -387,18 +343,19 @@ def _op_from(sections: dict, root: str) -> dict:
     else:
         percent = pct
     op['percent'] = round(percent, 1)
-    # rsync's own progress lines are the bar's business, not the log's.
+    # Drops rsync progress lines from the log shown.
     op['log'] = [l for l in lines if not re.match(r'^\s*[\d,]+\s+\d{1,3}%', l)][-40:]
     return op
 
 
 def _read_op(conn, root: str) -> dict:
+    """Returns the current or last copy's state, with its pid checked."""
     op = _probe(conn, root, '__none__')['op']
     return _settle_pid(conn, op)
 
 
 def _settle_pid(conn, op: dict) -> dict:
-    """On the login node the copy runs on, its pid says whether it is alive."""
+    """Marks the op failed if its pid (checked on its own login node) is gone."""
     pid = op.pop('_check_pid', None)
     if pid:
         code, _ = _run(conn, f'kill -0 {int(pid)} 2>/dev/null')
@@ -408,8 +365,7 @@ def _settle_pid(conn, op: dict) -> dict:
     return op
 
 
-# ---------------------------------------------------------------------------
-# The copy script: reads a plan, one step per line, and reports as it goes.
+# ---- Copy script: runs a plan of tab-separated steps and writes op.status/op.log ----
 #   copy<TAB>label<TAB>src<TAB>dst<TAB>bytes   rsync src -> dst (via dst.partial)
 #   files<TAB>label<TAB>srcdir<TAB>dst<TAB>bytes<TAB>name,name,...
 #   move<TAB>src<TAB>dst                        rename (same filesystem: instant)
@@ -420,8 +376,7 @@ def _settle_pid(conn, op: dict) -> dict:
 #   build<TAB>label<TAB>mode<TAB>tool<TAB>sifdir<TAB>dbdir<TAB>statement
 #                                               margie-build's build.sh --<mode> <tool>;
 #                                               a statement accepts a gated tool's licence
-# (link, pull, repo and build set up the tools: api/services/tool_assets.py.)
-# ---------------------------------------------------------------------------
+# (link, pull, repo and build are used by tool_assets.py.)
 COPY_SCRIPT = r'''#!/bin/bash
 set -u
 dir="$1"; plan="$dir/op.plan"; status="$dir/op.status"; log="$dir/op.log"
@@ -515,9 +470,7 @@ echo "== finished" >> "$log"
 
 
 def _copy_cpus(cfg: dict | None) -> int:
-    """Cores for the copy job: margie_sb.stores_copy_cpus, 4 by default, never
-    more than 16 (the lab's limit for copying and moving). A copy is limited
-    by the disks, not the processor, so more cores would mostly sit idle."""
+    """Returns the copy job's cores: margie_sb.stores_copy_cpus, default 4, capped at 16 (the lab's limit)."""
     try:
         n = int(_cfg_get(cfg or {}, 'margie_sb.stores_copy_cpus') or 4)
     except (TypeError, ValueError):
@@ -527,8 +480,7 @@ def _copy_cpus(cfg: dict | None) -> int:
 
 def _start(conn, root: str, kind: str, plan: list[list], after: dict, cfg: dict | None = None,
            walltime: str = '12:00:00', mem: str = '4G') -> None:
-    """Write the plan and start the copy script: a SLURM job when the config
-    names an account, detached on the login node otherwise."""
+    """Writes the plan and starts the copy script: via sbatch when an account is set, else detached on the login node."""
     state = f'{root}/{STATE_DIR}'
     code, out = _run(conn, f'mkdir -p {shlex.quote(state)} && chmod 700 {shlex.quote(state)}')
     if code != 0:
@@ -537,14 +489,14 @@ def _start(conn, root: str, kind: str, plan: list[list], after: dict, cfg: dict 
     ssh_sftp.write_remote_text_file(
         f'{state}/op.plan', ''.join('\t'.join(str(x) for x in step) + '\n' for step in plan), connection=conn)
     ssh_sftp.write_remote_text_file(f'{state}/op.kind', kind + '\n', connection=conn)
-    # What to record once it has finished (see apply_finished).
+    # Recorded by apply_finished once the copy is done.
     ssh_sftp.write_remote_text_file(f'{state}/op.after.json', json.dumps(after) + '\n', connection=conn)
     _run(conn, f'cd {shlex.quote(state)} && rm -f op.status op.log op.jobid op.slurm.out')
     account = str(_cfg_get(cfg or {}, 'compute.cluster_default.account') or '').strip()
     partition = str(_cfg_get(cfg or {}, 'compute.cluster_default.partition') or '').strip()
     q = shlex.quote
     if account:
-        # Until the job starts, the page shows it waiting in the queue.
+        # Shows the job as queued until it starts.
         ssh_sftp.write_remote_text_file(
             f'{state}/op.status', f'state=queued\nop={kind}\nlabel=Waiting for a SLURM slot\n', connection=conn)
         cmd = (f'cd {q(state)} && sbatch --parsable --job-name=margie-databases --account={q(account)} '
@@ -561,8 +513,7 @@ def _start(conn, root: str, kind: str, plan: list[list], after: dict, cfg: dict 
                             f'> /dev/null 2>&1 < /dev/null & echo started')
     if 'started' not in out:
         raise StoreError(f'Could not start the copy: {out.strip()}')
-    # The status file appears within a moment; wait for it so the page never
-    # sees an op that is neither running nor finished.
+    # Waits briefly for the status file so the op is never seen in no state.
     for _ in range(20):
         if _read_text(conn, f'{state}/op.status'):
             break
@@ -570,6 +521,7 @@ def _start(conn, root: str, kind: str, plan: list[list], after: dict, cfg: dict 
 
 
 def _size(conn, paths: list[str]) -> int:
+    """Returns the total byte size of paths via du."""
     if not paths:
         return 0
     code, out = _run(conn, 'du -sbc ' + ' '.join(shlex.quote(p) for p in paths) + ' 2>/dev/null | tail -1 | cut -f1',
@@ -580,17 +532,16 @@ def _size(conn, paths: list[str]) -> int:
         return 0
 
 
-# ---------------------------------------------------------------------------
-# What the page asks
-# ---------------------------------------------------------------------------
+# ---- Page requests ----
 
 def _config_paths(store: dict, target: str) -> dict:
-    """The config values for a store whose working copy is at target."""
+    """Returns the config values for a store whose working copy is at target."""
     return {key: (posixpath.join(target, inner) if inner else target) if store['kind'] == 'dir' else target
             for key, inner in store['config'].items()}
 
 
 def status(conn, cfg: dict, user: str) -> dict:
+    """Returns each store's working version, latest backup and the copy under way."""
     root = scratch_root(conn, cfg)
     probe = _probe(conn, root, user, cfg)
     op = _settle_pid(conn, probe['op'])
@@ -617,16 +568,13 @@ def status(conn, cfg: dict, user: str) -> dict:
 
 
 def progress(conn, cfg: dict) -> dict | None:
-    """Only the copy under way: what the progress bar polls, every second or two."""
+    """Returns only the copy under way, for the progress bar's polling."""
     root = scratch_root(conn, cfg)
     return _read_op(conn, root) or None
 
 
 def run_here(conn, cfg: dict) -> dict | None:
-    """A copy still waiting in the SLURM queue, run on the login node instead:
-    the job is cancelled and the same script started here, detached, as it is
-    when no account is set. Asked for by the person, who was told the login
-    node is shared and to follow their institution's policy."""
+    """Cancels a queued SLURM copy job and runs the same script detached on the login node."""
     root = scratch_root(conn, cfg)
     op = _read_op(conn, root)
     if not op or op.get('state') != 'queued' or not op.get('job'):
@@ -647,12 +595,12 @@ def run_here(conn, cfg: dict) -> dict | None:
 
 
 def _busy(op: dict | None) -> bool:
+    """Returns True while a copy is queued or running."""
     return bool(op) and op.get('state') in ('queued', 'running')
 
 
 def start_setup(conn, cfg: dict, user: str) -> dict:
-    """Copy whichever stores are missing on scratch: the newest backup if the
-    user has one, otherwise the base."""
+    """Copies every store missing on scratch from the user's newest backup, or else the base."""
     st = status(conn, cfg, user)
     if _busy(st['op']):
         raise StoreError('A copy is already under way.', 409)
@@ -693,15 +641,15 @@ _UNITS = {'B': 1, 'KB': 1024, 'MB': 1024 ** 2, 'GB': 1024 ** 3, 'TB': 1024 ** 4,
 
 
 def _bytes(text: str) -> int | None:
+    """Parses a size such as '1.5TB' or '20G' into bytes."""
     m = re.fullmatch(r'([\d.]+)\s*([KMGTP]?B?)', text.strip(), re.I)
     return int(float(m.group(1)) * _UNITS.get(m.group(2).upper() or 'B', 1)) if m else None
 
 
 def depot_free(conn, where: str = DEPOT) -> int | None:
-    """Bytes a backup can still use on depot: the smaller of what the group's
-    quota leaves (RCAC's myquota) and what the filesystem itself has free."""
+    """Returns the free bytes on depot: the smaller of the group's quota headroom (myquota) and df."""
     group = where.split('/')[2] if where.startswith('/depot/') and len(where.split('/')) > 2 else ''
-    # df on the nearest folder that exists: the backup folder may not yet.
+    # Runs df on the nearest existing folder, since the backup folder may not exist yet.
     code, out = _run(conn, f'myquota 2>/dev/null; echo "@@df"; d={shlex.quote(where)}; '
                            f'while [ ! -e "$d" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; '
                            f'df -B1 --output=avail "$d" 2>/dev/null | tail -1')
@@ -722,8 +670,7 @@ def depot_free(conn, where: str = DEPOT) -> int | None:
 
 
 def backup_check(conn, cfg: dict, user: str, store_id: str) -> dict:
-    """What a backup would take and whether depot has room -- asked before the
-    Yes / No, and again when Yes is pressed."""
+    """Returns a backup's size, depot's free space and whether it fits."""
     s = STORE_BY_ID.get(store_id)
     if not s:
         raise StoreError('No such database.', 404)
@@ -735,7 +682,7 @@ def backup_check(conn, cfg: dict, user: str, store_id: str) -> dict:
     paths = [src] + [src + c for c in (s.get('companions') or [])]
     size = _size(conn, paths)
     free = depot_free(conn, backup_root(cfg))
-    # Room to spare: a depot filled to the last byte breaks everyone's work.
+    # Keeps 5 GB free on the shared depot.
     margin = 5 * 1024 ** 3
     fits = free is None or free - margin >= size
     return {
@@ -750,7 +697,7 @@ def backup_check(conn, cfg: dict, user: str, store_id: str) -> dict:
 
 
 def start_backup(conn, cfg: dict, user: str, store_id: str) -> dict:
-    """Copy the working vN to depot as <user>-<name>-vN; the working copy becomes vN+1."""
+    """Copies the working vN to depot as <user>-<name>-vN, then renames the working copy to vN+1."""
     s = STORE_BY_ID.get(store_id)
     if not s:
         raise StoreError('No such database.', 404)
@@ -779,7 +726,7 @@ def start_backup(conn, cfg: dict, user: str, store_id: str) -> dict:
         code, _ = _run(conn, f'test -e {shlex.quote(src + c)}')
         if code == 0:
             plan.append(['copy', f"{s['label']} ({c.lstrip('.')})", src + c, dst + c, _size(conn, [src + c])])
-    # Only once the backup is in place: the working copy moves on to the next version.
+    # The rename runs only after the backup copy succeeds.
     plan.append(['move', src, nxt])
     for c in companions:
         code, _ = _run(conn, f'test -e {shlex.quote(src + c)}')
@@ -790,9 +737,8 @@ def start_backup(conn, cfg: dict, user: str, store_id: str) -> dict:
 
 
 def apply_finished(conn, cfg: dict, user: str) -> bool:
-    """After a copy has finished: record the new working versions, and point
-    the config at them. Returns True when the config changed (the caller
-    saves it). Safe to call any number of times."""
+    """Records a finished copy's new versions and config changes; idempotent.
+    Returns True when the config changed (the caller saves it)."""
     root = scratch_root(conn, cfg)
     op = _read_op(conn, root)
     if op.get('state') != 'done':
@@ -809,20 +755,20 @@ def apply_finished(conn, cfg: dict, user: str) -> bool:
         for sid, version in (after.get('versions') or {}).items():
             manifest[sid] = {'version': int(version)}
         _write_manifest(conn, root, manifest)
-        # Settings the copy moved (the containers' and reference databases' folders).
+        # Config keys set by a tool-assets copy.
         for key, value in (after.get('config') or {}).items():
             if _cfg_get(cfg, key) != value:
                 _cfg_set(cfg, key, value)
                 changed = True
         _run(conn, f'mv -f {shlex.quote(state)}/op.after.json {shlex.quote(state)}/op.applied.json')
     if op.get('op') == 'assets':
-        # Not the databases' copy: their settings stay as they are.
+        # A tool-assets copy leaves the store settings alone.
         return changed
     return point_config(conn, cfg, user, root) or changed
 
 
 def point_config(conn, cfg: dict, user: str, root: str | None = None) -> bool:
-    """Set every store's and output folder's config key to its scratch path."""
+    """Sets every store's and output folder's config key to its scratch path."""
     root = root or scratch_root(conn, cfg)
     manifest = read_manifest(conn, root)
     changed = False
@@ -833,7 +779,7 @@ def point_config(conn, cfg: dict, user: str, root: str | None = None) -> bool:
             wanted.update(_config_paths(s, working_path(s, root, user, v)))
     for key, sub in OUTPUT_DIRS.items():
         wanted[key] = f'{root}/{sub}'
-    # Remembered, so later requests need not ask the cluster where scratch is.
+    # Cached so later requests skip the cluster lookup.
     wanted['margie_sb.stores_root'] = root
     for key, value in wanted.items():
         if _cfg_get(cfg, key) != value:
@@ -843,4 +789,5 @@ def point_config(conn, cfg: dict, user: str, root: str | None = None) -> bool:
 
 
 def is_ready(conn, cfg: dict, user: str) -> bool:
+    """Returns True when every store has a working copy on scratch."""
     return status(conn, cfg, user)['ready']

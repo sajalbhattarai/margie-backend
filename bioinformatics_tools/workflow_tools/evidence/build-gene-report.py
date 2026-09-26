@@ -1,36 +1,9 @@
 #!/usr/bin/env python3
-"""build-gene-report.py -- margie_sb phase14 (evidence): one fully tabulated,
-self-contained GENE ANNOTATION REPORT per protein-coding gene, read straight
-off consolidation's own current column names.
-
-Runs after phase11 (scoring) and phase12/13 (fingerprint/synteny), before
-phase15 (llm) -- pure CPU/file-IO, its output is useful and inspectable on
-its own with or without ever calling a model.
-
-Format follows the user's own sample-report-before-llm.txt: one shared
-11-column table (Tool/ID/Description/Domain/Category/EC/Score/Bitscore/
-%Identity/E-value/Other) for every general+specialized database, and one
-shared 6-column table (Tool/Prediction/Domain/Score-Probability/
-Topology-CleavageSite/Other) for every localization tool -- every
-registered tool always gets a row, "-" where a column is genuinely not
-sourceable for that tool (real per-tool data backs each column; see
-individual row builders for which fields exist and which are real "-").
-
-Two deliberate deviations from a literal reading of that sample, both
-because real column-availability disagrees with the hand-typed dash
-pattern (the sample was written before checking real data; not every
-cell's dash/blank guess was right):
-  - NCBIFAM has no Score/Bitscore/%Identity (InterPro's NCBIFAM member-DB
-    columns only carry id/description/evalue/match coordinates).
-  - DBCAN has no Score/Bitscore/%Identity/evalue at all (confirmed against
-    the raw table); its EC column IS real (DBCAN_ec_numbers) even though
-    the sample marked it "-".
-
-OPERON MEMBERS is capped to OPERON_WINDOW nearest neighbors on each side of
-the candidate (not literally "every remaining operonic gene") -- full
-nesting made report size scale with operon size; see this module's own
-git history / prior conversation for the 1452-line example that motivated
-the cap.
+"""build-gene-report.py -- evidence stage: writes one plain-text gene annotation
+report per scored gene from the consolidated table, confidence scores and
+fingerprints. Database hits share an 11-column table and localisation tools a
+6-column table; every tool gets a row, "-" where a field does not exist for it.
+Operon members are limited to OPERON_WINDOW neighbours on each side.
 """
 from __future__ import annotations
 
@@ -50,6 +23,7 @@ _NO_REAL_OPERON = ("NOT_IN_AN_OPERON", "NOT_APPLICABLE_NON_CODING")
 
 
 def _clean(val) -> str:
+    """Returns the value as a stripped string, empty for None/NaN/"none"."""
     if val is None:
         return ""
     s = str(val).strip()
@@ -57,6 +31,7 @@ def _clean(val) -> str:
 
 
 def _fmt_pct(val) -> str:
+    """Formats a number as a one-decimal percentage, passing non-numbers through."""
     v = _clean(val)
     if not v:
         return ""
@@ -67,6 +42,7 @@ def _fmt_pct(val) -> str:
 
 
 def _fmt_eval(val) -> str:
+    """Formats an e-value in scientific notation, passing non-numbers through."""
     v = _clean(val)
     if not v:
         return ""
@@ -77,14 +53,12 @@ def _fmt_eval(val) -> str:
 
 
 def _has_value(val) -> bool:
-    """True unless empty or the tool's own "-" placeholder (KEGG/EGGNOG/
-    DBCAN all use a literal "-" for "checked, nothing found")."""
+    """Returns True unless the value is empty or the tools' "-" placeholder."""
     return _clean(val) not in ("", "-")
 
 
 def _int_str(val) -> str:
-    """OPERON_gene_position_in_operon is stored as a float-string ("2.0")
-    -- display it as a plain integer."""
+    """Returns a float-string such as "2.0" as a plain integer string."""
     v = _clean(val)
     try:
         return str(int(float(v)))
@@ -93,15 +67,13 @@ def _int_str(val) -> str:
 
 
 def kv(pairs: list[tuple[str, str]], indent: str = "") -> str:
+    """Renders label/value pairs as aligned "label : value" lines."""
     return "\n".join(f"{indent}{label:<{LABEL_W}}: {value}" for label, value in pairs)
 
 
 def pipe_table(header: list[str], rows: list[list[str]], indent: str = "",
                first_col_w: int = 10) -> str:
-    """Pipe-delimited table, first column padded for a tidy left edge,
-    everything after it plain " | "-joined (matches the user's own sample
-    report exactly -- only the leading Tool/Variant/Component column is
-    padded there too). Dash separator length matches the rendered header."""
+    """Renders a " | "-delimited text table with a padded first column and a dash rule under the header."""
     head_line = indent + " | ".join([header[0].ljust(first_col_w)] + header[1:])
     sep = indent + "-" * (len(head_line) - len(indent))
     lines = [head_line, sep]
@@ -112,13 +84,10 @@ def pipe_table(header: list[str], rows: list[list[str]], indent: str = "",
 
 
 # ---- multi-domain field splitting -----------------------------------------
-# Consolidation packs >1 domain hit per gene+DB as "ID1: val1; ID2: val2" in
-# every column (alignment_from/to, score, evalue, ...) keyed by the same
-# domain ID found in the *_id column itself; a single hit is stored bare
-# (no "ID: " prefix at all). Both shapes need to come back out as one row
-# per domain rather than one semicolon-packed cell, so an LLM (or a human)
-# doesn't have to re-split anything itself.
+# Consolidation packs several hits as "ID1: val1; ID2: val2" and a single hit
+# bare; these helpers split both shapes back into one row per domain.
 def _parse_id_value_list(s: str) -> list[tuple[str, str]]:
+    """Splits "ID: value; ID: value" into (id, value) pairs; bare entries get an empty id."""
     pairs = []
     for entry in s.split("; "):
         if ": " in entry:
@@ -130,9 +99,10 @@ def _parse_id_value_list(s: str) -> list[tuple[str, str]]:
 
 
 def split_multi(row: dict, id_col: str, *value_cols: str) -> list[list[str]]:
-    """Returns one row per domain: [id, value_col_1, value_col_2, ...].
-    Falls back to broadcasting a bare (non-"ID: val") value across every
-    domain ID when a column wasn't itself domain-keyed."""
+    """Returns one row per domain id: [id, value_col_1, value_col_2, ...].
+
+    A column whose entries do not pair one-to-one with the ids is repeated on every row.
+    """
     id_val = _clean(row.get(id_col, ""))
     if not id_val:
         return []
@@ -155,17 +125,16 @@ def split_multi(row: dict, id_col: str, *value_cols: str) -> list[list[str]]:
 
 
 # ---- per-tool row builders --------------------------------------------------
-# Every function returns rows shaped [Tool, ID, Description, Domain,
-# Category, EC, Score, Bitscore, %Identity, E-value, Other] -- one shared
-# header for every general/specialized database. A tool that found nothing
-# for this gene still returns exactly one all-"-" row (every registered
-# tool always appears, never silently omitted).
+# Each returns rows in _EVIDENCE_HEADER order; a tool without hits returns one
+# empty row so every tool appears.
 def _row(tool, id_="", desc="", domain="", category="", ec="", score="",
          bitscore="", pct_identity="", evalue="", other="") -> list[str]:
+    """Returns one evidence-table row in _EVIDENCE_HEADER column order."""
     return [tool, id_, desc, domain, category, ec, score, bitscore, pct_identity, evalue, other]
 
 
 def rows_rast(row: dict) -> list[list[str]]:
+    """Returns the RAST row: product description and subsystem."""
     desc = _clean(row.get("RAST_description"))
     if not desc:
         return [_row("RAST")]
@@ -174,6 +143,7 @@ def rows_rast(row: dict) -> list[list[str]]:
 
 
 def rows_pgap(row: dict) -> list[list[str]]:
+    """Returns one PGAP row per HMM hit with alignment range and e-value."""
     domains = split_multi(row, "PGAP_id", "PGAP_description", "PGAP_alignment_from",
                            "PGAP_alignment_to", "PGAP_full_seq_evalue")
     if not domains:
@@ -183,6 +153,7 @@ def rows_pgap(row: dict) -> list[list[str]]:
 
 
 def rows_tigrfam(row: dict) -> list[list[str]]:
+    """Returns one TIGRFAM row per HMM hit with range, score and e-value."""
     domains = split_multi(row, "TIGRFAM_id", "TIGRFAM_description", "TIGRFAM_alignment_from",
                            "TIGRFAM_alignment_to", "TIGRFAM_full_seq_score", "TIGRFAM_full_seq_evalue")
     if not domains:
@@ -192,10 +163,7 @@ def rows_tigrfam(row: dict) -> list[list[str]]:
 
 
 def rows_ncbifam(row: dict) -> list[list[str]]:
-    # Via InterPro's NCBIFAM member-DB columns -- no Score/Bitscore/
-    # %Identity exist for it at all (only id/description/evalue/match
-    # coordinates), unlike the sample's dash pattern, which left Score
-    # blank under the assumption it might exist.
+    """Returns one NCBIFAM row per InterPro NCBIFAM match (no score columns exist for it)."""
     domains = split_multi(row, "INTERPRO_NCBIFAM_id", "INTERPRO_NCBIFAM_description",
                            "INTERPRO_NCBIFAM_match_start", "INTERPRO_NCBIFAM_match_end",
                            "INTERPRO_NCBIFAM_evalue")
@@ -206,6 +174,7 @@ def rows_ncbifam(row: dict) -> list[list[str]]:
 
 
 def rows_cog(row: dict) -> list[list[str]]:
+    """Returns the COG row with functional category, identity and e-value."""
     id_, desc = _clean(row.get("COG_id")), _clean(row.get("COG_description"))
     if not id_:
         return [_row("COG")]
@@ -214,6 +183,7 @@ def rows_cog(row: dict) -> list[list[str]]:
 
 
 def rows_pfam(row: dict) -> list[list[str]]:
+    """Returns one PFAM row per HMM hit with range, score and e-value."""
     domains = split_multi(row, "PFAM_id", "PFAM_description", "PFAM_alignment_from",
                            "PFAM_alignment_to", "PFAM_full_seq_score", "PFAM_full_seq_evalue")
     if not domains:
@@ -223,6 +193,7 @@ def rows_pfam(row: dict) -> list[list[str]]:
 
 
 def rows_geneprop(row: dict) -> list[list[str]]:
+    """Returns one GenProp row per property with its status."""
     domains = split_multi(row, "GENEPROP_id", "GENEPROP_description", "GENEPROP_status")
     if not domains:
         return [_row("GENEPROP")]
@@ -230,14 +201,10 @@ def rows_geneprop(row: dict) -> list[list[str]]:
 
 
 def rows_interpro(row: dict) -> list[list[str]]:
-    # No per-accession domain-boundary column exists at this merged,
-    # deduplicated level (lives only in the 20 INTERPRO_<memberdb>_*
-    # column groups, keyed differently per member DB). GO terms are
-    # deduplicated IDs only; INTERPRO_pathways is almost entirely
-    # human/animal Reactome IDs inherited from cross-species InterPro
-    # mappings -- not meaningful evidence for a bacterial/archaeal gene,
-    # dropped entirely rather than dumping hundreds of irrelevant
-    # cross-species pathway IDs into every report.
+    """Returns one InterPro row per entry, with deduplicated GO ids (regex) on the first row.
+
+    INTERPRO_pathways is left out: it is mostly cross-species Reactome ids.
+    """
     domains = split_multi(row, "INTERPRO_id", "INTERPRO_description")
     if not domains:
         return [_row("INTERPRO")]
@@ -253,6 +220,7 @@ _EC_RE = re.compile(r"\[EC:([^\]]+)\]")
 
 
 def rows_kegg(row: dict) -> list[list[str]]:
+    """Returns the KEGG row, taking the EC number from the description by regex."""
     id_, desc = _clean(row.get("KEGG_id")), _clean(row.get("KEGG_description"))
     if not id_:
         return [_row("KEGG")]
@@ -267,6 +235,7 @@ def rows_kegg(row: dict) -> list[list[str]]:
 
 
 def rows_eggnog(row: dict) -> list[list[str]]:
+    """Returns the eggNOG row with COG category, GO, KO and PFAM cross-references."""
     id_, desc = _clean(row.get("EGGNOG_id")), _clean(row.get("EGGNOG_description"))
     if not id_:
         return [_row("EGGNOG")]
@@ -282,6 +251,7 @@ def rows_eggnog(row: dict) -> list[list[str]]:
 
 
 def rows_uniprot(row: dict) -> list[list[str]]:
+    """Returns the UniProt row with bitscore, identity, gene name and source organism."""
     id_, desc = _clean(row.get("UNIPROT_id")), _clean(row.get("UNIPROT_description"))
     if not id_:
         return [_row("UNIPROT")]
@@ -295,12 +265,13 @@ def rows_uniprot(row: dict) -> list[list[str]]:
                  evalue=_fmt_eval(row.get("UNIPROT_evalue")), other=", ".join(other_parts))]
 
 
-# Order matches the user's own sample-report-before-llm.txt exactly.
+# Row order of the general-database table.
 _GENERAL_SECTIONS = [rows_rast, rows_pgap, rows_tigrfam, rows_ncbifam, rows_cog, rows_pfam,
                       rows_geneprop, rows_interpro, rows_kegg, rows_eggnog, rows_uniprot]
 
 
 def rows_tcdb(row: dict) -> list[list[str]]:
+    """Returns the TCDB row with transporter class, bitscore, identity and family."""
     id_ = _clean(row.get("TCDB_subject_id"))
     if not id_:
         return [_row("TCDB")]
@@ -312,6 +283,7 @@ def rows_tcdb(row: dict) -> list[list[str]]:
 
 
 def rows_merops(row: dict) -> list[list[str]]:
+    """Returns the MEROPS row with query range, peptidase family and alignment stats."""
     id_ = _clean(row.get("MEROPS_id"))
     if not id_:
         return [_row("MEROPS")]
@@ -324,10 +296,7 @@ def rows_merops(row: dict) -> list[list[str]]:
 
 
 def rows_dbcan(row: dict) -> list[list[str]]:
-    # No Score/Bitscore/%Identity/evalue exist for DBCAN at all (confirmed
-    # against the raw table) -- the sample's dash pattern guessed an
-    # evalue might exist; it doesn't. EC genuinely IS real here
-    # (DBCAN_ec_numbers) even though the sample marked it "-".
+    """Returns the dbCAN row with HMM hit, EC numbers and method agreement (no score columns exist)."""
     id_ = _clean(row.get("DBCAN_id"))
     if not id_:
         return [_row("DBCAN")]
@@ -344,9 +313,10 @@ _EVIDENCE_HEADER = ["Tool", "ID", "Description", "Domain", "Category", "EC",
                      "Score", "Bitscore", "%Identity", "E-value", "Other"]
 
 
-# ---- localization (LLM can read raw topology directly -- not collapsed) ---
+# ---- localization (raw topology kept) ---------------------------------------
 # [Tool, Prediction, Domain, Score/Probability, Topology/Cleavage Site, Other]
 def rows_signalp6(row: dict) -> list[list[str]]:
+    """Returns the SignalP6 row: predicted class, its probability, cleavage site and other class probabilities."""
     pred = _clean(row.get("SIGNALP6_prediction")) or "OTHER"
     prob_col = {"SP": "SIGNALP6_prob_sp", "LIPO": "SIGNALP6_prob_lipo", "TAT": "SIGNALP6_prob_tat",
                 "TATLIPO": "SIGNALP6_prob_tatlipo", "PILIN": "SIGNALP6_prob_pilin"}.get(pred, "SIGNALP6_prob_other")
@@ -359,6 +329,7 @@ def rows_signalp6(row: dict) -> list[list[str]]:
 
 
 def rows_phobius(row: dict) -> list[list[str]]:
+    """Returns the Phobius row: signal peptide or TM-helix count, topology and cleavage position."""
     has_sp = _clean(row.get("PHOBIUS_has_signal_peptide")) in ("1", "True", "true")
     n_tm = _clean(row.get("PHOBIUS_n_transmembrane")) or "0"
     pred = "Signal peptide" if has_sp else (f"{n_tm} transmembrane helix(es)" if n_tm not in ("0", "") else "None")
@@ -369,6 +340,7 @@ def rows_phobius(row: dict) -> list[list[str]]:
 
 
 def rows_tmbed(row: dict) -> list[list[str]]:
+    """Returns the TMbed row: membrane class from its topology, segment range and topology string."""
     topo_str = _clean(row.get("TMBED_topology_string"))
     n_seg = _clean(row.get("TMBED_segment_count")) or "1"
     main_topo = _clean(row.get("TMBED_topology"))
@@ -381,6 +353,7 @@ def rows_tmbed(row: dict) -> list[list[str]]:
 
 
 def rows_psortb(row: dict) -> list[list[str]]:
+    """Returns the PSORTb row: localisation, score, confidence and gram class."""
     loc = _clean(row.get("PSORTB_localization")) or "Unknown"
     conf = _clean(row.get("PSORTB_is_confident"))
     gram = _clean(row.get("PSORTB_gram_class"))
@@ -393,6 +366,7 @@ _LOCALIZATION_HEADER = ["Tool", "Prediction", "Domain", "Score/Probability", "To
 
 
 def evidence_block(section_fns: list, row: dict, header: list[str], indent: str = "") -> str:
+    """Renders the rows of every section builder as one pipe table."""
     all_rows = [r for fn in section_fns for r in fn(row)]
     return pipe_table(header, all_rows, indent=indent)
 
@@ -400,11 +374,10 @@ def evidence_block(section_fns: list, row: dict, header: list[str], indent: str 
 # ---- physical neighbor block (peg-number adjacency) -----------------------
 def physical_neighbors_block(fid: str, df_indexed: dict, confidence_final: dict,
                               n: int = OPERON_WINDOW) -> str:
-    """Compact table of up to n physical genomic neighbors on each side.
-    Uses peg-number adjacency as a proxy for chromosomal proximity -- within
-    a single replicon, consecutive peg numbers are consecutive on the genome.
-    Shown regardless of operon membership so the LLM has genomic context even
-    for standalone genes and operon-boundary genes."""
+    """Renders a table of up to n neighbours on each side, found by peg-number adjacency (regex on the feature id).
+
+    Consecutive peg numbers stand in for consecutive genes on one replicon.
+    """
     m = re.match(r'^(fig\|\d+\.\d+\.peg\.)(\d+)$', fid)
     if not m:
         return "Physical neighbor data unavailable (non-peg feature ID)."
@@ -426,8 +399,9 @@ def physical_neighbors_block(fid: str, df_indexed: dict, confidence_final: dict,
     return pipe_table(["Feature ID", "Offset", "Canonical Label", "Strand"], rows)
 
 
-# ---- operon grouping (sentinel-safe -- see module docstring) --------------
+# ---- operon grouping --------------------------------------------------------
 def build_operon_groups(df: pd.DataFrame) -> dict[str, list[str]]:
+    """Maps each real OPERON_id to its feature_ids in operon order, using pandas groupby."""
     cleaned = df["OPERON_id"].astype(str).str.strip()
     has_real = df["OPERON_id"].notna() & (cleaned != "") & ~cleaned.isin(_NO_REAL_OPERON)
     groups: dict[str, list[str]] = {}
@@ -439,6 +413,7 @@ def build_operon_groups(df: pd.DataFrame) -> dict[str, list[str]]:
 
 # ---- identity / confidence / fingerprint sections --------------------------
 def identity_block(fid: str, row: dict, org_name: str, cf: dict, operon_str: str, indent: str = "") -> str:
+    """Renders the identity section: location, consensus label, operon and confidence."""
     pairs = [
         ("Organism", org_name),
         ("Feature ID", fid),
@@ -456,6 +431,7 @@ def identity_block(fid: str, row: dict, org_name: str, cf: dict, operon_str: str
 
 
 def _operon_str(row: dict, full_member_count: int) -> str:
+    """Returns "<operon> (position i of n)" or the no-operon sentinel."""
     op_id = _clean(row.get("OPERON_id"))
     if not op_id or op_id in _NO_REAL_OPERON:
         return op_id or "NOT_IN_AN_OPERON"
@@ -464,6 +440,7 @@ def _operon_str(row: dict, full_member_count: int) -> str:
 
 
 def confidence_block(cf: dict) -> str:
+    """Renders the confidence formula, C1-C4 component table and final score, tier and flag."""
     rows = [
         ["C1 Tool Coverage", cf.get("c1_score", ""), cf.get("c1_formula", "")],
         ["C2 Operon Presence", cf.get("c2_score_from_operon_probability", ""), cf.get("c2_formula", "")],
@@ -483,6 +460,7 @@ def confidence_block(cf: dict) -> str:
 
 
 def parse_fingerprint_full(raw: str) -> tuple[str, str, str]:
+    """Splits a " || "-joined fingerprint string into (hash, label, pattern)."""
     h = label = pat = ""
     for part in raw.split(" || "):
         if part.startswith("pattern hash: "):
@@ -495,9 +473,7 @@ def parse_fingerprint_full(raw: str) -> tuple[str, str, str]:
 
 
 def load_fingerprint_db(db_path: Path, hash_col: str = "fingerprint_hash") -> dict[str, dict]:
-    """Load the fingerprint DB once per script run, not per-gene -- an in-memory
-    dict avoids re-scanning this ~25k-row file for every gene x fingerprint
-    variant (slow on 4000+-gene genomes)."""
+    """Loads a fingerprint database TSV into a dict keyed by hash, once per run."""
     if not db_path.exists():
         return {}
     with open(db_path, newline="") as fh:
@@ -505,6 +481,7 @@ def load_fingerprint_db(db_path: Path, hash_col: str = "fingerprint_hash") -> di
 
 
 def gene_fingerprint_block(fid: str, fingerprint_full: dict, fingerprint_db: dict[str, dict]) -> str:
+    """Renders the gene fingerprint section with its cross-genome frequencies."""
     raw = fingerprint_full.get(fid, {}).get("fingerprint", "")
     if not raw:
         return "(no fingerprint -- gene not found in labeled-genes-fingerprint-full.tsv)"
@@ -529,6 +506,7 @@ _OPERON_FP_VARIANTS = [
 
 
 def operon_fingerprint_block(fid: str, operon_fp: dict, db_dicts: dict[str, dict]) -> str:
+    """Renders the four operon fingerprint hashes with their cross-genome frequencies."""
     raw = operon_fp.get(fid, {}).get("operon_fingerprint", "")
     if not raw:
         return "Candidate gene is a standalone (not in an operon) -- no operon fingerprint."
@@ -556,6 +534,7 @@ def operon_fingerprint_block(fid: str, operon_fp: dict, db_dicts: dict[str, dict
 # ---- full per-gene document -------------------------------------------------
 def operon_member_block(fid: str, df_indexed: dict, confidence_final: dict,
                          org_name: str, operon_groups: dict[str, list[str]]) -> str:
+    """Renders an indented identity and evidence block for one operon member."""
     indent = "    "
     row = df_indexed.get(fid)
     if row is None:
@@ -586,16 +565,11 @@ def operon_member_block(fid: str, df_indexed: dict, confidence_final: dict,
 def build_document(fid: str, df_indexed: dict, org_name: str, confidence_final: dict,
                     fingerprint_full: dict, operon_fp: dict, operon_fp_dbs: dict[str, dict],
                     gene_fp_db: dict[str, dict], operon_groups: dict[str, list[str]]) -> str:
+    """Assembles the full text report for one gene."""
     row = df_indexed[fid]
     cf = confidence_final.get(fid, {})
 
-    # Full nesting (every other member's complete evidence block) makes
-    # report size scale with operon size -- a 10-gene operon meant every
-    # one of its 10 reports repeated ~9x the same content. Capped to the
-    # OPERON_WINDOW nearest neighbors on each side instead -- bounds every
-    # report to a constant size and matches what actually matters for an
-    # operon-coherence check anyway (immediate neighbors), regardless of
-    # how large the operon is.
+    # Includes only the OPERON_WINDOW nearest members on each side, so report size stays bounded.
     op_id = _clean(row.get("OPERON_id"))
     other_members, full_member_count = [], 0
     if op_id and op_id not in _NO_REAL_OPERON:
@@ -655,11 +629,13 @@ def build_document(fid: str, df_indexed: dict, org_name: str, confidence_final: 
 
 
 def load_tsv_by_feature(path: Path) -> dict[str, dict]:
+    """Reads a TSV with csv into a dict keyed by feature_id."""
     with open(path, newline="") as fh:
         return {r["feature_id"]: r for r in csv.DictReader(fh, delimiter="\t") if r.get("feature_id")}
 
 
 def parse_args():
+    """Parses the command-line options with argparse."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--consolidated", required=True, help="consolidation/consolidated-merged-all-columns.tsv")
     p.add_argument("--confidence-final", required=True)
@@ -677,10 +653,12 @@ def parse_args():
 
 
 def safe_name(s: str) -> str:
+    """Replaces characters unsafe in file names with "_" (regex)."""
     return re.sub(r'[^\w\.\-]', '_', s)
 
 
 def main() -> None:
+    """Loads the consolidated table (pandas) and scoring/fingerprint TSVs and writes one report per scored gene."""
     args = parse_args()
 
     df = pd.read_csv(args.consolidated, sep="\t", low_memory=False)
@@ -691,8 +669,6 @@ def main() -> None:
     fingerprint_full = load_tsv_by_feature(Path(args.fingerprint_full))
     operon_fp = load_tsv_by_feature(Path(args.operon_fingerprint))
 
-    # Loaded once for the whole run, not once per gene -- see
-    # load_fingerprint_db()'s own docstring for why that mattered.
     gene_fp_db = load_fingerprint_db(Path(args.fingerprint_database))
     operon_fp_dbs = {
         "Evidence (Ordered)": load_fingerprint_db(Path(args.operon_fingerprint_database_evidence_ordered)),

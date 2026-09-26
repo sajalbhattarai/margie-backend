@@ -1,46 +1,10 @@
 #!/usr/bin/env python3
-"""Figure 56 - Operon boundaries & partner switching (with a genomic network).
+"""Figure 56 - operon boundaries and partner switching, with a genomic network.
 
-THE QUESTION (from the operon-index thread)
---------------------------------------------
-For a candidate gene, are its closest members separated into ANOTHER operon?
-If yes, what are the statistics - and when a neighbour IS separated, is it now
-partnered with OTHER genes (repartnered) or left alone (a singleton)?  And show
-it as a graph.
-
-DEFINITIONS
------------
-* Gene identity = clean_descriptor (functional name).  The SAME descriptor in
-  different genomes is the SAME gene.
-* Genomic adjacency = two genes consecutive (sorted by start) on the SAME contig,
-  regardless of operon membership.  Intergenic distance = down.start-up.end-1.
-* An operonic gene = in_operon and member_count >= 2.
-* Every genomic adjacency is one of:
-      same_operon         both operonic, SAME operon        (a kept partnership)
-      diff_operon         both operonic, DIFFERENT operons  (a broken boundary)
-      operon_vs_singleton one operonic, one singleton
-      both_singleton      neither operonic
-* For an operonic gene, a genomic neighbour that is NOT in its operon is
-  "separated".  A separated neighbour that is itself operonic has been
-  "repartnered" (it is in another operon with other genes); otherwise it is a
-  "singleton".
-
-Panels
-------
-(a) OPERON-BOUNDARY CURVE  P(consecutive genes share an operon | intergenic bin):
-    a sharp cliff - below ~100 bp neighbours are usually the same operon, above
-    ~100-200 bp they almost never are.  Operon boundaries live in the gap.
-(b) classification of every genomic adjacency (counts, %, median gap): kept
-    partnerships are tight (~2 bp); boundaries and singleton joins are far apart.
-(c) per operonic gene: is your CLOSEST neighbour kept in-operon, and are you an
-    interior or a boundary gene?  Closest neighbours are almost always kept.
-(d) fate of SEPARATED neighbours: repartnered into another operon vs left a
-    singleton.  This answers "are the separated partners now with other genes?"
-(e) a real genomic neighbourhood (E. coli) drawn as a network: nodes = genes
-    coloured by operon, thick solid links = kept operon partnerships, dashed
-    links = broken boundaries; the boundary gap and strand flips are annotated.
-
-Read-only analysis; does NOT modify the scoring pipeline.
+Classifies every genomic adjacency (same operon, different operons, operon +
+singleton, both singletons) and asks whether separated neighbours are in another
+operon. Panels: (a) same-operon rate by gap, (b) adjacency classes, (c) closest
+neighbour and boundary status, (d) fate of separated neighbours, (e) E. coli network.
 """
 import csv
 import re
@@ -75,6 +39,7 @@ CLASS_NAME = {"same_operon": "same operon\n(kept partner)",
 
 
 def _bin_of(gap):
+    """Returns the name of the intergenic bin containing gap."""
     for lo, hi, nm in BINS:
         if lo <= gap <= hi:
             return nm
@@ -82,6 +47,7 @@ def _bin_of(gap):
 
 
 def _build_contig_map(run_root, organisms):
+    """Returns {(organism, feature_id): contig id}, parsed from gene_id in labeled-genes.tsv."""
     rx = re.compile(r"^(.*)_(\d+)([+-])(\d+)$")
     m = {}
     for org in organisms:
@@ -101,6 +67,7 @@ def _build_contig_map(run_root, organisms):
 
 
 def make(genes, operons, outdir):
+    """Walks each contig to classify adjacencies and gene fates, then draws the panels and TSVs."""
     run_root = outdir.parents[3]
     g = genes.copy()
     organisms = sorted(g["organism"].unique())
@@ -113,9 +80,10 @@ def make(genes, operons, outdir):
             zip(g["organism"], g["feature_id"], g["member_count"])}
 
     def is_op(o, f):
+        """Returns True for a gene in an operon of at least two members."""
         return inop.get((o, f), False) and mcnt.get((o, f), 0) >= 2
 
-    # ---- walk every contig: genomic adjacencies + per-gene boundary status --
+    # ---- genomic adjacencies and per-gene boundary status, per contig ----
     cls_count = defaultdict(int)
     cls_gap = defaultdict(list)
     bin_same = defaultdict(lambda: [0, 0])   # bin -> [n_same_operon, n_total]
@@ -147,7 +115,7 @@ def make(genes, operons, outdir):
             bin_same[nm][1] += 1
             if cls == "same_operon":
                 bin_same[nm][0] += 1
-        # per operonic gene: closest / interior-boundary / fate of separated
+        # Per operonic gene: closest neighbour, interior or boundary, fate of separated neighbours.
         for i, gene in enumerate(r):
             if not is_op(org, gene["feature_id"]):
                 continue
@@ -181,7 +149,7 @@ def make(genes, operons, outdir):
 
     n_adj = sum(cls_count.values()) or 1
 
-    # ======================= FIGURE =========================================
+    # ---- figure ----
     fig = plt.figure(figsize=(15.8, 16.2))
     gs = fig.add_gridspec(3, 2, height_ratios=[1.0, 1.0, 1.08],
                           hspace=0.42, wspace=0.24)
@@ -191,7 +159,7 @@ def make(genes, operons, outdir):
     axD = fig.add_subplot(gs[1, 1])
     axE = fig.add_subplot(gs[2, :])
 
-    # ---- (a) operon-boundary curve ----------------------------------------
+    # ---- (a) operon-boundary curve ----
     xs, ps, ns = [], [], []
     for nm in BIN_NAMES:
         same, tot = bin_same.get(nm, [0, 0])
@@ -216,7 +184,7 @@ def make(genes, operons, outdir):
     L.boldticks(axA)
     axA.grid(False)
 
-    # ---- (b) classification of genomic adjacencies ------------------------
+    # ---- (b) classification of genomic adjacencies ----
     vals = [cls_count.get(c, 0) for c in CLASS_ORDER]
     cols = [CLASS_COLOR[c] for c in CLASS_ORDER]
     names = [CLASS_NAME[c] for c in CLASS_ORDER]
@@ -237,7 +205,7 @@ def make(genes, operons, outdir):
     L.boldticks(axB)
     axB.grid(False)
 
-    # ---- (c) per-gene: closest neighbour + boundary status ----------------
+    # ---- (c) per-gene: closest neighbour + boundary status ----
     c_labels = ["closest nbr\nKEPT in-operon", "closest nbr\nseparated",
                 "interior gene\n(both kept)", "boundary gene\n(>=1 separated)"]
     c_vals = [100 * closest_inop / total_op, 100 * closest_sep / total_op,
@@ -259,7 +227,7 @@ def make(genes, operons, outdir):
     L.boldticks(axC)
     axC.grid(False)
 
-    # ---- (d) fate of separated neighbours ---------------------------------
+    # ---- (d) fate of separated neighbours ----
     n_sep = sep_repartnered + sep_singleton
     d_vals = [sep_repartnered, sep_singleton]
     d_pct = [100 * sep_repartnered / n_sep, 100 * sep_singleton / n_sep]
@@ -281,14 +249,14 @@ def make(genes, operons, outdir):
     L.boldticks(axD)
     axD.grid(False)
 
-    # ---- (e) genomic-neighbourhood network --------------------------------
+    # ---- (e) genomic-neighbourhood network ----
     _draw_network(axE, g, is_op, organisms)
 
     fig.suptitle("Operon boundaries and partner switching: neighbours are kept "
                  "in-operon across tight gaps, separated across wide ones",
                  fontsize=13.5, fontweight="bold", y=0.997)
 
-    # ---- TSVs --------------------------------------------------------------
+    # ---- TSVs ----
     bcurve = pd.DataFrame([{
         "intergenic_bin": nm, "n_adjacencies": bin_same.get(nm, [0, 0])[1],
         "n_same_operon": bin_same.get(nm, [0, 0])[0],
@@ -322,8 +290,9 @@ def make(genes, operons, outdir):
 
 
 def _find_window(g, is_op, organisms):
-    """First clean E. coli boundary (operon>=3 | gap>=150 | operon>=2), expanded
-    to whole operons, capped ~11 genes.  Returns list of gene records."""
+    """Returns (organism, gene records) around the first E. coli boundary with a >=150 bp gap.
+
+    The window spans an operon of >=3 and one of >=2 genes, expanded to whole operons."""
     ec = [o for o in organisms if o.startswith("Escherichia")]
     ec = ec[0] if ec else organisms[0]
     sub = g[g["organism"] == ec]
@@ -331,6 +300,7 @@ def _find_window(g, is_op, organisms):
     recs = sub[sub["contig"] == ctg].sort_values("start").to_dict("records")
 
     def opid(rec):
+        """Returns the operon id of an operonic gene, else None."""
         oid = rec["operon_id"]
         return oid if str(oid).startswith("operon_") and is_op(ec, rec["feature_id"]) else None
 
@@ -345,7 +315,7 @@ def _find_window(g, is_op, organisms):
         gap = int(b["start"]) - int(a["end"]) - 1
         if oa and ob and oa != ob and gap >= 150 and counts[oa] >= 3 and counts[ob] >= 2:
             lo, hi = max(0, i - 4), min(len(recs), i + 6)
-            # expand to whole operons at the edges
+            # Expands the window to whole operons at both edges.
             while lo > 0 and opid(recs[lo]) and opid(recs[lo]) == opid(recs[lo - 1]):
                 lo -= 1
             while hi < len(recs) and opid(recs[hi - 1]) and opid(recs[hi - 1]) == opid(recs[hi] if hi < len(recs) else recs[hi - 1]):
@@ -355,9 +325,11 @@ def _find_window(g, is_op, organisms):
 
 
 def _draw_network(ax, g, is_op, organisms):
+    """Draws the E. coli window as genes coloured by operon, joined by kept or broken links."""
     ec, win = _find_window(g, is_op, organisms)
 
     def opid(rec):
+        """Returns the operon id of an operonic gene, else None."""
         oid = rec["operon_id"]
         return oid if str(oid).startswith("operon_") and is_op(ec, rec["feature_id"]) else None
 
@@ -369,7 +341,7 @@ def _draw_network(ax, g, is_op, organisms):
     xs = list(range(n))
     ys = [0.45 if r["strand"] == "+" else -0.45 for r in win]
 
-    # operon grouping bands
+    # Operon grouping bands.
     j = 0
     while j < n:
         oi = opid(win[j])
@@ -390,7 +362,7 @@ def _draw_network(ax, g, is_op, organisms):
         else:
             j += 1
 
-    # edges between consecutive genes
+    # Edges between consecutive genes.
     for i in range(n - 1):
         a, b = win[i], win[i + 1]
         gap = int(b["start"]) - int(a["end"]) - 1
@@ -406,7 +378,7 @@ def _draw_network(ax, g, is_op, organisms):
                     ha="center", va="bottom", fontsize=7.2,
                     fontweight="bold", color="black" if not same else "#333333")
 
-    # nodes
+    # Nodes.
     for i, r in enumerate(win):
         oi = opid(r)
         col = op_col[oi] if oi else SING

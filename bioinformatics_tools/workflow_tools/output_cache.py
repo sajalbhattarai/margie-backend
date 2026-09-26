@@ -9,11 +9,9 @@ has already been processed, even across fresh timestamped working directories.
 Copy the ``.db`` file to another server and it carries the cached outputs
 with it — no separate cache directory needed.
 
-A genome's key is its sequence hash (genome_identity.genome_hash), so the same
-genome saved with different line widths, case or line endings is still a hit.
-Entries written before that are keyed by the first 16 hex characters of the
-file's byte hash; they are still found (_input_hashes), and new ones are
-written under the sequence hash.
+A genome's key is its sequence hash (genome_identity.genome_hash), so formatting
+differences still hit; older entries keyed by a 16-hex-char file byte hash are
+still found (_input_hashes).
 """
 import hashlib
 import logging
@@ -107,7 +105,7 @@ def _retry_operation(func, max_retries: int = 3, initial_delay: float = 0.5):
 
 
 def _compute_file_hash(file_path: str) -> str:
-    """Return first 16 hex chars of the SHA-256 of *file_path* (the key before genome_hash)."""
+    """Returns the first 16 hex chars of the SHA-256 of *file_path* (the key before genome_hash)."""
     sha256 = hashlib.sha256()
     with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
@@ -116,7 +114,7 @@ def _compute_file_hash(file_path: str) -> str:
 
 
 def _input_hashes(input_file: str) -> tuple[str, str]:
-    """(key new entries are written under, older key still looked up)."""
+    """Returns (key new entries are written under, older key still looked up)."""
     return genome_hash(input_file), legacy_file_hash(input_file)[:16]
 
 
@@ -218,21 +216,17 @@ def restore(db_path: str, input_file: str, tool_name: str,
     return True
 
 
-# ─────────────────── RASTtk genome-id realignment ─────────────────── #
+# ---- RASTtk genome-id realignment ----
 
-# BV-BRC/RASTtk stamps every feature it calls with the id of the SUBMISSION that
-# called it: fig|6666666.<job>.peg.<n>. The job number is minted per submission,
-# so the same FASTA submitted twice yields two different namespaces for what are
-# byte-for-byte the same genes.
+# RASTtk stamps each feature with its submission's id (fig|6666666.<job>.peg.<n>),
+# so the same FASTA submitted twice gets two namespaces for identical genes.
 _RAST_GENOME_ID_RE = re.compile(rb"6666666\.(\d+)")
 
 
 def current_rast_genome_id(rasttk_file: str) -> str | None:
-    """Return the ``6666666.<job>`` id this run's RASTtk actually produced.
+    """Returns the ``6666666.<job>`` id this run's RASTtk produced.
 
-    Reads it out of a rasttk output (rast.gff / rast.tsv). Returns None if the
-    file is missing or carries no id, which the caller must treat as "don't
-    touch anything" rather than "no id".
+    Read from rast.gff / rast.tsv; None (file missing or no id) means leave everything alone.
     """
     try:
         blob = Path(rasttk_file).read_bytes()
@@ -248,26 +242,12 @@ def current_rast_genome_id(rasttk_file: str) -> str | None:
 
 
 def realign_rast_genome_id(paths: list[str], current_id: str) -> dict[str, str]:
-    """Rewrite cache-restored files onto THIS run's RASTtk genome id.
+    """Rewrites cache-restored files onto this run's RASTtk genome id.
 
-    output_cache keys on the input FASTA's content hash, so a hit means the
-    restored outputs were computed from byte-identical sequence. RASTtk is
-    deterministic under that condition -- for the same FASTA the peg numbering,
-    gene_id, strand and coordinates come back identical -- and the ONLY thing
-    that differs between two submissions is the 6666666.<job> prefix.
-
-    That prefix is what every downstream table joins on. When rasttk itself is
-    a cache MISS (its restore is gated behind a full GTDB-Tk batch hit) while
-    its dependents are HITs, the restored tables still carry the old job's
-    namespace and every join against the fresh rasttk output finds nothing --
-    consolidation then unions two disjoint feature sets instead of joining
-    them, doubling the row count and leaving every scored gene without
-    coordinates and every coordinate-bearing gene without a score. Rewriting
-    the prefix here is what keeps a cache hit meaningful instead of poisonous.
-
-    Only rewrites a file that carries EXACTLY ONE genome id. A file holding
-    several is cross-organism (or already mixed) and is left alone with a
-    warning -- guessing which id is "this genome" there would corrupt it.
+    A cache hit means identical sequence, so RASTtk output differs only in the
+    6666666.<job> prefix that downstream tables join on. When rasttk itself
+    misses but its dependents hit, the prefix is rewritten so the joins still
+    match. Files with more than one genome id are left alone with a warning.
 
     Returns ``{path: "<old>->      <new>"}`` for the files actually rewritten.
     """
@@ -299,13 +279,10 @@ def realign_rast_genome_id(paths: list[str], current_id: str) -> dict[str, str]:
 
 
 def cached_tools(db_path: str, input_file: str) -> set:
-    """Return the set of tool names that already have cached outputs for
-    *input_file* (matched by the file's content hash). Read-only, never
-    raises: returns an empty set if the DB or file is missing/unreadable.
+    """Returns the tool names with cached outputs for *input_file* (by content hash).
 
-    Used by the batch scheduler to tell how many phases a genome has already
-    completed in a prior run, so the most-complete genomes can be processed
-    first even when nothing has been written to the output directory yet."""
+    Read-only and never raises (empty set on any problem). Used by the batch
+    scheduler to process the most complete genomes first."""
     try:
         if not Path(db_path).expanduser().exists():
             return set()
@@ -372,17 +349,9 @@ def restore_all(db_path: str, input_file: str,
     Returns ``{tool_name: hit_bool}`` so the caller can log which tools
     were restored.
 
-    After restoring, every restored file is stamped with ONE common mtime.
-    Files are restored tool-by-tool in ``build_filepaths_map`` insertion
-    order, so a file written later (e.g. envelope_summary.tsv, whose tool is
-    inserted into the map AFTER its deepsig/psortb consumers) would otherwise
-    get a newer mtime than the outputs that depend on it -- and Snakemake's
-    mtime rerun-trigger would then recompute those already-cached rules and
-    cascade downstream into consolidation/labeling/scoring. A single shared
-    mtime makes no restored INPUT strictly newer than any restored OUTPUT, so
-    Snakemake keeps them all. Every restored file still lands newer than the
-    Stage-1 rasttk output (produced before this restore runs), so rules keyed
-    only on rast.faa are unaffected.
+    Every restored file is stamped with one common mtime, so no restored input
+    is newer than a restored output and Snakemake's mtime trigger does not rerun
+    cached rules; all remain newer than the Stage-1 rasttk output.
     """
     results: dict[str, bool] = {}
     restored_paths: list[str] = []

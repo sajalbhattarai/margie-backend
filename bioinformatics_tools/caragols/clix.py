@@ -184,12 +184,8 @@ class App:
         """
         LOGGER.debug('Cognizing %s', comargs)
 
-        # Prefer the MOST SPECIFIC match (highest gravity/token count), not
-        # just the first one found in iteration order. dir() returns do_*
-        # methods alphabetically, so a shorter dispatch that's a token-prefix
-        # of a longer one (e.g. do_margie's ['margie'] vs do_margie_sb's
-        # ['margie', 'sb']) would otherwise always win first-match-wins,
-        # making the longer command permanently unreachable.
+        # Prefers the most specific match (highest gravity), so do_margie_sb
+        # ['margie', 'sb'] is not shadowed by do_margie ['margie'].
         candidates = [d for d in self.dispatches if comargs[:d.gravity] == d.tokens]
         matched: Dispatch | None = max(candidates, key=lambda d: d.gravity) if candidates else None
 

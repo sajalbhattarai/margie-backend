@@ -1,8 +1,6 @@
 """
-Unit tests for bioinformatics_tools.utilities.ssh_sftp.
-
-These test the SFTP/SSH-exec helpers directly (no FastAPI TestClient,
-no real network) by mocking the SSHConnection's paramiko client.
+Unit tests for bioinformatics_tools.utilities.ssh_sftp, with the SSHConnection's
+paramiko client mocked (no network).
 """
 import shlex
 import stat as stat_module
@@ -16,10 +14,8 @@ from bioinformatics_tools.utilities import ssh_sftp
 
 
 def _mock_connection_for_exec(exec_stdout: bytes, exec_stderr: bytes = b""):
-    """An SSHConnection mock whose connect() always returns the same
-    paramiko-SSHClient-shaped mock, wired so check_remote_file's SFTP
-    stat() call succeeds (regular file) and exec_command() returns the
-    given canned output."""
+    """Builds an SSHConnection mock whose SFTP stat() reports a regular file and
+    whose exec_command() returns the given output."""
     mock_ssh = MagicMock()
 
     mock_sftp_client = MagicMock()
@@ -41,9 +37,7 @@ def _mock_connection_for_exec(exec_stdout: bytes, exec_stderr: bytes = b""):
 
 class TestReadRemoteFilePage:
     def test_escapes_path_with_shell_metacharacters(self):
-        """A path containing spaces/parens must never be interpolated into
-        the remote shell command unescaped -- this is the actual proof
-        the endpoint isn't command-injectable via a crafted filename."""
+        """Checks that a path with spaces and parentheses is shell-quoted in the remote command."""
         sentinel = ssh_sftp._PAGE_SENTINEL
         stdout = (
             f"3\n{sentinel}\ncol_a\tcol_b\n{sentinel}\nval1\tval2\n"
@@ -57,8 +51,7 @@ class TestReadRemoteFilePage:
 
         command = mock_ssh.exec_command.call_args[0][0]
         quoted = shlex.quote(dangerous_path)
-        # The escaped form must appear once per shell invocation (wc, the
-        # header sed, and the range sed -- three uses of the same path).
+        # One quoted use each for wc, the header sed and the range sed.
         assert command.count(quoted) == 3
 
         assert result == {
@@ -68,8 +61,7 @@ class TestReadRemoteFilePage:
         }
 
     def test_skips_wc_when_total_lines_known(self):
-        """known_total_lines should suppress the wc -l pass entirely --
-        this is what makes repeat page clicks on a cached file cheap."""
+        """Checks that known_total_lines skips the wc -l pass."""
         sentinel = ssh_sftp._PAGE_SENTINEL
         stdout = f"col_a\tcol_b\n{sentinel}\nval1\tval2\n".encode()
         mock_connection, mock_ssh = _mock_connection_for_exec(stdout)
@@ -86,10 +78,7 @@ class TestReadRemoteFilePage:
         assert result["lines"] == ["val1\tval2"]
 
     def test_print_before_quit_keeps_last_row_of_page(self):
-        """Regression guard: the sed range command must be written as
-        `START,ENDp;ENDq` (print then quit). If it were `ENDq;START,ENDp`,
-        sed would quit at the END line before its own `p` ever ran for
-        that line, silently dropping the last row of every page."""
+        """Checks the sed range is `START,ENDp;ENDq`, so the last row prints before sed quits."""
         sentinel = ssh_sftp._PAGE_SENTINEL
         stdout = f"42\n{sentinel}\nh\n{sentinel}\nrow2\trow2b\nrow3\trow3b\n".encode()
         mock_connection, mock_ssh = _mock_connection_for_exec(stdout)
@@ -102,8 +91,7 @@ class TestReadRemoteFilePage:
         assert "2,3p;3q" in command
 
     def test_empty_page_past_end_of_file(self):
-        """Requesting a page beyond EOF should return an empty page, not
-        raise -- the sed range simply produces no output."""
+        """Checks that a page beyond EOF returns an empty page."""
         sentinel = ssh_sftp._PAGE_SENTINEL
         stdout = f"3\n{sentinel}\ncol_a\n{sentinel}\n".encode()
         mock_connection, _ = _mock_connection_for_exec(stdout)
@@ -158,15 +146,10 @@ class TestCopyRemoteDirectory:
 
 
 class TestRewritePathReferences:
-    """The find-and-replace script run after Resume's copy, to fix up
-    provenance metadata (GTDB-Tk/KEGG-style input_path/output_path columns)
-    that still point at the old run's directory after being copied
-    forward."""
+    """Tests the script that rewrites old-run paths in copied provenance columns after a Resume copy."""
 
     def test_script_rewrites_old_path_in_text_files(self, tmp_path):
-        """Runs the EXACT generated script as a real subprocess against
-        real fixture files -- proves the find-and-replace logic itself is
-        correct, not just that some command got sent over SSH."""
+        """Runs the generated script as a subprocess against fixture files."""
         old_dir = str(tmp_path / "2026-06-21-1118")
         new_dir = str(tmp_path / "2026-06-21-1300")
 
@@ -201,9 +184,7 @@ class TestRewritePathReferences:
         assert result.stdout.strip() == "0"
 
     def test_script_handles_paths_with_dots_and_dashes_literally(self, tmp_path):
-        """Path segments commonly contain '.' and '-' (e.g.
-        2026-06-21-1118, GCF_000027325.1) -- these are regex/sed
-        metacharacters but must be treated as plain literal text."""
+        """Checks that '.' and '-' in paths are matched literally."""
         old_dir = str(tmp_path / "2026-06-21-1118")
         new_dir = str(tmp_path / "2026-06-21-9999")
         target = tmp_path / "data"
@@ -237,8 +218,7 @@ class TestRewritePathReferences:
         assert result == 3
 
     def test_returns_zero_on_nonzero_exit_without_raising(self):
-        """Cosmetic-only cleanup -- a failure here must never raise and
-        block the resumed job from launching, only log and return 0."""
+        """Checks that a failed rewrite returns 0 instead of raising."""
         mock_connection, _ = self._mock_connection_for_rewrite("", exit_code=1, stderr=b"python error")
 
         result = ssh_sftp.rewrite_path_references("/new/dir", "/old/dir", "/new/dir", connection=mock_connection)

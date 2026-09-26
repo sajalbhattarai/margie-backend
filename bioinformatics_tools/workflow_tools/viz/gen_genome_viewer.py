@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
-"""gen_genome_viewer.py -- build a SELF-CONTAINED interactive HTML genome viewer
-from a FINAL_ANNOTATION_WITH_CONFIDENCE.tsv.
+"""gen_genome_viewer.py -- builds a self-contained interactive HTML genome viewer
+from FINAL_ANNOTATION_WITH_CONFIDENCE.tsv.
 
-Two modes, toggled in the page:
-  * Gene mode   -- every gene arc is coloured by CONFIDENCE_TIER using a
-                   sequential single-hue slate ramp (tiers are ORDERED, so a
-                   ramp, not a rainbow); review flags in a reserved status red.
-  * Operon mode -- each operon takes a bright hue from a validated 6-colour
-                   categorical cycle (operon identity is categorical, unlike
-                   the ordered tiers), non-operonic genes grey, non-coding
-                   lighter grey; hovering/clicking an operon highlights all
-                   its member genes and shows the operon's details.
-
-Everything is read from the FINAL table; the data is embedded directly in the
-HTML so the file opens offline with no server and no external assets.
+Gene mode colours genes by confidence tier with review flags; operon mode colours
+each operon from a categorical cycle and highlights its members. The per-gene
+data (plus evidence trail and fingerprints) is embedded as JSON and gzip/base64
+in TEMPLATE, so the page works offline.
 
 Usage: gen_genome_viewer.py <FINAL.tsv> <out.html>
 """
@@ -30,10 +22,9 @@ csv.field_size_limit(10 ** 8)
 TIERS = ["highest", "high", "medium", "fair", "low"]          # index 0..4; -1 = non-coding
 TIER_IDX = {t: i for i, t in enumerate(TIERS)}
 
-# Evidence trail: what each database actually called this gene. Read from the
-# consolidated per-tool matrix, joined by feature_id. Grouped so the panel can
-# show the seven C1 decision databases first, then domain signatures, then the
-# specialised callers. (display name, group, candidate columns).
+# Evidence trail entries (display name, group, candidate columns) read from the
+# consolidated per-tool matrix; decision databases first, then domain
+# signatures, then specialised callers.
 EVIDENCE = [
     ("RAST", "decision", ["RAST_description"]),
     ("COG", "decision", ["COG_description"]),
@@ -71,6 +62,7 @@ IDENTITY_COL = {"UniProt": "UNIPROT_percent_identity", "COG": "COG_identity",
 
 
 def fmt_pid(v):
+    """Formats a fraction or percentage as "NN% id", empty when not numeric."""
     try:
         x = float(v)
     except (TypeError, ValueError):
@@ -80,13 +72,13 @@ def fmt_pid(v):
     return f"{round(x)}% id"
 
 
-# Gene callers name their own columns after themselves -- RAST_start from
-# RASTtk, PRODIGAL_start from Prodigal -- so a column asked for by one caller's
-# name is matched by what follows it.
+# Gene-call columns carry the caller's prefix (RAST_start, PRODIGAL_start), so
+# they are matched by the part after the prefix.
 GENE_CALLERS = ("rast", "rasttk", "prodigal")
 
 
 def col(row, name):
+    """Returns a row value by column name, ignoring "Column-X: " prefixes (regex) and the gene-caller prefix."""
     want = name.strip().lower()
     head, _, rest = want.partition("_")
     alt = rest if head in GENE_CALLERS and rest else ""
@@ -102,31 +94,27 @@ def col(row, name):
 
 
 def clean_ev(d):
+    """Strips source and gnl| prefixes from an evidence description by regex and caps it at 120 characters."""
     d = re.sub(r"^[A-Za-z][\w /()]*?:\s*", "", str(d)).strip()      # drop "JCVI:"/"KEGG:" prefixes
     d = re.sub(r"^gnl\|[^|]*\|[^|]*\|\S*\s*", "", d).strip()         # drop gnl|DB|acc| prefixes
     return d[:120]                                                   # keep [EC:...] tags — the EC evidence
 
 
 def contig_of(gid):
+    """Returns the contig part of a "<contig>_<start><strand><len>" gene_id (regex)."""
     return re.sub(r"_[0-9]+[+-][0-9]+$", "", gid)
 
 
 def num(v, nd=2):
+    """Returns v rounded to nd decimals, or None when not numeric."""
     try:
         return round(float(v), nd)
     except (TypeError, ValueError):
         return None
 
 
-# Where the consolidated per-tool matrix sits, relative to the FINAL table's
-# own directory. The layout differs depending on WHEN this runs:
-#   during the run (phase11 scoring)  -> <organism>/consolidation/...
-#                                        with FINAL at <organism>/scoring/
-#   after reorganize_outputs.py       -> <organism>/per-tool-phased-output/
-#                                        consolidation/... with FINAL at the top
-# Generating per-organism at scoring time means the post-reorganize guess alone
-# would silently miss (the lookup is existence-guarded), producing a viewer with
-# an empty evidence trail. Search both, and let --consolidated override.
+# Locations of the consolidated matrix relative to the FINAL table's directory,
+# before and after reorganize_outputs.py; --consolidated overrides them.
 _CONS_NAME = "consolidated-merged-all-columns.tsv"
 _CONS_CANDIDATES = (
     Path("per-tool-phased-output") / "consolidation" / _CONS_NAME,  # reorganized
@@ -136,9 +124,10 @@ _CONS_CANDIDATES = (
 
 
 def find_consolidated(final_path, explicit=None):
-    """Resolve the consolidated matrix, or None. An explicit path that does not
-    exist is an error rather than a silent downgrade -- if the caller named it,
-    they expect the evidence trail."""
+    """Returns the consolidated matrix path from the explicit path or known locations, or None.
+
+    A missing explicit path exits with an error.
+    """
     if explicit:
         p = Path(explicit)
         if not p.is_file():
@@ -153,10 +142,10 @@ def find_consolidated(final_path, explicit=None):
 
 
 def load_fingerprints(final_path):
-    """feature_id -> {h: pattern hash, l: label, f: [[field, value], ...]} from the
-    genome's fingerprint/labeled-genes-fingerprint-full.tsv (next to scoring/), or {}.
-    Each cell reads "pattern hash: X || label: Y || fingerprint: F1: v | F2: v ...";
-    empty fields are left out."""
+    """Reads labeled-genes-fingerprint-full.tsv with csv into {feature_id: {h, l, f, raw}}, or {} when absent.
+
+    Parses "pattern hash: X || label: Y || fingerprint: F1: v | F2: v ..."; empty fields are dropped.
+    """
     base = Path(final_path).resolve().parent
     for rel in ("../fingerprint/labeled-genes-fingerprint-full.tsv", "fingerprint/labeled-genes-fingerprint-full.tsv"):
         p = (base / rel).resolve()
@@ -180,6 +169,7 @@ def load_fingerprints(final_path):
 
 
 def main():
+    """Reads the FINAL table and evidence with csv, packs the per-gene data and writes the HTML viewer."""
     argv = [a for a in sys.argv[1:] if a != "--artifact"]
     explicit_cons = None
     if "--consolidated" in argv:
@@ -205,17 +195,16 @@ def main():
         for r in csv.DictReader(open(cons_path, newline=""), delimiter="\t"):
             cons[r.get("feature_id", "")] = r
     else:
-        # Not fatal: the map is complete without it, only the per-gene evidence
-        # trail is empty. Say so loudly rather than shipping a hollow viewer.
+        # Not fatal: only the evidence trail is empty.
         print(f"WARNING: no {_CONS_NAME} near {final}; "
               "evidence trail will be empty", file=sys.stderr)
 
     def evidence_of(fid):
+        """Returns the evidence trail [[tool index, description, identity, informative]] for a gene."""
         cr = cons.get(fid)
         if not cr:
             return []
-        # Show EVERY tool that returned anything, not just the informative ones,
-        # so nothing (including EC numbers) is hidden. row = [ti, desc, metric, inf].
+        # Every tool with a result is listed, informative or not.
         trail, seen = [], set()
         for ti, (name, grp, colnames) in enumerate(EVIDENCE):
             val = ""
@@ -238,8 +227,7 @@ def main():
         return trail
 
     def uniprot_hit(fid):
-        """UniProt's best BLAST hit, shown for EVERY gene (even when its call was
-        uninformative and therefore not selected) so the % identity is visible."""
+        """Returns UniProt's best hit (identity, entry, description, informative) for a gene, or None."""
         cr = cons.get(fid)
         if not cr:
             return None
@@ -273,9 +261,8 @@ def main():
 
     fps = load_fingerprints(final)
     genes = []
-    # The gene report's longer text (formulas, reasoning, audit trail, the
-    # one-line fingerprint): per gene, in XF order, gzipped into the page and
-    # unpacked only when a report is downloaded -- it would triple the file.
+    # Longer per-gene report text in XF order, gzipped into the page and unpacked
+    # only when a report is downloaded.
     XF = ["gene_id", "FEATURE_TYPE", "ENVELOPE", "ENVELOPE_reason", "best_consensus_product_descriptor_source_hierarchy_order",
           "best_consensus_product_descriptor_source_audit_trail", "specialized_database_hits", "localization_and_topology_hits",
           "C1_reasoning", "C2_score_formula", "C2_score_reasoning", "C3_score_formula", "C3_score_reasoning",
@@ -329,8 +316,7 @@ def main():
 
     n_op = len({g["op"] for g in genes if g["op"]})
     n_flag = sum(g["rv"] for g in genes)
-    # display label = the genome identifier / filename verbatim (a user genome may be
-    # "abc.fasta" with no parseable scientific name — the filename always works).
+    # Display label is the genome identifier as given.
     short = organism
 
     data = {
@@ -345,8 +331,7 @@ def main():
     html = TEMPLATE.replace("/*__DATA__*/", json.dumps(data, separators=(",", ":"))).replace("__XTRA__", packed)
 
     if "--artifact" in sys.argv:
-        # Artifact host supplies its own <!doctype>/<html>/<head>/<body>; emit only
-        # the page content (title + style + body inner) so nothing is duplicated.
+        # Artifact mode emits only title, style and body content; the host supplies the document shell.
         style = re.search(r"<style>.*?</style>", html, re.S).group(0)
         inner = re.search(r"<body>(.*)</body>", html, re.S).group(1)
         html = (f"<title>{short} genome — MARGIE confidence viewer</title>\n"

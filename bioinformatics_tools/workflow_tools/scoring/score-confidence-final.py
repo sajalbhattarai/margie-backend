@@ -1,72 +1,15 @@
 #!/usr/bin/env python3
-"""score-confidence-final.py — margie_sb phase11 (scoring), final step:
-combine C1/C2/C3/C4 into a TWO-STAGE 0-1 confidence score.
+"""score-confidence-final.py — scoring stage, final step: two-stage 0-1 confidence.
 
-Reads all four individual metric tables (score-c1-tool-coverage.py,
-score-c2-operon-probability.py, c3_score_organism.py,
-score-c4-ec-agreement.py) -- ALL READ-ONLY -- joins on feature_id, and
-writes ONE file carrying every component score, its human-readable
-reasoning, both confidence stages, whether operon context helped, the
-tier, and the review flag together. This is the single reference table
-for "how confident are we in this gene's annotation, and why" -- every
-number traces back to a reasoning string on the same row.
-
-TWO-STAGE FORMULA (NON-FITTED, 0-1 SCALE):
-
-  Stage 1 -- preliminary confidence from the gene's OWN evidence. C4 is now a
-  graded EC-conflict CLEARANCE (c4_score = 1 - (m/5)*R, where R = conflicting
-  EC tool-pairs / total EC tool-pairs and m = number of EC-reporting tools;
-  1.0 = no conflict). It DISCOUNTS the C1 tool-coverage multiplicatively rather
-  than being averaged co-equally with it, so silence/single-source (c4_score=1)
-  never drags C1 down -- only a real EC conflict does:
-    preliminary = C1 * c4_score           # C1 reduced only by real EC conflict
-
-  Stage 2 -- fold in operon context (C3 gates C2 contribution). If C3 < 0.5
-  (operon is NOT conserved across organisms), only C3 contributes (its penalty).
-  If C3 >= 0.5 (operon IS conserved), both C2 and C3 contribute equally.
-  This ensures low-OCC genes are penalized even if their operon probability
-  is high, reflecting that species-specific operons don't prove universal function:
-    if C3 < 0.5:
-        context = (C3 - 0.5)            # Only use negative C3 signal (penalty)
-    else:
-        context = ((C2 - 0.5) + (C3 - 0.5)) / 2   # Both contribute (averaging)
-    final   = clip(preliminary + context, 0.0, 1.0)
-
-  does_context_improve_confidence? (±0.1 material threshold — trivial nudges
-  are ignored so only operon contexts that actually move the needle count):
-    final - preliminary >= +0.1 -> "increases"   (context corroborates)
-    final - preliminary <= -0.1 -> "decreases"   (context undermines)
-    otherwise                   -> "no effect"    (incl. singletons C2=C3=0.5)
-
-Where each component is 0-1:
-    C1 = Tool coverage: fraction of 7 independent tools with informative hits
-    C2 = Operon probability: geometric-mean co-directionality (neutral 0.5)
-    C3 = Operonic Context Confidence: three-level OCC (neutral 0.5)
-    C4 = EC conflict clearance: 1 - (m/5)*R, the fraction of C1 that survives
-         the EC-conflict check (neutral 1.0 = no conflict)
-
-DESIGN RATIONALE:
-  Two independent, non-fitted stages. Stage 1 is what the gene IS from its
-  own homology + functional evidence; stage 2 asks whether its genomic
-  (operon) context corroborates or undermines that. The C3 (operonic coherence)
-  score GATES the C2 contribution: if the operon is poorly conserved across
-  organisms (C3 < 0.5), the high C2 (operon probability) is ignored, reflecting
-  that a species-specific operon doesn't prove universal function. Only when
-  the operon is conserved (C3 >= 0.5) do both C2 and C3 boost confidence equally.
-
-confidence_tier (on final, 0-1):
-    > 0.9 highest | > 0.7 high | > 0.5 medium | > 0.3 fair | else low
-
-needs_review = "yes" if ANY of:
-  - EC conflict (c4_ec_agreement_status == "conflicting")
-  - operon context DECREASES confidence by >= 0.1
-  - low confidence (final < 0.5)
-A context INCREASE is corroboration (good news) and is NOT flagged for review.
-
-Row coloring (make-final-excel.py / ssh.py), priority red > blue > green:
-  RED   : EC conflict OR operon context decreases confidence by >=0.1 (white text)
-  BLUE  : final < 0.5
-  GREEN : operon context increases confidence by >=0.1 (informational, not needs_review)
+Joins the C1-C4 tables, operon info and localisation columns on feature_id and
+writes every component with its reasoning, both stages, the tier and the review flag.
+  preliminary = C1 * c4_score
+  context     = C2 * C3 for operon members (C3 alone with --context-mode c3-only), else 0
+  final       = clip(preliminary + context, 0, 1)
+A parallel "hybrid" final uses the hybrid C3. Context only raises the score.
+Tiers: > 0.9 highest | > 0.7 high | > 0.5 medium | > 0.3 fair | else low.
+needs_review is set by EC conflict, final < 0.5, C2 < 0.5 in an operon, or an
+ambiguous operon that gave no boost.
 """
 import argparse
 import csv
@@ -77,21 +20,11 @@ from pathlib import Path
 
 csv.field_size_limit(10_000_000)
 
-# Two-stage non-fitted model (each component 0-1, final 0-1):
-#   preliminary = C1 * c4_score        # c4_score = 1 - (m/5)*R EC-conflict clearance
-#   context     = C2*C3 - C2*conflict  # C2 (operon prob) GATES; C3 (pure conservation)
-#                                      # boosts, conflict (descriptor consensus) penalizes.
-#                                      # Novelty (C3->0, no conflict) and non-operons -> 0.
-#   final       = clip(preliminary + context, 0, 1)
-# See CONFIDENCE_MODEL_DERIVATION.md + operon-context-neutral-derivation/ for why.
 _NEUTRAL = 0.5
-# Operon context must move final confidence by at least this much (either
-# direction) to count as a material increase/decrease; smaller = "no effect".
+# Minimum change from context that counts as "increases"/"decreases".
 _CONTEXT_MATERIAL_THRESHOLD = 0.1
-# Operon-inference ambiguity (m/n = fraction of the operon's adjacent pairs
-# blocked by a hypothetical/uncharacterized member). At or above this, and when
-# operon context did NOT boost the call, we add a review COMMENT (never a score
-# penalty — boost-only): the operon was too uncharacterized to corroborate.
+# Fraction of adjacent operon pairs involving an uncharacterized member at which
+# a review note is added (never a score penalty).
 _OPERON_AMBIGUITY_MIN = 0.5
 
 _IDENTITY_COLUMNS = [
@@ -115,6 +48,7 @@ _LOCALIZATION_COLUMNS = [
 ]
 
 def safe_float(value: str, default: float) -> float:
+    """Returns float(value), or default when it cannot be parsed."""
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -122,7 +56,7 @@ def safe_float(value: str, default: float) -> float:
 
 
 def _c1_reasoning(c1_row: dict) -> str:
-    """Human-readable why-this-C1 string from the C1 tool-coverage row."""
+    """Builds the C1 reasoning text from the C1 tool-coverage row."""
     tools = c1_row.get("c1_informative_tools", "")
     n = c1_row.get("c1_informative_tool_count", "?")
     total = c1_row.get("c1_total_tools_considered", "7")
@@ -132,10 +66,9 @@ def _c1_reasoning(c1_row: dict) -> str:
 
 
 def _simplify_tmbed(raw: str) -> str:
-    """Collapse per-segment TMBED topology string to a compact set of unique types.
+    """Collapses a per-segment TMBED topology to its distinct types by regex.
 
-    Input: "0-31: signal_peptide; 32-1014: outside"
-    Output: "signal_peptide + outside"
+    "0-31: signal_peptide; 32-1014: outside" -> "signal_peptide + outside"
     """
     if not raw or raw == "inside":
         return raw
@@ -152,12 +85,10 @@ def _simplify_tmbed(raw: str) -> str:
 
 
 def _specialized_db_hits(row: dict) -> str:
-    """Compact, pipe-separated summary of the specialized-database calls
-    (protease / transporter / CAZyme) for one gene, pulled from the consolidated
-    merged table. Uses each database's clean classification code (the raw
-    descriptions are verbose and inconsistent). Only databases with an actual
-    hit are included; genes with none get an empty string.
-    Format:  MEROPS:<family> | TCDB:<tc-number> | dbCAN:<CAZy-family> [EC ...]."""
+    """Summarises MEROPS/TCDB/dbCAN classification codes for one gene.
+
+    Format: "MEROPS:<family> | TCDB:<tc-number> | dbCAN:<CAZy-family> [EC ...]"; empty without hits.
+    """
     segs = []
     # MEROPS peptidase family (e.g. S85); fall back to the accession id.
     merops = row.get("MEROPS_family", "").strip() or row.get("MEROPS_id", "").strip()
@@ -171,14 +102,13 @@ def _specialized_db_hits(row: dict) -> str:
     dbcan = row.get("DBCAN_id", "").strip()
     if dbcan:
         ec = row.get("DBCAN_ec_numbers", "").strip()
-        # Only show EC if it carries a real number (skip placeholders like "-|-").
+        # EC shown only when it contains a digit (skips placeholders like "-|-").
         segs.append(f"dbCAN:{dbcan}" + (f" [EC {ec}]" if any(c.isdigit() for c in ec) else ""))
     return " | ".join(segs)
 
 
-# Confidence tier for the final 0-1 confidence score.
 def confidence_score_tier(final: float) -> str:
-    """Map final confidence (0-1) to tier: >0.9 highest ... <0.3 low."""
+    """Maps the final 0-1 confidence to a tier: > 0.9 highest ... <= 0.3 low."""
     if final > 0.9:
         return "highest"
     if final > 0.7:
@@ -191,6 +121,7 @@ def confidence_score_tier(final: float) -> str:
 
 
 def main() -> None:
+    """Loads the component tables with csv, computes both confidence stages per gene and writes the final table."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--c1-input", required=True, help="labeled-genes-c1-tool-coverage.tsv")
@@ -220,6 +151,7 @@ def main() -> None:
             raise SystemExit(1)
 
     def load(path):
+        """Reads a TSV with csv into a dict keyed by feature_id."""
         with open(path, newline="") as fh:
             reader = csv.DictReader(fh, delimiter="\t")
             return {row["feature_id"]: row for row in reader if row.get("feature_id")}
@@ -241,9 +173,7 @@ def main() -> None:
                 continue
             loc_by_gene[fid] = {col: row.get(col, "") for col in _LOCALIZATION_COLUMNS}
             spec_by_gene[fid] = _specialized_db_hits(row)
-            # RAST_feature_type: CDS / rna / prophage -- carried through so the FINAL
-            # table, workbook and operon diagrams can distinguish coding features
-            # from non-CDS (RNA) and colour/flag them accordingly.
+            # RAST_feature_type (CDS / rna / prophage) lets later outputs colour non-coding rows.
             type_by_gene[fid] = (row.get("RAST_feature_type", "") or "").strip()
 
     out_columns = (
@@ -255,8 +185,7 @@ def main() -> None:
             "feature_type",
             # ── component scores with friendly names + reasoning ──────────
             "c1_score_database_coverage", "c1_score_reasoning",
-            # raw UniOP operon probability, reported alongside C2 so the neutral
-            # 0.5 fallback (singletons) is never mistaken for a real probability.
+            # Raw UniOP probability, so the 0.5 fallback is distinguishable.
             "c2_uniop_probability_raw",
             "c2_score_operon_probability", "c2_score_reasoning",
             "c3_score_operon_context", "c3_score_operon_context_hybrid", "c3_reasoning",
@@ -269,19 +198,16 @@ def main() -> None:
             "confidence_tier",
             "confidence_tier_hybrid",
             "needs_review", "needs_review_reason",
-            # ── specialized-database calls (protease/transporter/CAZyme),
-            #    pipe-separated in one column, sits just before the copied
-            #    alias columns below. ──
+            # ── specialized-database calls (protease/transporter/CAZyme) ──
             "specialized_db_hits",
-            # ── backward-compatible aliases for downstream fingerprint /
-            #    evidence steps (add-gene-fingerprint, add-fingerprint-to-final,
-            #    build-gene-report). confidence_score == final confidence. ──
+            # ── alias columns read by the fingerprint and evidence steps;
+            #    confidence_score == final confidence. ──
             "c1_score", "c1_informative_tools", "c1_formula",
             "c2_score_from_operon_probability", "c2_formula",
             "c3_score", "c3_signal_breakdown", "c3_formula",
             "c4_score", "c4_formula",
             "confidence_score", "confidence_score_formula", "confidence_score_tier", "confidence_flag",
-            # carried through for make-final-annotated's product_descriptor_hierarchy_tier_name column
+            # read by make-final-annotated.py
             "hierarchy_tier_name",
         ]
     )
@@ -293,8 +219,7 @@ def main() -> None:
     tier_counts = {}
     n = 0
     n_skipped = 0
-    # Iterate over C4 (always populated for every gene, including non-coding
-    # ones, since add-ec-consensus.py reads from labeled-genes.tsv directly).
+    # Iterates over C4, which has a row for every gene including non-coding ones.
     with open(paths["c4"], newline="") as fh, open(output_path, "w", newline="") as out_fh:
         reader = csv.DictReader(fh, delimiter="\t")
         writer = csv.DictWriter(out_fh, fieldnames=out_columns, delimiter="\t", extrasaction="ignore")
@@ -324,8 +249,7 @@ def main() -> None:
             # Specialized-database calls (MEROPS/TCDB/dbCAN), pipe-separated.
             out_row["specialized_db_hits"] = spec_by_gene.get(fid, "")
 
-            # ── Component scores: friendly-named columns + reasoning, plus
-            #    backward-compatible aliases read by downstream steps. ──
+            # ── Component scores, reasoning and alias columns ──
             c1_raw = c1_row.get("c1_score", "")
             c2_raw = c2_row.get("c2_score_from_operon_probability", "")
             c3_raw = c3_row.get("c3_score", "")
@@ -361,9 +285,8 @@ def main() -> None:
             out_row["c4_formula"] = row.get("c4_formula", "")
 
             if not c2_raw:
-                # Non-coding feature -- operon probability (and the two-stage
-                # confidence) doesn't apply. confidence_score left EMPTY so
-                # build-gene-report.py skips it as non-scored.
+                # Non-coding feature: no confidence; empty confidence_score makes
+                # build-gene-report.py skip it.
                 for col in ("preliminary_confidence_c1_c4", "final_confidence_operon_context",
                             "final_confidence_operon_context_hybrid",
                             "c3_score_operon_context_hybrid"):
@@ -383,9 +306,8 @@ def main() -> None:
 
             c1 = safe_float(c1_raw, 0.0)
             c2 = safe_float(c2_raw, 0.0)         # operon probability (0 = not/unknown operon)
-            c3 = safe_float(c3_raw, 0.0)         # PURE conservation (0 = novel/no evidence)
-            # hybrid C3 (per-gene max adjacency/co-member) -- scored in PARALLEL so the
-            # output carries an adjacency final and a hybrid final side by side.
+            c3 = safe_float(c3_raw, 0.0)         # conservation (0 = novel/no evidence)
+            # Hybrid C3 (per-gene max of adjacency/co-member), scored in parallel.
             c3_hyb = safe_float(c3_row.get("c3_score_hybrid", ""), 0.0)
             conflict = safe_float(conflict_raw, 0.0)   # descriptor-consensus contradiction
             significance = safe_float(significance_raw, 0.0)  # enrichment: chance-above-random co-occurrence
@@ -395,43 +317,27 @@ def main() -> None:
             except (TypeError, ValueError):
                 _omc = 0
             in_operon = _omc >= 2
-            # c4 is the EC-conflict CLEARANCE (1 - (m/5)*R); neutral = 1.0
-            # (no conflict = no penalty), NOT 0.5 like the operon-context terms.
+            # c4 is the EC-conflict clearance; its neutral value is 1.0, not 0.5.
             c4 = safe_float(c4_raw, 1.0)
 
-            # ── Stage 1: preliminary from the gene's own evidence. C4 discounts
-            #    C1 multiplicatively — only a real EC conflict (c4_score<1) lowers
-            #    it; silence/single-source (c4_score=1) leaves base = C1. ──
+            # ── Stage 1: gene's own evidence; C4 discounts C1 only on EC conflict. ──
             preliminary = c1 * c4
-            # ── Stage 2: operon context, C2 as a MULTIPLICATIVE GATE. We score the
-            #    functional call, so the EVIDENCE is cross-genome: C3 (conservation)
-            #    corroborates it, `conflict` (descriptor consensus) contradicts it.
-            #    C2 (operon probability) is only a GATE — it says whether there is a
-            #    real operon to lend context, so it can DISCOUNT but never inflate.
-            #    C3/conflict drive the magnitude; C2 scales it. Novelty (C3→0, no
-            #    conflict) and non-operon genes are neutral. context ∈ [−1,+1]. ──
+            # ── Stage 2: operon context; C3 (conservation) sets the boost and C2
+            #    (operon probability) scales it. Non-operon genes get 0. ──
             if in_operon:
                 if args.context_mode == "c3-only":
                     boost = max(0.0, c3)                     # conservation drives the boost directly
                 else:
                     boost = max(0.0, c2) * max(0.0, c3)      # C3 (conservation) boosts; C2 gates
-                # PENALTY DISABLED (boost-only). Every conflict formulation tried
-                # (adjacency and co-membership) false-fires on lineage-specific
-                # operons: it compares our descriptor to a mate's GLOBAL consensus,
-                # which a novel module never matches, and the OCC includes the
-                # scored genome (no leave-one-out). A trustworthy contradiction
-                # signal needs leave-one-out + module-support gating + the operon
-                # propensity prior -- an open problem, not this release. C3 stays
-                # novelty-neutral, so nothing is penalized for merely being unseen.
-                # c3_descriptor_conflict is still computed and emitted for study.
+                # No penalty: descriptor-conflict signals misfire on lineage-specific
+                # operons, so c3_descriptor_conflict is reported but not applied.
                 penalty = 0.0
                 context = boost
             else:
                 boost = penalty = context = 0.0
             final = min(1.0, max(0.0, preliminary + context))
 
-            # ── parallel HYBRID final: identical model, hybrid C3 in place of the
-            #    adjacency C3.  Same context-mode gate. ──
+            # ── Hybrid final: same model with the hybrid C3. ──
             if in_operon:
                 boost_hyb = (max(0.0, c3_hyb) if args.context_mode == "c3-only"
                              else max(0.0, c2) * max(0.0, c3_hyb))
@@ -449,8 +355,7 @@ def main() -> None:
 
             tier = confidence_score_tier(final)
 
-            # ── needs_review: EC conflict OR operon-driven DECREASE OR low.
-            #    A context increase is corroboration (good news) → not flagged. ──
+            # ── needs_review triggers; a context increase is not a trigger. ──
             ec_conflict = ec_status == "conflicting"
             context_drop = context_effect == "decreases"
             low_conf = final < _NEUTRAL
@@ -462,15 +367,11 @@ def main() -> None:
                                f"({preliminary:.4f}→{final:.4f})")
             if low_conf:
                 reasons.append(f"low confidence (final={final:.4f} < {_NEUTRAL})")
-            # Weak operon probability: the gene is placed in an operon, but its
-            # pairwise operon probability (C2, UniOP) with the neighbour is < 0.5,
-            # so that operon assignment itself is doubtful -- flag for review.
+            # Operon member with C2 < 0.5: the operon assignment itself is doubtful.
             if in_operon and c2 < 0.5:
                 reasons.append(f"weak operon probability (C2={c2:.2f} < 0.5) -- this gene's "
                                f"operon assignment with its neighbour is doubtful")
-            # Operon member that operon context could NOT corroborate because the
-            # operon is mostly uncharacterized: comment only (boost-only leaves the
-            # score at the gene's own evidence; we never penalize for ignorance).
+            # Mostly uncharacterized operon that gave no boost: review note only.
             operon_ambiguous = (in_operon and context_effect != "increases"
                                 and ambiguity >= _OPERON_AMBIGUITY_MIN)
             if operon_ambiguous:
@@ -490,10 +391,10 @@ def main() -> None:
             out_row["needs_review"] = needs_review
             out_row["needs_review_reason"] = "; ".join(reasons) if reasons else "no review triggers"
 
-            # backward-compatible aliases (confidence_score == final confidence)
+            # alias: confidence_score == final confidence
             out_row["confidence_score"] = f"{final:.4f}"
             
-            # Build context formula string (C2-gated geometric mean)
+            # Context formula text
             if in_operon:
                 context_formula = (
                     f"context=C2·C3=({c2:.3f}·{c3:.3f})={boost:+.4f} "

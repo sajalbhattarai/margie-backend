@@ -1,26 +1,11 @@
 #!/usr/bin/env python3
-"""reorganize_outputs.py -- final per-organism output cleanup for a margie run.
+"""reorganize_outputs.py -- final per-organism output cleanup for a run.
 
-Runs ONCE at the end of the batch (after the run-level global report), reducing
-each organism folder to just the things a user cares about:
-
-  <run>/<organism>/
-    FINAL_ANNOTATION_WITH_CONFIDENCE.tsv     (promoted out of scoring/)
-    FINAL_ANNOTATION_WITH_CONFIDENCE.xlsx    (colored workbook, generated here)
-    <figures-dirname>/                        (was scoring/figures/, e.g. "diagrams")
-    per-tool-phased-output/                   (EVERYTHING else -- all tool phase
-                                               folders + the rest of scoring/)
-
-Why it runs at the very end (not per-organism during the batch): the run-level
-pangenome report (make_global_report.py / run_report_figures_global) reads EVERY
-organism's scoring/scored-labeled-genes-confidence-final.tsv and
-labeling/labeled-genes.tsv directly off disk. Moving those before it runs would
-break it, so this step is invoked only after that global report finishes.
-
-Idempotent and parallel: safe to re-run; organisms are processed concurrently
-(the per-organism Excel generation is the slow part and is what parallelises).
-This is a plain post-processing script, NOT a Snakemake rule -- moving rule
-outputs would confuse Snakemake's completeness tracking on a re-run.
+Leaves each organism folder with FINAL_ANNOTATION_WITH_CONFIDENCE.tsv/.xlsx,
+FINAL_GENOME_VIEWER.html, the figures folder, and per-tool-phased-output/ with
+everything else. Runs once after the run-level global report, which reads the
+per-organism scoring and labeling files in place. Idempotent; organisms run in
+parallel threads. Not a Snakemake rule, so moved outputs do not affect rerun tracking.
 """
 from __future__ import annotations
 
@@ -33,19 +18,17 @@ from pathlib import Path
 
 FINAL_TSV = "FINAL_ANNOTATION_WITH_CONFIDENCE.tsv"
 FINAL_XLSX = "FINAL_ANNOTATION_WITH_CONFIDENCE.xlsx"
-# Written at the organism top level by rule run_genome_viewer_one_genome. Must
-# be in the keep-set below or the sweep buries it in per-tool-phased-output/,
-# which is exactly where the GUI does not look for it.
+# Written at the organism top level by rule run_genome_viewer_one_genome; kept
+# there because the GUI looks for it there.
 GENOME_VIEWER = "FINAL_GENOME_VIEWER.html"
 PTP = "per-tool-phased-output"
-# run-level (not per-organism) folders that must never be treated as an organism
+# Run-level folders that are never organisms
 _RUN_LEVEL = {"scoring", "sqlite", "ani", "aai", "closest", "mauve",
               "original_container_outputs", "logs", "genome_pool"}
 
 
 def _is_organism_dir(d: Path) -> bool:
-    """A per-organism folder: has scoring/FINAL... (fresh), or FINAL... at top
-    plus per-tool-phased-output/ (already reorganized)."""
+    """Returns True for an organism folder: FINAL tsv in scoring/ or at top, or an existing per-tool-phased-output/."""
     if d.name in _RUN_LEVEL:
         return False
     return ((d / "scoring" / FINAL_TSV).is_file()
@@ -55,13 +38,14 @@ def _is_organism_dir(d: Path) -> bool:
 
 def reorganize_one(org_dir, figures_dirname: str = "diagrams",
                    excel_script: str | None = None, python: str | None = None) -> dict:
+    """Reorganizes one organism folder with shutil moves, generating the Excel via a subprocess; returns a result dict."""
     org = Path(org_dir)
     diag = org / figures_dirname
     ptp = org / PTP
     scoring = org / "scoring"
     result = {"organism": org.name, "actions": [], "excel": None, "error": None}
     try:
-        # locate the FINAL tsv wherever it currently is (scoring/ if fresh, top if re-run)
+        # FINAL tsv is in scoring/ on a first run, at top on a rerun
         final_scoring = scoring / FINAL_TSV
         final_top = org / FINAL_TSV
         final_src = final_scoring if final_scoring.is_file() else (
@@ -105,15 +89,16 @@ def reorganize_one(org_dir, figures_dirname: str = "diagrams",
                 continue
             dst = ptp / entry.name
             if dst.exists():
-                continue  # leftover from a partial/previous run -> leave it
+                continue  # left from an earlier partial run
             shutil.move(str(entry), str(dst))
             result["actions"].append(f"-> {PTP}/{entry.name}")
-    except Exception as exc:  # never raise into the pool; report per-organism
+    except Exception as exc:  # reported per organism instead of raised into the pool
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result
 
 
 def main() -> None:
+    """Finds organism folders and reorganizes them with a ThreadPoolExecutor."""
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-root", required=True, help="the timestamped run output dir")
