@@ -285,7 +285,7 @@ def _probe(conn, root: str, user: str, cfg: dict | None = None) -> dict:
              f'echo "@@log"; tail -c 16000 {shlex.quote(log_path)} 2>/dev/null | tr "\\r" "\\n"',
              'echo "@@host"; hostname',
              f'echo "@@squeue"; j=$(cat {shlex.quote(_state_path(root, "op.jobid"))} 2>/dev/null); '
-             f'[ -n "$j" ] && {{ echo "job=$j"; squeue -h -j "$j" -o %T 2>/dev/null; }}',
+             f'[ -n "$j" ] && {{ echo "job=$j"; squeue -h -j "$j" -o "%T|%r" 2>/dev/null; }}',
              f'echo "@@slurmout"; tail -n 20 {shlex.quote(_state_path(root, "op.slurm.out"))} 2>/dev/null',
              f'echo "@@logage"; echo $(( $(date +%s) - $(stat -c %Y {shlex.quote(log_path)} 2>/dev/null || echo 0) ))']
     for st in STORES:
@@ -346,10 +346,15 @@ def _op_from(sections: dict, root: str) -> dict:
     # there, a log that has stopped growing for five minutes is the sign.
     squeue = [l.strip() for l in sections.get('squeue', []) if l.strip()]
     job = next((l[4:] for l in squeue if l.startswith('job=')), '')
-    slurm_state = next((l for l in squeue if not l.startswith('job=')), '')
+    slurm_line = next((l for l in squeue if not l.startswith('job=')), '')
+    slurm_state, _, slurm_reason = slurm_line.partition('|')
     if job:
         op['job'] = job
         op['slurm_state'] = slurm_state
+        # Why a job waits (Resources, Priority, QOSMaxJobsPerUserLimit...): shown
+        # beside "Waiting for a SLURM slot", with the choice to run it here.
+        if slurm_state == 'PENDING' and slurm_reason and slurm_reason != 'None':
+            op['slurm_reason'] = slurm_reason
     if op.get('state') in ('queued', 'running') and job:
         # A SLURM job: squeue knows whether it is still there.
         if not slurm_state:
@@ -614,6 +619,30 @@ def status(conn, cfg: dict, user: str) -> dict:
 def progress(conn, cfg: dict) -> dict | None:
     """Only the copy under way: what the progress bar polls, every second or two."""
     root = scratch_root(conn, cfg)
+    return _read_op(conn, root) or None
+
+
+def run_here(conn, cfg: dict) -> dict | None:
+    """A copy still waiting in the SLURM queue, run on the login node instead:
+    the job is cancelled and the same script started here, detached, as it is
+    when no account is set. Asked for by the person, who was told the login
+    node is shared and to follow their institution's policy."""
+    root = scratch_root(conn, cfg)
+    op = _read_op(conn, root)
+    if not op or op.get('state') != 'queued' or not op.get('job'):
+        raise StoreError('There is no copy waiting in the queue.', 409)
+    if op.get('slurm_state') != 'PENDING':
+        raise StoreError('The copy has already started on a compute node.', 409)
+    state = f'{root}/{STATE_DIR}'
+    q = shlex.quote
+    code, out = _run(conn, f'scancel {q(op["job"])} && cd {q(state)} && rm -f op.jobid op.slurm.out op.status '
+                            f'&& (setsid nohup bash op.sh {q(state)} > /dev/null 2>&1 < /dev/null &) && echo started')
+    if 'started' not in out:
+        raise StoreError(f'Could not start the copy here: {out.strip()}')
+    for _ in range(20):
+        if _read_text(conn, f'{state}/op.status'):
+            break
+        time.sleep(0.25)
     return _read_op(conn, root) or None
 
 

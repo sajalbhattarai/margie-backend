@@ -1404,6 +1404,15 @@ def setup_stores(current_user: dict = Depends(get_current_user)):
     return _stores_call(user_stores.start_setup, conn, user_config, current_user["cluster_username"])
 
 
+@router.post("/stores/run-here")
+def run_store_copy_here(current_user: dict = Depends(get_current_user)):
+    """The copy waiting in the SLURM queue (databases, backups, tool setup), run
+    on the login node instead, at the person's request."""
+    conn = _build_connection(current_user)
+    user_config = _stores_user_config(current_user, conn)
+    return {"op": _stores_call(user_stores.run_here, conn, user_config)}
+
+
 @router.post("/stores/{store_id}/backup")
 def backup_store(store_id: str, current_user: dict = Depends(get_current_user)):
     """Copy one database's working version to depot; the working copy moves on
