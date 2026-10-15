@@ -210,8 +210,7 @@ class TestJobStore:
 
         job_store.finalize("j6", status="completed", phase="Done")
 
-        # add_slurm_job checkpoints provenance as it goes, so the last write is
-        # finalize's full snapshot.
+        # The last write is finalize's full snapshot, not a checkpoint.
         _, kwargs = mock_history.record_job_updated.call_args
         assert kwargs["status"] == "completed"
         assert kwargs["phase"] == "Done"
@@ -259,7 +258,7 @@ class TestJobStore:
         for i in range(50):
             job_store.add_slurm_job("j-throttle", slurm_id=str(9000 + i), rule="run_scoring")
 
-        # One immediate write, then the throttle holds the rest until the interval elapses.
+        # One immediate write; the throttle holds the rest for the interval.
         assert mock_history.record_job_updated.call_count == 1
 
         job_store.checkpoint("j-throttle", force=True)
@@ -1019,7 +1018,7 @@ class TestViewFile:
         assert mock_sftp.read_remote_file_page.call_args.kwargs["known_total_lines"] == 5
 
     def test_view_file_page_size_bounds(self, authed_client):
-        # Query(..., le=500) rejects this before the handler or any SSH call runs.
+        # Query(..., le=500) rejects this before the handler or SSH runs.
         resp = authed_client.get(
             "/v1/ssh/view_file/any-job-id",
             params={"path": "results.tsv", "page_size": 99999},

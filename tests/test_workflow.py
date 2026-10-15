@@ -321,9 +321,7 @@ class TestRunPipeline:
 
 
 # ---- _run_pipeline_batch_sequential ----
-# Stage 1 (rasttk_all, backgrounded) and Stage 2 (one genome at a time, in
-# RASTtk-token order). Path, time.sleep and the subprocess helpers are mocked
-# so the orchestration loop runs instantly.
+# Path, time.sleep and subprocess helpers are mocked so the loop runs instantly.
 
 def _target_genome_of(cmd: list[str]) -> str | None:
     """Returns target_genome=<x> from a built snakemake command's --config section."""
